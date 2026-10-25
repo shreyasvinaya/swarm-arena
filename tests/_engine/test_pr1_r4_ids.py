@@ -41,7 +41,7 @@ async def test_returned_identifier_keeps_stop_heartbeat_and_renewal(
     )
     evidence = {}
     try:
-        with anyio.fail_after(15):
+        with anyio.fail_after(60):
             while not ((tmp_path / "entered.json").exists() or (tmp_path / "next-judge").exists()):
                 assert process.poll() is None, process.communicate()
                 await anyio.sleep(0.01)
@@ -49,7 +49,7 @@ async def test_returned_identifier_keeps_stop_heartbeat_and_renewal(
         before = json.loads(owner.read_text())["expires_at"]
         heartbeat = (tmp_path / "heartbeat").read_text()
         # A 3 s lease renews about every second; allow several renewal periods.
-        with anyio.move_on_after(5):
+        with anyio.move_on_after(30):
             while (  # noqa: ASYNC110 - observes another process
                 json.loads(owner.read_text())["expires_at"] == before
                 or (tmp_path / "heartbeat").read_text() == heartbeat
@@ -63,7 +63,7 @@ async def test_returned_identifier_keeps_stop_heartbeat_and_renewal(
         swarm.run_id = "r"
         await swarm.stop(now=True)
         # Stop files are polled every 2 s; the hook stays blocked until `release`.
-        with anyio.move_on_after(10):
+        with anyio.move_on_after(30):
             while not (tmp_path / "done.json").exists():  # noqa: ASYNC110 - observes another process
                 await anyio.sleep(0.01)
         evidence["done_before_release"] = (tmp_path / "done.json").exists()
@@ -79,12 +79,12 @@ async def test_returned_identifier_keeps_stop_heartbeat_and_renewal(
         (tmp_path / "evidence.json").write_text(json.dumps(evidence))
         (tmp_path / "release").write_text("release")
         try:
-            stdout, stderr = await anyio.to_thread.run_sync(lambda: process.communicate(timeout=8))
+            stdout, stderr = await anyio.to_thread.run_sync(lambda: process.communicate(timeout=60))
             (tmp_path / "driver-output.txt").write_text(stdout + stderr)
         finally:
             if process.poll() is None:
                 process.kill()
-                process.communicate(timeout=5)
+                process.communicate(timeout=60)
     assert process.returncode == 0, stderr
 
 

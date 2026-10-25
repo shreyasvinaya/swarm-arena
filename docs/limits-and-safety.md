@@ -120,22 +120,193 @@ post-deadline settlement, including durable stop-result publication. Healthy
 live settlement remains under its owner's supervision without this fixed timer.
 Report arrival has its own timeout, including after a graceful stop; expiry
 records a conservative charge rather than a storage-cleanup failure.
-Without a committed settle, the reservation stays charged in full. Cancelling construction or command preparation
-before a committed start releases the reservation at zero while ownership is
-held; a late preparation result never launches or journals work.
+Without a committed settle, the reservation stays charged in full. Cancelling
+construction or command preparation before a committed start normally releases
+the reservation at zero while ownership is held; a late preparation result never
+launches or journals work. Gateway runs have a
+[keep-charged exception](running-on-ray.md#gateway-reservations) before key creation.
 
 On resume, every reservation without a committed settlement stays charged in
 full. Runs with a committed completion are recovered; runs with a committed
-start but no committed completion become `lost`, and retrying them needs new
-budget. Reservations for dispatches without a committed start remain charged
-conservatively, without a lost marker. Thus a crash's
+`tool_start` or Ray `tool_dispatch` but no committed completion become `lost`,
+and retrying them needs new budget. Reservations with neither event remain
+charged conservatively, without a lost marker. A Ray dispatch intent can be
+committed before submission, so a missing task does not prove that it never ran.
+See [Ray recovery](running-on-ray.md#recovery) for the dashboard requirements and
+unknown death evidence. Token-authenticated clusters use Ray's own token loader
+under the recovery deadline and can confirm lost runs with matching evidence;
+tokens are never persisted or included in errors. Unavailable authentication
+remains unknown, and HTTPS, proxied or overridden dashboards retain the documented
+confirmation limits. Thus a crash's
 additional accounting loss is bounded by unsettled reservations: in-flight tool
 runs and open per-holder tranches. The accounting cap cannot be enlarged by a
 crash or forced takeover. A tool's **actual external spend** still depends on
-correct estimates, reported usage, and its own provider caps; this release has no gateway
-that enforces tool-internal provider spending. Reported overspend is recorded
+correct estimates, reported usage, and its own provider caps. The optional
+gateway on the pinned LiteLLM range provides only a soft cap, as described below. Reported overspend is recorded
 and can exhaust the budget. Usage beyond the supported accounting range
 terminally exhausts the whole run, even with unset caps.
+
+## LLM gateway: hard and soft caps
+
+The optional `llm_gateway` checks its strict profile before run ownership,
+manifest publication, approval, or any virtual key creation. Approval warnings
+include `LLM gateway uses a soft cap.` when soft-cap policy is accepted. **The pinned LiteLLM range
+`>=1.107.0rc2,<1.108` cannot provide a hard cap.** Its profile is always
+unverified. `require_hard_cap` defaults to true when `limits.max_usd` is set;
+that configuration therefore fails preflight. Set it explicitly to false to
+accept a soft cap:
+
+```toml
+[limits]
+max_usd = 5.0
+
+[llm_gateway]
+url = "http://127.0.0.1:4000"
+master_key_env = "LITELLM_MASTER_KEY"
+require_hard_cap = false
+```
+
+Keep the master key in the named environment variable. Neither it nor a virtual
+key belongs in configuration files, manifests or journal events. Gateway URLs
+must have no userinfo, query or fragment. A run retains one adapter, its checked
+profile and one key manager bound to the existing journal owner. Preflight
+retains fixed method, route and status diagnostics from the built-in transport;
+foreign adapter errors expose only their type. Gateway model identifiers must
+be printable, nonblank and at most 256 characters, otherwise they display as
+`<unknown>`. Errors and manifest evidence retain the first ten failures followed
+by `and N more` when necessary.
+
+A verified strict profile requires all of the following:
+
+- Budget reservations enabled, with enforcement that fails closed when spend
+  counters are stale.
+- Known input/output prices and an output-token bound for every model, plus an
+  enforced per-key bound on the request's `max_tokens`.
+- Only routes that participate in budget reservations; pass-through endpoints
+  disabled.
+- An enforced maximum total request duration, no longer than the configured
+  `request_timeout_s`.
+- Virtual keys required for model access.
+
+LiteLLM on the pinned range lacks three required guarantees: **request
+`max_tokens` is not bounded per key**, **no maximum request duration is
+enforced**, and **virtual keys are not required**. It also lacks the needed
+settings introspection endpoint. The adapter checks liveliness and model
+metadata, and reports `gateway settings introspection unavailable`; it never
+assumes unreadable settings pass. `default_estimated_output_tokens` is an
+estimate, not an enforced ceiling, and an HTTP timeout does not establish a
+total request-duration guarantee. A batch-write interval is not proof that
+spend logs are complete.
+
+The manifest's `llm_gateway` block records the URL, `cap`, `verified`, `failures`
+and `terminal_accounting`; it is identical in `manifest.json` and `run_started`.
+Without a gateway the block is null. The pinned adapter records `cap = "soft"`,
+`verified = false` and `terminal_accounting = false`. Candidate `trace` and the
+board viewer display the key alias, reserved `max_budget` in USD and cap label.
+They use the committed state captured with the board frontier, so a refresh
+reveals later reconciliation while an already captured reader stays unchanged.
+
+Gateway budgets cap **USD only**, not tokens. Pin the gateway's cost map to the
+model prices used when reserving budgets; changing prices undermines estimates.
+A soft cap does not guarantee that concurrent external requests stay within the
+reservation. Keyed tool reservations stay fully charged for the run, including
+[cancellation while the keep-charged mark is saved](running-on-ray.md#gateway-reservations).
+With this LiteLLM range, reconciliation keeps the full reservation labelled `estimated`:
+without a verified duration bound, waiting longer cannot prove completeness.
+Observed rows can still inform provenance without lowering the ledger charge.
+
+## After the run: reconcile
+
+Run `swarm-arena reconcile RUN_DIR`, where `RUN_DIR` is `<run_root>/<run-id>`.
+It reads that run's `run.toml` by default; `--config PATH` selects an override.
+The command prints each candidate, key alias, reserved USD, spend USD and label.
+It checks storage conditional-write support (including an `s3://` run root)
+before takeover, refuses a live owner, and holds the run lease while publishing
+its report. Recorded gateway keys require the original gateway URL (userinfo
+is ignored); a missing or changed binding is refused before takeover and
+rechecked after acquisition. The driver also attempts reconciliation before its final commit,
+using its existing owner and gateway profile. Gateway failures are recorded
+without failing completion; storage failures and ownership loss still propagate.
+A run with no committed head returns an empty report and releases its lease
+without publishing history; it remains ineligible for resume.
+
+The run directory and run root are trusted operator data. Anyone who can write
+them can change the tools that resume executes and make resume or reconcile
+send the environment master key named by `master_key_env` to the gateway URL in
+that configuration. Keep run roots writable only by the operator. On shared
+storage, pass `--config` from an independently trusted copy; the gateway
+continuity check then refuses a changed URL. This does not authenticate a
+modified journal or recorded plan.
+
+Before reconciliation mutates a key, its journal and writer must match the
+addressed run. The adapter checks the selected hash through `/key/info` and
+compares the stored creation `metadata.run_id` and `key_alias` with the record.
+A mismatch or unavailable identity leaves the key estimated without mutation,
+using a fixed reason without external values. These checks use the pinned
+LiteLLM key-info fields; they do not make an attacker-writable run root trusted.
+
+A key's report becomes an observation only when all these conditions hold:
+
+1. The executor confirms the original tool is dead. A key with no start or
+   dispatch event counts as unused. A reused local process-group leader is dead
+   only when both recorded and current start times are known and differ.
+   A remote host or unavailable, stale or unbound Ray dashboard remains unknown;
+   see the [plain-HTTP dashboard requirement](running-on-ray.md#recovery).
+2. The gateway confirms closure at time T. Repeated reconciliations preserve the
+   earliest journaled confirmation; blocking alone is not confirmation.
+3. The gateway enforces a maximum request duration no longer than
+   `request_timeout_s`, reports a batch write interval, and both intervals have
+   passed since T.
+
+Otherwise the report keeps the full reservation as **estimated**, with the
+failed conditions listed. The pinned LiteLLM adapter cannot verify the duration
+and batch guarantees, so it stays estimated and does not delete keys for
+completeness. An adapter that can demonstrate these capabilities reports
+**observed (completeness unverified)** unless it also guarantees terminal
+accounting, in which case it reports **observed**. Unverified observed spend
+is not proof that every charge has arrived: late log batches may add rows.
+Deletion is attempted only after a successful eligible read and durable recording.
+The committed head must cover the observations and closure before deletion,
+so a takeover after deletion can recover spend even after upstream log retention.
+
+Reports deduplicate gateway requests by key and request identity, retain earlier
+committed observations even when logs age out, and sum integer micro-dollars
+before displaying USD. A key total that cannot be represented without losing a
+micro-dollar stays estimated with `unsupported gateway observation` and is not
+deleted. An unsupported run aggregate preserves all per-key results and reports
+the exact full-reservation total as estimated with the same fixed reason. If
+even that estimate cannot be represented, the aggregate is unavailable (`null`),
+never rounded or clamped. These display limits do not prevent run completion or
+its final review export. A later reconcile can add late rows for retained keys;
+deleted keys reuse their committed observations without repeating gateway reads.
+Readers retain their captured committed snapshot until refreshed.
+Reconciliation never refunds reservations, changes a live run's budget, or
+restarts the paid-work clock. Gateway waits have a separate bounded allowance;
+healthy journal storage is not charged against that external-work timer. The
+overall allowance is at most `settle_timeout_s`, capped before inherited
+cancellation and writer closing/I/O deadlines. Each key has a fresh allowance
+of at most `request_timeout_s` within that overall bound. An operation whose
+allowance expired before entry reports `reconcile time allowance exhausted`,
+without claiming a gateway failure. Reconciliation visits keys without confirmed
+closure first. It checks identity once, immediately before blocking an unclosed
+key or reading eligible spend; already-closed keys with no eligible spend need
+no identity or process-death lookup. Repeated calls can therefore close later
+keys even when the pinned profile never permits deletion. Deleted keys reuse
+committed observations. Resume's closure loop also has one bounded overall allowance;
+unclosed keys remain available for reconciliation. Run-end reads and
+reconciliation finish before the final completion allowance is armed. Failure
+events include the nonsecret key and candidate IDs for later recovery.
+The KeyManager and reconciliation exception handlers do not convert
+`KeyboardInterrupt`, `SystemExit`, `GeneratorExit`, or groups containing them
+into gateway failures, or start compensating cleanup for those controls.
+This applies to controls that reach those handlers in the awaiting task;
+controls raised inside adapter worker threads are contained as type-only
+failures like other worker-thread work. Caller cancellation and registered
+ownership/terminal controls retain their existing handling.
+
+A key created just before the open deadline but never journaled is unusable
+(its bearer never left the driver), expires after `key_duration_s`, and is not
+counted in reports.
 
 ## Tokens, USD, and tranches
 
@@ -170,8 +341,8 @@ carriers, from private provenance. Copied, caller-created or subclassed carriers
 remain diagnostics. Caller cancellation takes precedence over carried controls.
 Usage overflow retains conservative charges. Exact journal/ledger equality
 applies to finalized, non-overflow accounting; fencing or interrupted publication
-can leave a reservation conservatively charged. Gateway enforcement of external
-tool spending remains later work.
+can leave a reservation conservatively charged. External tool calls can use the
+optional gateway, subject to its [soft-cap limits](#llm-gateway-hard-and-soft-caps).
 
 ## Three execution clocks and the watchdog
 
@@ -204,8 +375,10 @@ User-raised cancellation and exception groups are contained at manager, action,
 check, tool, and judge boundaries with type-only diagnostics. Judge construction,
 batch preparation, anchor selection, and configuration validation use the same
 classification before recording a failure. Healthy peers continue
-and the goal can finish. Cancellation before dispatch refunds the tool reservation
-exactly once, including command preparation and edit uploads. Cleanup has a bounded
+and the goal can finish. Cancellation before dispatch normally refunds the tool
+reservation exactly once, including command preparation and edit uploads; the
+[gateway keep-charged exception](running-on-ray.md#gateway-reservations) still applies.
+Cleanup has a bounded
 settlement wait; work that may have started retains its charge. Actual caller
 cancellation and ownership fencing still propagate. Fencing nested in an exception
 group propagates as a bare ownership-loss error, without group or leaf values;
@@ -218,7 +391,7 @@ these waits without using the executor collection allowance.
 Startup estimates, provider declarations, executor hooks, and preflight failures
 are also reported by type without hook values. A hook-raised cancellation is a
 startup failure; cancellation requested by the caller still cancels the run.
-Built-in provider probing and model-provider recovery are M3 work.
+See [Provider failures](#provider-failures) for built-in provider probing and recovery.
 
 ## Stop modes and resume
 
@@ -268,6 +441,15 @@ not a promise that graceful finalization completed. Normal returned runs,
 including no-result goals, exit 0; runtime/control failures exit 1 and usage
 errors exit 2.
 
+In library mode with a user-owned `asyncio.run`, a SIGINT delivered to a worker
+thread is handled at the next event-loop wakeup, bounded during a live run by
+the lease-renewal timer (`lease_ttl_s / 3`). The CLI owns a wakeup file descriptor
+and wakes the loop for signals delivered to any thread. A raw repeated
+`KeyboardInterrupt` inside asyncio/AnyIO bookkeeping can hang shutdown, an
+upstream limitation. For reliable repeated Ctrl-C, use the CLI or install a
+signal handler that cancels the run. The library does not take over
+process-global signal state.
+
 Resume from the committed journal with the saved configuration, or a human
 replacement:
 
@@ -278,6 +460,11 @@ uv run swarm-arena resume .swarm-arena/runs/<run-id> --config run.toml
 ```
 
 `Swarm(config).resume(run_id, force=False)` provides the Python equivalent.
+Resume trusts the saved configuration, journal and recorded tools. Restrict run
+root writes to the operator and use a trusted `--config` on shared storage:
+writers can redirect the configured `master_key_env` credential to another
+gateway URL or change which tools resume runs. See the
+[run-storage trust boundary](#after-the-run-reconcile) above.
 Backend journal reads are contained and their bytes detached before chain or replay
 validation. Backend diagnostics and backend cancellation cannot impersonate core
 validation or caller cancellation.
@@ -317,6 +504,11 @@ Judge-private files are withheld from tool staging, not protected against
 arbitrary same-user code. Use trusted programs; containers are future work.
 See the [isolation boundary](own-files.md#isolation-boundary).
 
+For cluster execution, see the Ray guide's
+[initialization warning](running-on-ray.md#initialization-warning),
+[workspace cleanup limit](running-on-ray.md#workspace-cleanup), and
+[secret transport boundary](running-on-ray.md#gateway-secret-transport).
+
 `FunctionTool` returns JSON data only: it does not apply file edits or parent
 file overlays. Like `ScriptTool`, its `env` lists variable **names**, which must
 be in `RunConfig.secrets.allow`. These settings and their validation aliases
@@ -344,6 +536,14 @@ that produces an error output. Collection converts ordinary exceptions and
 interrupts, exception groups, and fencing-shaped exceptions propagate unchanged.
 The engine classifies those transported outcomes at its supervised boundary,
 where it can distinguish caller cancellation from a hook-raised failure.
+
+At supervised outcome boundaries, hard controls raised by user code or worker
+thread work are contained as type-only failures. Hard controls raised by the
+awaiting run/resume body retain their identity through cleanup. In library mode,
+a raw `KeyboardInterrupt` delivered while a gateway, executor, or report call's
+coroutine frame is running may be recorded as that call's failure: the frame
+cannot distinguish it from a worker outcome. The CLI's owned SIGINT handling,
+or a library SIGINT handler that cancels the task, avoids this ambiguity.
 
 A hook-created `Fenced` exception does not establish ownership loss, whether
 raised directly or nested in an exception group. Only the journal's fenced

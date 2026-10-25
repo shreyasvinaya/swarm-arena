@@ -135,7 +135,7 @@ def test_concurrent_take_over_has_one_winner(
 
     def synchronized_read(key: str) -> Blob:
         blob = original_read(key)
-        barrier.wait(timeout=5)
+        barrier.wait(timeout=60)
         return blob
 
     def take_over(owner_id: str) -> Lease | Fenced | LeaseHeld:

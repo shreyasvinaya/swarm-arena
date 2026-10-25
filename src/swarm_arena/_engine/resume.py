@@ -8,6 +8,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, TypeVar
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import anyio
@@ -22,13 +23,14 @@ from swarm_arena._engine.preflight import _board_arena_root, _check_storage
 from swarm_arena._engine.round import EngineDeps
 from swarm_arena._engine.stops import ProviderStops, RunClock, StopState
 from swarm_arena._errors import (
+    ConfigError,
     Fenced,
     PlanError,
     StorageError,
     _core_error,
     _exception_type_name,
 )
-from swarm_arena._exec.executor import Executor
+from swarm_arena._exec.executor import Executor, Job, schedule_timeout_scope
 from swarm_arena._exec.procinfo import host_id
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import Event, EventDraft, EventType
@@ -94,8 +96,27 @@ def _read(store: Store, doc: OwnerDoc) -> tuple[list[Event], RunState]:
     return events, RunState.from_events(events)
 
 
+def _check_gateway_binding(state: RunState, config: RunConfig) -> None:
+    """Keep every journaled key attached to its original gateway without values."""
+    if any(event.type == EventType.GATEWAY_KEY for event in state._events):
+        old_gateway, new_gateway = state.config.llm_gateway, config.llm_gateway
+        if old_gateway is None or new_gateway is None:
+            raise _core_error(ConfigError, "llm_gateway")
+
+        def binding(url: str) -> str:
+            try:
+                parsed = urlsplit(url)
+                return urlunsplit(parsed._replace(netloc=parsed.netloc.rsplit("@", 1)[-1]))
+            except ValueError:
+                raise _core_error(ConfigError, "llm_gateway") from None
+
+        if binding(old_gateway.url) != binding(new_gateway.url):
+            raise _core_error(ConfigError, "llm_gateway")
+
+
 def _check(state: RunState, config: RunConfig) -> list[str]:
     """Reject intrinsic limit incompatibilities without mutating authority."""
+    _check_gateway_binding(state, config)
     for name in ("max_tokens", "max_usd"):
         old, new = getattr(state.config.limits, name), getattr(config.limits, name)
         if new is not None and (old is None or new < old):
@@ -125,6 +146,47 @@ def _restore_import_paths(state: RunState) -> None:
             sys.path.append(directory)
 
 
+async def _recover_orphans(
+    executor: Executor, jobs: list[Job.Started], timeout_s: float
+) -> list[bool]:
+    """Recover once per job concurrently, retaining input order and one allowance."""
+    timeout_s = min(timeout_s, getattr(executor.config, "cancel_margin_s", timeout_s))
+    confirmed = [False] * len(jobs)
+    errors: list[BaseException | None] = [None] * len(jobs)
+    boundary = _Outcome()
+
+    async def recover(index: int, started: Job.Started) -> None:
+        outcome = _Outcome()
+        try:
+            result = await executor.kill_orphan(started)
+            confirmed[index] = result is True and not scope.cancel_called
+        except anyio.get_cancelled_exc_class() as error:
+            # Real caller/deadline cancellation propagates; a hook-raised
+            # cancellation without pending cancellation is an ordinary failure.
+            errors[index] = outcome.classify(error)
+        except BaseExceptionGroup as error:
+            if error.subgroup((KeyboardInterrupt, SystemExit, GeneratorExit)) is not None:
+                raise
+            errors[index] = error
+        except Exception as error:
+            errors[index] = error
+
+    with anyio.move_on_after(timeout_s) as scope:
+        async with anyio.create_task_group() as group:
+            for index, started in enumerate(jobs):
+                group.start_soon(recover, index, started)
+    failures = [error for error in errors if error is not None]
+    if failures:
+        classified = boundary.classify(
+            failures[0] if len(failures) == 1 else BaseExceptionGroup("orphan recovery", failures)
+        )
+        _raise_terminal(classified)
+        raise _core_error(
+            RuntimeError, f"orphan recovery failed: {_exception_type_name(classified)}"
+        ) from None
+    return confirmed
+
+
 class _ResumeServices:
     """Keep the AnyIO writer context in one task across preparation and execution."""
 
@@ -140,11 +202,13 @@ class _ResumeServices:
         validated_head: Head,
         model_warnings: list[str],
         stops: StopState,
+        gateway: run_module._GatewaySetup | None = None,
     ) -> None:
         self.config, self.run_id, self.store, self.lease = config, run_id, store, lease
         self.force = force
         self.clock = clock
         self.stops = stops
+        self.gateway = gateway
         self.validated_head = validated_head
         self.model_warnings = model_warnings
         self.ready, self.close = anyio.Event(), anyio.Event()
@@ -259,56 +323,72 @@ class _ResumeServices:
                                 clock=clock,
                                 state=state,
                             ):
+                                gateway = run_module._bind_gateway(
+                                    self.gateway, config, journal, self.run_id
+                                )
+                                if gateway is not None:
+                                    gateway.restore(events)
                                 executor = await run_module._start_executor(config)
                                 killed: list[str] = []
                                 starts = {
                                     e.payload["candidate_id"]: e
                                     for e in events
-                                    if e.type == EventType.TOOL_START
+                                    if e.type in {EventType.TOOL_START, EventType.TOOL_DISPATCH}
                                 }
                                 commands = {
                                     e.payload["job_id"]: e
                                     for e in events
                                     if e.type == EventType.COMMAND_START
                                 }
-                                for jobs, index, event_type in (
-                                    (state.started, starts, EventType.RUN_LOST),
-                                    (state.started_commands, commands, EventType.COMMAND_END),
+                                pending = [
+                                    (id, started, index[id], event_type)
+                                    for jobs, index, event_type in (
+                                        (state.started, starts, EventType.RUN_LOST),
+                                        (state.started_commands, commands, EventType.COMMAND_END),
+                                    )
+                                    for id, started in jobs.items()
+                                ]
+                                confirmations = await _recover_orphans(
+                                    executor,
+                                    [started for _, started, _, _ in pending],
+                                    config.settle_timeout_s,
+                                )
+                                for (id, started, source, event_type), confirmed in zip(
+                                    pending, confirmations, strict=True
                                 ):
-                                    for id, started in jobs.items():
-                                        outcome = _Outcome()
-                                        try:
-                                            with anyio.move_on_after(config.settle_timeout_s):
-                                                if await executor.kill_orphan(started):
-                                                    killed.append(id)
-                                        except BaseException as error:
-                                            error = outcome.classify(error)
-                                            _raise_terminal(error)
-                                            name = _exception_type_name(error)
-                                            raise _core_error(
-                                                RuntimeError,
-                                                f"orphan recovery failed: {name}",
-                                            ) from None
-                                        source = index[id]
-                                        payload = (
-                                            {
-                                                "candidate_id": id,
-                                                "reservation_id": source.payload["reservation_id"],
-                                            }
-                                            if event_type == EventType.RUN_LOST
-                                            else {"job_id": id, "status": "lost"}
+                                    if confirmed:
+                                        killed.append(id)
+                                    payload: dict[str, Any] = (
+                                        {
+                                            "candidate_id": id,
+                                            "reservation_id": source.payload["reservation_id"],
+                                        }
+                                        if event_type == EventType.RUN_LOST
+                                        else {"job_id": id, "status": "lost"}
+                                    )
+                                    if (
+                                        event_type == EventType.RUN_LOST
+                                        and started.kind == "dispatch"
+                                    ):
+                                        payload.update(
+                                            kind="dispatch",
+                                            task_name=started.task_name,
+                                            confirmed_dead=confirmed,
                                         )
-                                        journal.append(
-                                            EventDraft(
-                                                type=event_type,
-                                                task_id=source.task_id,
-                                                goal_id=source.goal_id,
-                                                team=source.team,
-                                                agent=source.agent,
-                                                round=source.round,
-                                                payload=payload,
-                                            )
+                                    journal.append(
+                                        EventDraft(
+                                            type=event_type,
+                                            task_id=source.task_id,
+                                            goal_id=source.goal_id,
+                                            team=source.team,
+                                            agent=source.agent,
+                                            round=source.round,
+                                            payload=payload,
                                         )
+                                    )
+                                if gateway is not None:
+                                    await run_module._close_gateway(journal, gateway)
+                                    await run_module._read_gateway(journal, gateway)
                                 shares = weighted_shares(
                                     ledger.free(),
                                     {g: (config.goal_weights or {}).get(g, 1.0) for g in continued},
@@ -375,6 +455,7 @@ class _ResumeServices:
                                     },
                                     stops=stops,
                                     clock=clock,
+                                    gateway=gateway,
                                     admission=RunAdmission(
                                         config.limits.max_agents_total,
                                         [
@@ -538,6 +619,8 @@ async def _take_over(
     review: bool = False,
     clock: Callable[[], RunClock | None] | None = None,
     stops: StopState | None = None,
+    allow_empty_head: bool = False,
+    owner_id: str | None = None,
 ) -> Lease:
     """Retry only same-epoch CAS races, with caller prechecks before each attempt."""
     retain = stops is not None
@@ -550,7 +633,7 @@ async def _take_over(
                     raise FileNotFoundError(f"run {run_id} has no control/owner.json")
                 raise _core_error(ValueError, "run has no committed owner")
             doc, _ = owner
-            if doc.head is None:
+            if doc.head is None and not allow_empty_head:
                 raise _core_error(ValueError, f"run {run_id} has no committed events")
             if validate is not None:
                 await _validated_io(validate, doc)
@@ -566,7 +649,7 @@ async def _take_over(
                     partial(
                         Lease.take_over,
                         store,
-                        owner_id=uuid4().hex,
+                        owner_id=owner_id if owner_id is not None else uuid4().hex,
                         host=host_id(),
                         ttl_s=config.lease_ttl_s,
                         force=force,
@@ -631,69 +714,85 @@ async def resume_run(
     >>> runner = await resume_run(config, "run-id", force=False, replanner=None)  # doctest: +SKIP
     >>> results = await runner.run()  # doctest: +SKIP
     """
-    await _check_storage(config)
-    run_module._require_asyncio()
-    store = open_store(config.run_root).child(run_id)
+    with schedule_timeout_scope(config.schedule_timeout_s):
+        await _check_storage(config)
+        run_module._require_asyncio()
+        store = open_store(config.run_root).child(run_id)
 
-    clock: RunClock | None = None
-    stops = StopState()
-    validated_head: Head | None = None
-    model_warnings: list[str] = []
+        clock: RunClock | None = None
+        stops = StopState()
+        validated_head: Head | None = None
+        model_warnings: list[str] = []
+        gateway: run_module._GatewaySetup | None = None
 
-    def validate(doc: OwnerDoc) -> None:
-        nonlocal clock, validated_head
-        _, state = _read(store, doc)
-        _check(state, config)
-        _restore_import_paths(state)
-        if clock is None:
-            clock = RunClock(state.run_elapsed_s)
-        else:
-            clock._rebase(state.run_elapsed_s)
-        validated_head = doc.head
+        def validate(doc: OwnerDoc) -> None:
+            nonlocal clock, validated_head
+            _, state = _read(store, doc)
+            _check(state, config)
+            _restore_import_paths(state)
+            if clock is None:
+                clock = RunClock(state.run_elapsed_s)
+            else:
+                clock._rebase(state.run_elapsed_s)
+            validated_head = doc.head
 
-    async def check_startup_models() -> None:
-        nonlocal model_warnings
-        model_warnings = await run_module._check_startup_models(config, replanner)
+        async def check_startup_models() -> None:
+            nonlocal model_warnings, gateway
+            model_warnings = await run_module._check_startup_models(config, replanner)
+            if gateway is None:
+                gateway = await run_module._prepare_gateway(config)
 
-    lease = await _take_over(
-        config,
-        run_id,
-        store,
-        force=force,
-        validate=validate,
-        before_acquire=check_startup_models,
-        clock=lambda: clock,
-        stops=stops,
-    )
-    assert clock is not None
-    assert validated_head is not None
-    services = _ResumeServices(
-        config,
-        run_id,
-        store,
-        lease,
-        force=force,
-        clock=clock,
-        validated_head=validated_head,
-        model_warnings=model_warnings,
-        stops=stops,
-    )
-    services.task = asyncio.create_task(services._serve(), name=f"resume-{run_id}")
-    try:
-        await services.ready.wait()
-        if services.failure is not None:
-            await services._aclose()
-        assert services.resumed is not None
-        state = services.resumed.state
-        return run_module.RunRunner(
+        lease = await _take_over(
             config,
-            [state.plan_for_round(g, state.goals[g].rounds_closed + 1) for g in state.plans],
-            run_id=run_id,
-            approve=None,
-            replanner=replanner,
-            resumed=services.resumed,
+            run_id,
+            store,
+            force=force,
+            validate=validate,
+            before_acquire=check_startup_models,
+            clock=lambda: clock,
+            stops=stops,
         )
-    except BaseException:
-        if not services.closed:
-            await services._aclose(failed=True)
-        raise
+        assert clock is not None
+        assert validated_head is not None
+        services = _ResumeServices(
+            config,
+            run_id,
+            store,
+            lease,
+            force=force,
+            clock=clock,
+            validated_head=validated_head,
+            model_warnings=model_warnings,
+            stops=stops,
+            gateway=gateway,
+        )
+        services.task = asyncio.create_task(services._serve(), name=f"resume-{run_id}")
+        error: BaseException | None = None
+        try:
+            await services.ready.wait()
+            if services.failure is not None:
+                await services._aclose()
+            assert services.resumed is not None
+            state = services.resumed.state
+            runner = run_module.RunRunner(
+                config,
+                [state.plan_for_round(g, state.goals[g].rounds_closed + 1) for g in state.plans],
+                run_id=run_id,
+                approve=None,
+                replanner=replanner,
+                resumed=services.resumed,
+            )
+            assert services.deps is not None
+            runner._gateway = gateway
+            runner._key_manager = services.deps.gateway
+            return runner
+        except BaseException as caught:
+            error = caught
+        assert error is not None
+        try:
+            if not services.closed:
+                await services._aclose(failed=True)
+        except BaseException:
+            if not run_module._has_driver_control(error):
+                raise
+        raise error

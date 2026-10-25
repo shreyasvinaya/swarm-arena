@@ -59,7 +59,7 @@ def _start_driver(
         finally:
             if driver.poll() is None:
                 driver.kill()
-            driver.wait(timeout=10)
+            driver.wait(timeout=60)
             # A failed assertion must not leave any sleeping tool groups behind.
             for marker in root.glob("*.pid.json"):
                 pgid = json.loads(marker.read_text())["pgid"]
@@ -119,7 +119,8 @@ def _score_preparation_barrier(goal: Goal, candidate: Candidate) -> Score:
     if candidate.round == 1:
         root = Path(candidate.request.inputs["marker"]).parent
         (root / "barrier-entered").touch()
-        _wait_for(lambda: (root / "barrier-release").exists())
+        # The pre-release path can span readiness, stop CLI, and preparation-return waits.
+        _wait_for(lambda: (root / "barrier-release").exists(), 900)
     return score_value(goal, candidate)
 
 
@@ -129,7 +130,8 @@ def _plan(root: Path, *, preparation: bool = False) -> Plan:
         {
             "round": r,
             "inputs": {
-                "seconds": 0.0 if preparation or r == 3 else 60.0,
+                # Enclose run-dir/round readiness, status, stop, and stop-event waits (420 s).
+                "seconds": 0.0 if preparation or r == 3 else 900.0,
                 "marker": str(root / f"round-{r}.pid.json"),
             },
         }

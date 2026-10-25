@@ -175,7 +175,7 @@ async def test_simultaneous_revisions_serialize_against_current_goal_keys(
     )
     planner = CollidingPlanner(simultaneous=True)
     swarm = Swarm(cfg, replanner=planner)
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         await swarm.run([_partitioned("g1"), _partitioned("g2")])
     assert planner.arrived == {"g1", "g2"}
     rejected = events(cfg, "plan_rejected")

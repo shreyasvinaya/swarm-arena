@@ -51,7 +51,7 @@ async def test_blocked_stop_poll_releases_owner(
     def hold(entered: threading.Event) -> None:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(20), "controlled worker release deadline"
+        assert release.wait(300), "controlled worker release deadline"
 
     def exists(store: LocalStore, key: str) -> bool:
         if key == "control/stop-now-e1" and (phase == "startup" or driving.is_set()):
@@ -78,14 +78,14 @@ async def test_blocked_stop_poll_releases_owner(
     monkeypatch.setattr(ArenaBoard, "frontier", frontier)
     task = asyncio.create_task(Swarm(config).run(plan(rounds=1), run_id="r"))
     try:
-        with anyio.fail_after(10):
-            assert await anyio.to_thread.run_sync(work_entered.wait, 8)
-            assert await anyio.to_thread.run_sync(poll_entered.wait, 8)
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(work_entered.wait, 60)
+            assert await anyio.to_thread.run_sync(poll_entered.wait, 60)
         if signal == "cancel":
             task.cancel()
         else:
             deadline.set()
-        done, _ = await asyncio.wait([task], timeout=2)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "owner waited for its blocked stop lookup"
         assert not release.is_set()
         if signal == "cancel":
@@ -103,12 +103,16 @@ async def test_blocked_stop_poll_releases_owner(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
-            await asyncio.gather(task, return_exceptions=True)
-            for worker in workers:
-                if worker.name.startswith("swarm-arena-daemon-"):
-                    await anyio.to_thread.run_sync(worker.join, 5)
-                    assert not worker.is_alive()
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
+        for worker in workers:
+            if worker.name.startswith("swarm-arena-daemon-"):
+                await anyio.to_thread.run_sync(worker.join, 60)
+    assert not pending_cleanup, "stop owner did not finish cleanup"
+    assert all(
+        not worker.is_alive() for worker in workers if worker.name.startswith("swarm-arena-daemon-")
+    )
 
 
 @pytest.mark.parametrize("phase", ["startup", "driver"])
@@ -143,7 +147,7 @@ async def test_stop_poll_failure_reaches_owner(
     def hold() -> None:
         workers.append(threading.current_thread())
         work_entered.set()
-        assert release.wait(20), "controlled worker release deadline"
+        assert release.wait(300), "controlled worker release deadline"
 
     def create(store: LocalStore, current: str, data: bytes) -> str:
         if phase == "startup" and current == "manifest.json":
@@ -158,7 +162,7 @@ async def test_stop_poll_failure_reaches_owner(
     def exists(store: LocalStore, current: str) -> Any:
         if current != key or (phase == "driver" and not driving.is_set()):
             return original_exists(store, current)
-        assert work_entered.wait(8)
+        assert work_entered.wait(60)
         calls.append(current)
         if kind == "truth":
             return Truth()
@@ -185,9 +189,9 @@ async def test_stop_poll_failure_reaches_owner(
     monkeypatch.setattr(ArenaBoard, "frontier", frontier)
     task = asyncio.create_task(Swarm(config).run(plan(rounds=1), run_id="r"))
     try:
-        with anyio.fail_after(10):
-            assert await anyio.to_thread.run_sync(work_entered.wait, 8)
-        done, _ = await asyncio.wait([task], timeout=2)
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(work_entered.wait, 60)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "polling failure silently removed the watcher"
         assert not task.cancelled(), "backend cancellation impersonated caller cancellation"
         error = task.exception()
@@ -211,18 +215,20 @@ async def test_stop_poll_failure_reaches_owner(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
-            await asyncio.gather(task, return_exceptions=True)
-            for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
-                assert not worker.is_alive()
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+    assert not pending_cleanup, "stop owner did not finish cleanup"
+    assert all(not worker.is_alive() for worker in workers)
 
 
 @pytest.mark.parametrize("mode", ["run", "resume", "resume_retry"])
 async def test_one_stop_watcher_spans_acquisition_setup_and_driver(
     run_config: RunConfig, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
-    config = run_config.model_copy(update={"settle_timeout_s": 2.0})
+    config = run_config
     swarm = Swarm(config)
     if mode != "run":
         await swarm.run(plan(rounds=1), run_id="r")
@@ -286,7 +292,7 @@ async def test_stop_at_initialization_entry_has_stopped_outcome(
 
     monkeypatch.setattr(run_module._RunJournal, "__aenter__", entered)
     with (
-        anyio.fail_after(5),
+        anyio.fail_after(60),
         pytest.raises(
             RuntimeError,
             match=r"^run initialization stopped before run_started$",

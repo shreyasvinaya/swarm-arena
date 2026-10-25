@@ -55,10 +55,10 @@ _ALLOW = {
     ): "Pre-takeover validation.",
     ("_scoring/human_review.py", "HumanReview.import_csv", "check_storage"): "Pre-takeover probes.",
     ("_tooling/script_tool.py", "_list_files", "_list_files_sync"): "In-memory manifest/view only.",
-    ("_exec/local_run.py", "_JobRun.run", "self._stopped_output"): "Local regular-file notes only.",
-    ("_exec/local_run.py", "_JobRun._deliver_partial", "self._stopped_output"): "Local notes only.",
-    ("_exec/local_run.py", "_JobRun._wait_post_collect", "note_in_log"): "Local regular-file note.",
-    ("_exec/local_run.py", "_JobRun._finish", "note_in_log"): "Local regular-file note.",
+    ("_exec/job_steps.py", "_JobRun.run", "self._stopped_output"): "Local regular-file notes only.",
+    ("_exec/job_steps.py", "_JobRun._deliver_partial", "self._stopped_output"): "Local notes only.",
+    ("_exec/job_steps.py", "_JobRun._wait_post_collect", "note_in_log"): "Local regular-file note.",
+    ("_exec/job_steps.py", "_JobRun._finish", "note_in_log"): "Local regular-file note.",
     (
         "_exec/local.py",
         "LocalExecutor.submit",
@@ -76,6 +76,11 @@ _ALLOW = {
         "procinfo.kill_orphan",
     ): "Local process cleanup.",
     ("_exec/local.py", "LocalExecutor._get_host_id", "host_id"): "Local host identity.",
+    (
+        "_exec/local.py",
+        "LocalExecutor.confirm_dead",
+        "procinfo.process_start_time",
+    ): "Local process identity inspection.",
     ("testing/_harness.py", "OfflineHarness.run_rounds", "self._run_folder"): "Before acquisition.",
     ("testing/_harness.py", "OfflineHarness.run_rounds", "_build"): "Preownership snapshots.",
     (
@@ -190,11 +195,15 @@ def test_lease_owned_modules_use_abandonable_workers() -> None:
         _ROOT / "_journal/writer.py",
         _ROOT / "_journal/views.py",
         _ROOT / "_journal/lease.py",
+        _ROOT / "_gateway/keys.py",
+        _ROOT / "_gateway/reconcile.py",
         _ROOT / "_planning/validate.py",
         _ROOT / "_agent/context.py",
         _ROOT / "testing/_harness.py",
         _ROOT / "_exec/local_run.py",
+        _ROOT / "_exec/job_steps.py",
         _ROOT / "_exec/local.py",
+        _ROOT / "ray/_executor.py",
         _ROOT / "_scoring/human_review.py",
         _ROOT / "_agent/tool_run.py",
         _ROOT / "_tooling/script_tool.py",
@@ -330,3 +339,94 @@ class Job:
         await run_sync_daemon(self._upload_log, data)
 """
     assert _worker_calls(source) == [("Job.finish", "self._upload_log", 6)]
+
+
+def test_guard_scans_shared_job_publication(monkeypatch: pytest.MonkeyPatch) -> None:
+    target = _ROOT / "_exec/job_steps.py"
+    original = Path.read_text
+    source = target.read_text() + '\nasync def unsafe_upload():\n    artifacts.put_bytes(b"x")\n'
+
+    def read_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        return source if path == target else original(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match=r"_exec/job_steps.py:\d+: unsafe_upload"):
+        test_lease_owned_modules_use_abandonable_workers()
+
+
+@pytest.mark.parametrize(
+    ("module", "safe", "unsafe"),
+    [
+        (
+            "_agent/tool_run.py",
+            "_storage_io(_reported_rows,",
+            "anyio.to_thread.run_sync(_reported_rows,",
+        ),
+        (
+            "_exec/job_steps.py",
+            "self._workspace_io(self._upload_report,",
+            "anyio.to_thread.run_sync(self._upload_report,",
+        ),
+    ],
+)
+def test_guard_scans_report_storage(
+    monkeypatch: pytest.MonkeyPatch, module: str, safe: str, unsafe: str
+) -> None:
+    target = _ROOT / module
+    source = target.read_text()
+    replaced = source.replace(safe, unsafe)
+    assert replaced != source
+    original = Path.read_text
+
+    def read_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        return replaced if path == target else original(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match="unprotected worker calls"):
+        test_lease_owned_modules_use_abandonable_workers()
+
+
+def test_guard_scans_ray_executor_publication(monkeypatch: pytest.MonkeyPatch) -> None:
+    target = _ROOT / "ray/_executor.py"
+    original = Path.read_text
+    source = target.read_text()
+    unsafe = source.replace("await _storage_io(", "await anyio.to_thread.run_sync(")
+    assert unsafe != source
+
+    def read_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        return unsafe if path == target else original(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match=r"ray/_executor.py:\d+: RayExecutor._submitted"):
+        test_lease_owned_modules_use_abandonable_workers()
+
+
+def test_guard_scans_gateway_key_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    target = _ROOT / "_gateway/keys.py"
+    original = Path.read_text
+    unsafe = (
+        target.read_text()
+        + '\nasync def unsafe_gateway_publish(store):\n    store.create("x", b"x")\n'
+    )
+
+    def read_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        return unsafe if path == target else original(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match=r"_gateway/keys.py:\d+: unsafe_gateway_publish"):
+        test_lease_owned_modules_use_abandonable_workers()
+
+
+def test_guard_scans_reconcile_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    target = _ROOT / "_gateway/reconcile.py"
+    original = Path.read_text
+    unsafe = (
+        target.read_text() + '\nasync def unsafe_reconcile(store):\n    store.create("x", b"x")\n'
+    )
+
+    def read_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        return unsafe if path == target else original(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError, match=r"_gateway/reconcile.py:\d+: unsafe_reconcile"):
+        test_lease_owned_modules_use_abandonable_workers()

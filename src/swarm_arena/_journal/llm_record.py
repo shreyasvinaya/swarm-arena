@@ -25,6 +25,7 @@ from swarm_arena._errors import Fenced, StorageError, _core_error, _stop_cleanup
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.a2a import agent_task_id
 from swarm_arena._journal.event import EventDraft
+from swarm_arena._journal.lease import Lease
 from swarm_arena._journal.replay import RunState
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.canonical import canonical_json, sha256_hex
@@ -74,10 +75,11 @@ class _Binding:
     tracing: TracingConfig
     loop: asyncio.AbstractEventLoop
     stops: StopState
-    clock: RunClock
+    clock: RunClock | None
     limits: Limits
     settle_timeout_s: float
     seen_litellm: dict[str, str] = field(default_factory=dict)
+    seen_tool_litellm: dict[str, str] = field(default_factory=dict)
     recorded: set[str] = field(default_factory=set)
     originals: dict[str, str | None] = field(default_factory=dict)
     pending: dict[str, _Pending] = field(default_factory=dict)
@@ -101,6 +103,8 @@ class _Binding:
 
     def track_scope(self, scope: LLMScope) -> None:
         """Count each funded scope once until all its accounting has drained."""
+        if self.clock is None:
+            raise _core_error(ValueError, "maintenance binding refuses funded calls")
         if id(scope) not in self.scopes:
             self.scopes[id(scope)] = scope
             tranche = id(scope.tranche)
@@ -117,6 +121,10 @@ class _Binding:
         if not self.active:
             raise _core_error(Fenced, "run ownership lost")
         self.journal._raise_if_fenced()
+        if self.clock is None:
+            self.journal._check_open()
+            if self.journal._remaining() <= 0:
+                raise _core_error(Fenced, "maintenance lease is no longer held")
         if self.terminal is not None:
             raise self.terminal from None
 
@@ -145,6 +153,7 @@ def bind_run(
     clock: RunClock | None = None,
     limits: Limits | None = None,
     settle_timeout_s: float = 60,
+    _maintenance_lease: Lease | None = None,
 ) -> None:
     """Bind entered services and restore committed deduplication and cache indexes.
 
@@ -174,6 +183,9 @@ def bind_run(
         The owner's run limits, or standalone defaults.
     settle_timeout_s : float, default=60
         Report and post-stop accounting allowance.
+    _maintenance_lease : Lease or None, optional
+        Private reconcile authority. Requires this entered writer's live lease
+        and no paid-work clock; permits only external tool observations.
 
     Notes
     -----
@@ -199,6 +211,13 @@ def bind_run(
     if not math.isfinite(settle_timeout_s) or settle_timeout_s <= 0:
         raise _core_error(ValueError, "invalid settle_timeout_s")
     journal._check_open()
+    if _maintenance_lease is not None and (
+        clock is not None
+        or _maintenance_lease is not journal._lease
+        or _maintenance_lease.doc.epoch != journal.epoch
+        or journal._remaining() <= 0
+    ):
+        raise _core_error(ValueError, "maintenance binding requires the held writer lease")
     binding = _Binding(
         journal,
         ids,
@@ -206,7 +225,7 @@ def bind_run(
         tracing,
         asyncio.get_running_loop(),
         stops if stops is not None else StopState(),
-        clock if clock is not None else RunClock(0),
+        None if _maintenance_lease is not None else clock if clock is not None else RunClock(0),
         limits if limits is not None else Limits(),
         settle_timeout_s,
     )
@@ -218,7 +237,9 @@ def bind_run(
         if call.reservation_id is not None:
             binding.call_reservations[call.id] = call.reservation_id
         if call.litellm_call_id is not None:
-            binding.seen_litellm[call.litellm_call_id] = call.id
+            _dedup_index(binding, call.role == "tool" and call.reservation_id is None)[
+                call.litellm_call_id
+            ] = call.id
         _digest(request_sha256.get(call.id))
         identity = _digest(identities.get(call.id))
         if identity is not None and call.status == "ok" and not call.cache_hit:
@@ -315,6 +336,8 @@ def open_call(
     if asyncio.get_running_loop() is not binding.loop:
         raise _core_error(ValueError, "open_call requires the bound owner loop")
     binding.check()
+    if binding.clock is None:
+        raise _core_error(ValueError, "maintenance binding refuses funded calls")
     if binding.closing or any(id(owner) in binding.drained for owner in scope.lineage()):
         raise _core_error(ValueError, "LLM scope is drained")
     if scope.journal is not binding.journal or scope.artifacts is not binding.artifacts:
@@ -389,7 +412,9 @@ async def _watch_owner(
             except Exception:
                 scope.cancel()
                 return
-        left = binding.clock.left(binding.limits.run_timeout_s)
+        left = (
+            math.inf if binding.clock is None else binding.clock.left(binding.limits.run_timeout_s)
+        )
         if binding.stops.stop_now or binding.stops.run_timeout or left <= 0:
             binding.begin_cleanup()
             if interrupt_reports:
@@ -529,8 +554,8 @@ def _metadata(metadata: Mapping[str, Any]) -> dict[str, str]:
 @dataclass(frozen=True)
 class _Prepared:
     call: LLMCall
-    request: bytes
-    response: bytes
+    request: bytes | None
+    response: bytes | None
     request_sha: str
     cache_identity: str | None
     actual: Amount
@@ -553,6 +578,18 @@ def _prepare_call(
         raise ValueError("invalid cache_hit")
     if cache_hit and kwargs["charge_reservation"]:
         raise ValueError("cache_hit and charge_reservation are mutually exclusive")
+    external = kwargs.get("_external_observation", False) and entry is None
+    informational_overflow = external and (cost > USD_LIMIT or (usage.usd or 0) > USD_LIMIT)
+    if informational_overflow:
+        cost = 0.0
+        usage = usage.model_copy(update={"usd": None})
+    if external:
+        for name, limit in (("model", 256), ("provider", 64), ("litellm_call_id", 128)):
+            value = kwargs[name]
+            if value is not None:
+                value = _context_string(value, name)
+                if len(value) > limit or (value and not value.isprintable()):
+                    raise ValueError("invalid observation identifier")
     estimated = kwargs["charge_reservation"] and entry is not None
     overflow = not cache_hit and cost > USD_LIMIT and not estimated
     if estimated:
@@ -605,8 +642,10 @@ def _prepare_call(
         cost_usd=actual.usd,
         cache_hit=cache_hit,
         latency_ms=_plain(kwargs["latency_ms"]),
-        status="error" if estimated or overflow else status,
-        error=_UNKNOWN_SPEND
+        status="error" if estimated or overflow or informational_overflow else status,
+        error="usage_overflow: unsupported informational amount"
+        if informational_overflow
+        else _UNKNOWN_SPEND
         if estimated
         else _OVERFLOW
         if overflow
@@ -619,8 +658,8 @@ def _prepare_call(
     response = canonical_json(_plain(kwargs["response"]))
     return _Prepared(
         call,
-        request,
-        response,
+        request if kwargs["request"] is not None else None,
+        response if kwargs["response"] is not None else None,
         sha256_hex(request),
         _digest(kwargs["cache_identity"]),
         actual,
@@ -636,12 +675,19 @@ def _put_payload(artifacts: ArtifactStore, content: bytes) -> str:
     return digest
 
 
-def _duplicate(binding: _Binding, cid: str, lid: str | None, entry: _Pending | None) -> bool:
+def _dedup_index(binding: _Binding, tool: bool) -> dict[str, str]:
+    """Keep tool-origin identities separate from funded component identities."""
+    return binding.seen_tool_litellm if tool else binding.seen_litellm
+
+
+def _duplicate(
+    binding: _Binding, cid: str, lid: str | None, entry: _Pending | None, *, tool: bool = False
+) -> bool:
     return (
         not binding.active
         or binding.closing
         or cid in binding.recorded
-        or (lid is not None and lid in binding.seen_litellm)
+        or (lid is not None and lid in _dedup_index(binding, tool))
         or (
             entry is not None and (entry.state == "abandoned" or id(entry.scope) in binding.drained)
         )
@@ -675,7 +721,9 @@ def _append(
         outcome.contain(error, ValueError, "LLM journal append")
     binding.recorded.add(call.id)
     if call.litellm_call_id is not None:
-        binding.seen_litellm[call.litellm_call_id] = call.id
+        _dedup_index(binding, call.role == "tool" and call.reservation_id is None)[
+            call.litellm_call_id
+        ] = call.id
     if identity is not None and call.status == "ok" and not call.cache_hit:
         binding.original(identity, call.id)
 
@@ -729,6 +777,10 @@ def _owns_callback(binding: _Binding, meta: dict[str, str]) -> bool:
     """Require owner provenance before routing a late report into a successor."""
     if not binding.active:
         return False
+    if binding.clock is None:
+        # Maintenance has no funded lineage. Only explicit current-owner
+        # observations can enter; old callbacks retain their ignored outcome.
+        return meta.get("owner_epoch") == str(binding.journal.epoch)
     scope = current_llm_scope()
     if (
         scope is not None
@@ -784,6 +836,7 @@ async def record_call(
     settle: bool,
     charge_reservation: bool = False,
     cache_identity: str | None = None,
+    _external_observation: bool = False,
 ) -> LLMCall | None:
     """Prepare, journal and settle one call, suppressing duplicate or late reports.
 
@@ -821,6 +874,11 @@ async def record_call(
     cache_identity : str or None, optional
         SHA-256 of the namespace, effective key and generating response identity.
         Missing/ambiguous provenance leaves cached_from_call_id unset.
+
+    _external_observation : bool, default=False
+        Private core ingestion path for settlement-free external observations.
+        Without a pending reservation, require tool role, never adopt an ambient
+        funded scope, and use a separate tool-observation dedup namespace.
 
     Returns
     -------
@@ -867,6 +925,7 @@ async def record_call(
         settle=settle,
         charge_reservation=charge_reservation,
         cache_identity=cache_identity,
+        _external_observation=_external_observation,
     )
     if asyncio.get_running_loop() is not binding.loop:
         future = asyncio.run_coroutine_threadsafe(_record(binding, meta, kwargs), binding.loop)
@@ -879,7 +938,25 @@ async def _record(
 ) -> LLMCall | None:
     if not _owns_callback(binding, meta):
         return None
+    external = kwargs.get("_external_observation", False)
+    if binding.clock is None and (
+        external is not True
+        or kwargs["settle"] is not False
+        or kwargs["charge_reservation"]
+        or meta.get("role") != "tool"
+        or "reservation_id" in meta
+        or "call_id" in meta
+        or current_llm_scope() is not None
+        or not isinstance(kwargs["litellm_call_id"], str)
+        or not kwargs["litellm_call_id"].startswith("gw:")
+    ):
+        raise _core_error(ValueError, "maintenance binding accepts only external tool observations")
+    if type(external) is not bool or (external and kwargs["settle"]):
+        raise _core_error(ValueError, "invalid external observation")
     entry = binding.pending.get(meta.get("reservation_id", ""))
+    if external and entry is None and meta.get("role") != "tool":
+        raise _core_error(ValueError, "external observation requires tool role")
+    tool = entry is None and meta.get("role") == "tool" and not meta.get("reservation_id")
     cid = meta.get("call_id") or (entry.call_id if entry is not None else binding.ids.next("llm"))
     reservation = binding.call_reservations.get(cid)
     if reservation is not None and meta.get("reservation_id") != reservation:
@@ -887,7 +964,7 @@ async def _record(
     lid = kwargs["litellm_call_id"]
     if lid is not None:
         lid = _context_string(lid, "litellm_call_id")
-    if _duplicate(binding, cid, lid, entry):
+    if _duplicate(binding, cid, lid, entry, tool=tool):
         return None
     binding.check()
     try:
@@ -896,13 +973,18 @@ async def _record(
             partial(_prepare, partial(_prepare_call, meta, cid, entry, kwargs)),
             entry=entry,
         )
-        if not ready or _duplicate(binding, cid, lid, entry):
+        if not ready or _duplicate(binding, cid, lid, entry, tool=tool):
             return None
         assert prepared is not None
         call = prepared.call
         if binding.tracing.store_payloads:
-            refs: list[str] = []
-            for content in (prepared.request, prepared.response):
+            refs: dict[str, str] = {}
+            for field, content in (
+                ("request_ref", prepared.request),
+                ("response_ref", prepared.response),
+            ):
+                if content is None:
+                    continue
                 ready, digest = await _owned(
                     binding,
                     partial(
@@ -910,11 +992,11 @@ async def _record(
                     ),
                     entry=entry,
                 )
-                if not ready or _duplicate(binding, cid, lid, entry):
+                if not ready or _duplicate(binding, cid, lid, entry, tool=tool):
                     return None
                 assert digest is not None
-                refs.append(digest)
-            call = call.model_copy(update={"request_ref": refs[0], "response_ref": refs[1]})
+                refs[field] = digest
+            call = call.model_copy(update=refs)
         if call.cache_hit and prepared.cache_identity is not None:
             call = call.model_copy(
                 update={"cached_from_call_id": binding.originals.get(prepared.cache_identity)}
@@ -923,7 +1005,7 @@ async def _record(
         if entry is not None:
             entry.state = "claimed"
         _append(binding, call, prepared.request_sha, prepared.cache_identity)
-        scope = entry.scope if entry is not None else current_llm_scope()
+        scope = entry.scope if entry is not None else None if external else current_llm_scope()
         if scope is not None and scope.run_id == call.run_id:
             for owner in scope.lineage():
                 if call.id not in owner.call_ids:
@@ -1159,10 +1241,13 @@ async def _bound_run(
     artifacts: ArtifactStore,
     config: RunConfig,
     stops: StopState,
-    clock: RunClock,
+    clock: RunClock | None,
     state: RunState,
+    _maintenance_lease: Lease | None = None,
 ) -> AsyncGenerator[None]:
     """Bind once, then drain/close within usable services and unbind on every exit."""
+    if clock is None and _maintenance_lease is None:
+        raise _core_error(ValueError, "maintenance binding requires the held writer lease")
     bind_run(
         run_id,
         journal=journal,
@@ -1176,8 +1261,18 @@ async def _bound_run(
         clock=clock,
         limits=config.limits,
         settle_timeout_s=config.settle_timeout_s,
+        _maintenance_lease=_maintenance_lease,
     )
     binding = _bindings[run_id]
+    if _maintenance_lease is not None:
+        # There is no funded state to drain. Hard controls and cancellation
+        # therefore unbind synchronously without entering paid-work cleanup.
+        try:
+            yield
+        finally:
+            if _bindings.get(run_id) is binding:
+                unbind_run(run_id, journal=journal)
+        return
     failed = False
     try:
         yield
@@ -1191,7 +1286,7 @@ async def _bound_run(
             or binding.stops.stop
             or binding.stops.stop_now
             or binding.stops.run_timeout
-            or binding.clock.left(binding.limits.run_timeout_s) <= 0
+            or (binding.clock is not None and binding.clock.left(binding.limits.run_timeout_s) <= 0)
         ):
             binding.begin_cleanup()
         failure: BaseException | None = None

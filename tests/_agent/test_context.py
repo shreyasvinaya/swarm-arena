@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.engine import CtxEnv
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import AlwaysFailCheck
@@ -488,7 +489,7 @@ async def test_parallel_run_tool_respects_last_budget_share(
             release.set()
             return error
 
-    with anyio.fail_after(10):
+    with anyio.fail_after(60):
         results = await _gather(run(1.0), run(2.0))
     assert sum(isinstance(result, Candidate) for result in results) == 1
     assert [result.limit for result in results if isinstance(result, LimitReached)] == ["budget"]
@@ -570,7 +571,7 @@ async def test_read_snapshot_is_taken_before_tool_awaits(
 
     async with anyio.create_task_group() as group:
         group.start_soon(run)
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await entered.wait()
         ctx.read_learning("L-2")
         release.set()
@@ -782,7 +783,7 @@ async def test_simultaneous_contexts_and_cancellation_keep_charges_independent(
 
     async with anyio.create_task_group() as group:
         group.start_soon(run)
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await entered.wait()
         b.search_learnings("parallel")
         scope.cancel()
@@ -1098,22 +1099,19 @@ async def test_escaped_action_lifetime_is_revoked(
     )
     parent = asyncio.create_task(ctx.call_action("spawn", {}))
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await entered.wait()
         if cancelled:
             parent.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await parent
+                await observe_task(parent)
         else:
-            await parent
+            await observe_task(parent)
         release.set()
-        await children[0]
+        await observe_task(children[0])
     finally:
         release.set()
-        for task in [parent, *children]:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(parent, *children, return_exceptions=True)
+        await settle_tasks(parent, *children)
     assert sum(isinstance(result, LimitReached) for result in results) == (1 if available else 2)
     assert all(
         result.limit == "max_turns_per_round"
@@ -1392,7 +1390,7 @@ async def test_run_tool_preserves_live_gate_after_registry_closes(
     (parent if closed_registry == "parent" else owned).close()
 
     with (
-        anyio.fail_after(2),
+        anyio.fail_after(60),
         track_inflight(owned),
         pytest.raises(LimitReached) as caught,
     ):

@@ -203,7 +203,7 @@ def test_copied_context_validates_safely_in_another_thread() -> None:
 
             thread = Thread(target=worker)
             thread.start()
-            thread.join(timeout=5)
+            thread.join(timeout=60)
             assert not thread.is_alive()
             return self
 

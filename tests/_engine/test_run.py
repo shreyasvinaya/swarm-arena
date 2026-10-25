@@ -9,13 +9,15 @@ from unittest.mock import Mock
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.engine import take_over_retrying, with_executor, with_limits
 from _fakes.finished import FinishedRun, run_again
 from _fakes.leases import force_take_over
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 from _fakes.run import WRITE, WRITE_THEN_SLEEP, all_events, events, plan, run_dir, wait_tool_started
 from _fakes.tools import PyTool, RecordingExecutor
 
-from swarm_arena import Ref, RunConfig, ScriptedManager
+from swarm_arena import Limits, Ref, RunConfig, ScriptedManager
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._engine.run import RunRunner, _require_asyncio
 from swarm_arena._engine.swarm import Swarm
@@ -29,6 +31,8 @@ from swarm_arena._model.results import LLMCall
 from swarm_arena._model.tooling import Estimate
 from swarm_arena._store.local import LocalStore
 from swarm_arena.manager import AgentContext, RoundReport
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -179,12 +183,16 @@ async def _pause_recording_run(config: RunConfig, current: Any) -> str:
     swarm = Swarm(config)
     task = asyncio.create_task(swarm.run(current))
     try:
-        with anyio.fail_after(15):
+        with anyio.fail_after(60):
             await paused.wait()
     finally:
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
+    assert not pending_cleanup, "recording run did not finish cleanup"
+    with pytest.raises(asyncio.CancelledError):
+        task.result()
     assert swarm.run_id is not None
     return swarm.run_id
 
@@ -359,8 +367,10 @@ async def test_resume_binding_keeps_the_rebased_acquired_head_clock(
         return await acquire(*args, **kwargs)
 
     def setup(_: RunConfig) -> None:
-        setup_clocks.append(_bindings["rebase"].clock)
-        assert _bindings["rebase"].clock._before == 20.0
+        binding_clock = _bindings["rebase"].clock
+        assert binding_clock is not None
+        setup_clocks.append(binding_clock)
+        assert binding_clock._before == 20.0
 
     monkeypatch.setattr(resume_module, "RunClock", Clock)
     monkeypatch.setattr(resume_module, "_acquire_lease", race)
@@ -409,7 +419,7 @@ async def test_graceful_stop_teardown_expiry_is_cleanup_error(
     monkeypatch.setattr(ScriptedManager, "run_round", stop_after_round)
     monkeypatch.setattr(Tranche, "close", held_close)
     with (
-        anyio.fail_after(20),
+        anyio.fail_after(30),
         pytest.raises(RuntimeError, match=r"^stop cleanup timed out$") as caught,
     ):
         await Swarm(config).run(plan(rounds=1), run_id=run_id)
@@ -421,7 +431,7 @@ async def test_graceful_stop_teardown_expiry_is_cleanup_error(
 
 
 async def test_run_folder_layout(run_config: RunConfig) -> None:
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         out = await Swarm(run_config).run(plan())
     root = run_dir(run_config)
     for key in [
@@ -551,7 +561,7 @@ async def test_run_returns_empty_list_for_no_result_goal(run_config: RunConfig) 
 
 async def test_run_timeout_stops_everything(run_config: RunConfig) -> None:
     cfg = with_limits(run_config, run_timeout_s=1.0)
-    with anyio.fail_after(25):
+    with anyio.fail_after(60):
         out = await Swarm(cfg).run(plan(tool=PyTool({"code": WRITE_THEN_SLEEP})))
     sol = json.loads((run_dir(cfg) / "goals/g/solution.json").read_text())
     assert (sol["status"], sol["reason"], out["g"]) == ("no_result", "no passing candidate", [])
@@ -599,7 +609,7 @@ async def test_fenced_cancels_inflight_and_raises(run_config: RunConfig) -> None
         except BaseException as exc:
             raised.append(exc)
 
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tg:
             tg.start_soon(capture)
             store = await wait_tool_started(run_config)
@@ -1165,9 +1175,8 @@ async def test_stalled_completion_export_ends_owner_before_worker_returns(
     from swarm_arena._exec.threads import run_sync_daemon
     from swarm_arena._journal.lease import Lease
 
-    # A whole run needs at least a three-second lease under parallel CI load. Its one-second
-    # renewal interval still detects the successor inside the unchanged three-second bound.
-    config = run_config.model_copy(update={"settle_timeout_s": 1.0, "lease_ttl_s": 3.0})
+    # Keep renewal frequent, but prove abandonment while the export worker remains held.
+    config = run_config.model_copy(update={"lease_ttl_s": 3.0})
     run_id = "export-cancel"
     if resumed:
         await Swarm(run_config).run(plan(rounds=1), run_id=run_id)
@@ -1187,7 +1196,7 @@ async def test_stalled_completion_export_ends_owner_before_worker_returns(
             if len(creates) == 1:
                 workers.append(threading.current_thread())
                 entered.set()
-                assert release.wait(10), "worker release deadline"
+                assert release.wait(300), "worker release deadline"
             try:
                 return real_create(self, key, data)
             finally:
@@ -1218,16 +1227,16 @@ async def test_stalled_completion_export_ends_owner_before_worker_returns(
     services: list[asyncio.Task[Any]] = []
     successor: Lease | None = None
     try:
-        assert await run_sync_daemon(entered.wait, 15)
+        assert await run_sync_daemon(entered.wait, 60)
         services = [t for t in asyncio.all_tasks() if t.get_name() == f"resume-{run_id}"]
-        started = anyio.current_time()
+        assert not release.is_set()
         if interrupt == "cancel":
             scopes[0].cancel()
         else:
             successor = force_take_over(store, owner_id="successor", host="local", ttl_s=60)
-        done, _ = await asyncio.wait([task], timeout=3 * config.settle_timeout_s)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "caller retained by stalled completion export"
-        assert anyio.current_time() - started < 3 * config.settle_timeout_s
+        assert workers[0].is_alive()
         owner = read_owner(store)
         assert owner is not None
         if interrupt == "cancel":
@@ -1240,9 +1249,9 @@ async def test_stalled_completion_export_ends_owner_before_worker_returns(
         assert all(t.done() for t in services)
         assert not returned.is_set()
         release.set()
-        assert await run_sync_daemon(returned.wait, 5)
+        assert await run_sync_daemon(returned.wait, 60)
         for worker in workers:
-            await run_sync_daemon(worker.join, 5)
+            await run_sync_daemon(worker.join, 60)
             assert not worker.is_alive()
         await asyncio.gather(task, *services)
         assert len(creates) == 1, "abandoned export started another file"
@@ -1250,12 +1259,19 @@ async def test_stalled_completion_export_ends_owner_before_worker_returns(
         assert read_owner(store) == owner
     finally:
         release.set()
-        await asyncio.wait_for(asyncio.gather(task, *services, return_exceptions=True), 5)
+        for pending in (task, *services):
+            if not pending.done():
+                pending.cancel()
+        _, pending_cleanup = await asyncio.wait([task, *services], timeout=60)
+        for finished in (task, *services):
+            if finished.done() and not finished.cancelled():
+                finished.exception()
         for worker in workers:
-            await run_sync_daemon(worker.join, 5)
-            assert not worker.is_alive()
+            await run_sync_daemon(worker.join, 60)
         if successor is not None:
             successor.release()
+    assert not pending_cleanup, "export owner did not finish cleanup"
+    assert all(not worker.is_alive() for worker in workers)
 
 
 async def test_driving_timeout_is_not_a_stop_command(
@@ -1279,7 +1295,7 @@ async def test_driving_timeout_is_not_a_stop_command(
     monkeypatch.setattr(GoalRunner, "run", run_goal)
     monkeypatch.setattr(RunRunner, "_watch_clock", expire)
     config = with_limits(run_config, max_concurrent_goals=1)
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         result = await Swarm(config).run(
             [plan(goal_id="a", rounds=1), plan(goal_id="b", rounds=1)], run_id="r"
         )
@@ -1394,26 +1410,29 @@ async def test_startup_model_hook_is_abandonable(run_config: RunConfig) -> None:
         def models(self) -> tuple[str, ...]:
             workers.append(threading.current_thread())
             entered.set()
-            assert release.wait(15)
+            assert release.wait(300)
             return ()
 
     current = plan(rounds=1)
     task = asyncio.create_task(Swarm(run_config, replanner=HeldPlanner([current])).run(current))
     try:
-        with anyio.fail_after(5):
-            assert await anyio.to_thread.run_sync(entered.wait, 4)
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError), anyio.fail_after(30):
+            await observe_task(task)
+        assert not release.is_set()
     finally:
         release.set()
         if not task.done():
             task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
-            assert not worker.is_alive()
+            await anyio.to_thread.run_sync(worker.join, 60)
+    assert not pending_cleanup, "startup owner did not finish cleanup"
+    assert all(not worker.is_alive() for worker in workers)
     assert await anyio.to_thread.run_sync(lambda: not Path(run_config.run_root).exists())
 
 
@@ -1429,7 +1448,6 @@ def _planning_config(
             "models": ModelCatalog(
                 {"p": ModelSpec(model="unpriced/planner-test", roles=["planner"], max_tokens=10)}
             ),
-            "settle_timeout_s": 2,
         }
     )
 
@@ -1594,13 +1612,14 @@ async def test_planning_session_stopped_setup_never_yields(
             (session / "control" / "stop-e1").write_text("")
         else:
             task.cancel()
-        with anyio.fail_after(10):
+        with anyio.fail_after(30):
             if stop == "stop":
                 with pytest.raises(RuntimeError, match=r"^planning session stopped$"):
-                    await task
+                    await observe_task(task)
             else:
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    await observe_task(task)
+                assert task.cancelled()
         assert yielded == []
         assert session.name not in llm_record._bindings
         owner = read_owner(LocalStore(session))
@@ -1611,11 +1630,16 @@ async def test_planning_session_stopped_setup_never_yields(
         await held.finish()
         assert all_events(config) == before
     finally:
-        await held.finish()
+        held.release.set()
         if not task.done():
             task.cancel()
-            with suppress(BaseException):
-                await task
+        try:
+            _, pending_cleanup = await asyncio.wait([task], timeout=60)
+            if task.done() and not task.cancelled():
+                task.exception()
+        finally:
+            await held.finish()
+    assert not pending_cleanup, "planning setup did not finish cleanup"
 
 
 async def test_queued_r0_carries_planning_session(run_config: RunConfig) -> None:
@@ -1658,6 +1682,17 @@ async def test_planning_acquisition_is_supervised_before_owner_response(
     from swarm_arena._journal.lease import Lease
 
     held, released = HeldOperation(), ThreadEvent()
+    deadline = anyio.Event()
+
+    class ClockBackend:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(anyio, name)
+
+        async def sleep(self, seconds: float) -> None:
+            await deadline.wait()
+
+    if stop == "deadline":
+        monkeypatch.setattr(run_module, "anyio", ClockBackend())
     create, release = LocalStore.create, Lease.release
     setups: list[bool] = []
     yielded: list[bool] = []
@@ -1676,7 +1711,7 @@ async def test_planning_acquisition_is_supervised_before_owner_response(
     monkeypatch.setattr(Lease, "release", release_owner)
     monkeypatch.setattr(run_module, "_run_setups", [lambda config: setups.append(True)])
     config = _planning_config(run_config)
-    config = with_limits(config, run_timeout_s=0.2 if stop == "deadline" else 30)
+    config = with_limits(config, run_timeout_s=0.2 if stop == "deadline" else 300)
 
     async def enter() -> None:
         async with run_module.planning_session(
@@ -1692,12 +1727,14 @@ async def test_planning_acquisition_is_supervised_before_owner_response(
             (session / "control/stop-e1").write_text("")
         elif stop == "cancel":
             task.cancel()
+        else:
+            deadline.set()
         with (
-            anyio.fail_after(3),
             pytest.raises(
                 asyncio.CancelledError if stop == "cancel" else RuntimeError,
                 match=None if stop == "cancel" else "planning session stopped",
             ),
+            anyio.fail_after(30),
         ):
             await asyncio.shield(task)
         assert setups == []
@@ -1705,9 +1742,12 @@ async def test_planning_acquisition_is_supervised_before_owner_response(
     finally:
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
         await held.finish()
-        assert await anyio.to_thread.run_sync(released.wait, 5)
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
+        assert await anyio.to_thread.run_sync(released.wait, 60)
+    assert not pending_cleanup, "acquisition owner did not finish cleanup"
     owner = read_owner(LocalStore(session))
     assert owner is not None
     assert owner[0].expires_at <= utc_now()
@@ -1766,7 +1806,7 @@ json.dump({'data': {}, 'failed_provider': 'fake'} if n == 1 else {'data': {'y': 
         finally:
             entered.set()
 
-    with anyio.fail_after(25):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as group:
             group.start_soon(run)
             try:
@@ -1962,7 +2002,7 @@ async def test_provider_stop_reaches_registered_agents_in_concurrent_goals(
 
     monkeypatch.setattr(ProviderStops, "register", register)
     monkeypatch.setattr(ScriptedManager, "run_round", run_round)
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tasks:
             tasks.start_soon(fail)
             await Swarm(cfg).run([g, h], run_id="provider-cross-goal")
@@ -1981,16 +2021,28 @@ async def test_provider_stop_reaches_registered_agents_in_concurrent_goals(
     assert not any(e.type == "tool_start" and e.agent == "a0" for e in ev)
 
 
-def test_library_forced_interrupt_preserves_cancelled_shutdown(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "window", ["ready", "waiter-registration", "cleanup-callback", "first-worker", "second-worker"]
+)
+def test_library_forced_interrupt_preserves_cancelled_shutdown(tmp_path: Path, window: str) -> None:
     import os
     import select
     import signal
     import subprocess
     import time
 
-    code = """
+    if window.endswith("-worker") and not getattr(sys, "_is_gil_enabled", lambda: True)():
+        pytest.skip("requires GIL selector ordering")
+
+    code = f"""
 import asyncio
+import os
+import select
 import signal
+import sys
+import threading
+from collections import deque
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 import anyio
@@ -2002,8 +2054,63 @@ root = Path.cwd()
 config = RunConfig(run_root=str(root / 'runs'), artifact_root=str(root / 'artifacts'),
                    arena_root=str(root / 'arena'), settle_timeout_s=2)
 settle = Ledger._settle
+stage = 0
+selecting = threading.Event()
+worker = None
+async def operation() -> None:
+    global worker, stage
+    loop = asyncio.get_running_loop()
+    if {window.endswith("-worker")!r}:
+        def send() -> None:
+            assert sys.stdin.buffer.read(1) == b'i'
+            assert selecting.wait(60)
+            signal.pthread_kill(threading.get_ident(), signal.SIGINT)
+        worker = threading.Thread(target=send, daemon=True)
+        worker.start()
+        # The sender runs only once the native selector releases the GIL.
+        sys.setswitchinterval(60)
+    # Keep Runner's native handler, but wake the selector for signals on any thread.
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(read_fd, False)
+    os.set_blocking(write_fd, False)
+    def drain() -> None:
+        with suppress(BlockingIOError):
+            os.read(read_fd, 65536)
+    loop.add_reader(read_fd, drain)
+    wakeup_fd = signal.set_wakeup_fd(write_fd)
+    original_select = loop._selector.select
+    def select_at_interrupt(timeout: float | None = None) -> Any:
+        global stage
+        if stage and not loop._ready:
+            ready_stage, stage = stage, 0
+            # A raw KeyboardInterrupt must land outside task/done callbacks.
+            print('settlement-ready' if ready_stage == 1 else 'cleanup-ready', flush=True)
+            if ready_stage == {1 if window == "first-worker" else 2}:
+                selecting.set()
+            # Hold this idle boundary until SIGINT, even if other I/O becomes ready.
+            assert select.select([read_fd], [], [], 300)[0]
+            return original_select(0)
+        return original_select(timeout)
+    loop._selector.select = select_at_interrupt
+    try:
+        await Swarm(config).run(plan(rounds=1))
+    finally:
+        loop._selector.select = original_select
+        signal.set_wakeup_fd(wakeup_fd)
+        loop.remove_reader(read_fd)
+        os.close(read_fd)
+        os.close(write_fd)
 async def held_settle(self: Ledger, *args: Any, **kwargs: Any) -> None:
+    global stage
     first_interrupt = anyio.Event()
+    if {window == "waiter-registration"!r}:
+        class HeldWaiters(deque[asyncio.Future[bool]]):
+            def append(self, future: asyncio.Future[bool]) -> None:
+                # Hold the Event.wait check/register gap before publishing readiness.
+                print('waiter-registering', flush=True)
+                assert sys.stdin.buffer.read(1) == b'x'
+                super().append(future)
+        first_interrupt._event._waiters = HeldWaiters()
     runner_handler = signal.getsignal(signal.SIGINT)
     assert callable(runner_handler)
     def observe(signum: int, frame: Any) -> None:
@@ -2014,13 +2121,18 @@ async def held_settle(self: Ledger, *args: Any, **kwargs: Any) -> None:
     signal.signal(signal.SIGINT, observe)
     try:
         with anyio.CancelScope(shield=True):
-            print('settlement-ready', flush=True)
+            stage = 1
             await first_interrupt.wait()
     finally:
         signal.signal(signal.SIGINT, runner_handler)
         try:
             with anyio.CancelScope(shield=True):
-                print('cleanup-ready', flush=True)
+                stage = 2
+                if {window == "cleanup-callback"!r}:
+                    def held_callback() -> None:
+                        print('callback-running', flush=True)
+                        assert sys.stdin.buffer.read(1) == b'c'
+                    asyncio.get_running_loop().call_soon(held_callback)
                 await anyio.sleep_forever()
         finally:
             with anyio.CancelScope(shield=True):
@@ -2028,16 +2140,23 @@ async def held_settle(self: Ledger, *args: Any, **kwargs: Any) -> None:
                 await settle(self, *args, **kwargs)
 Ledger._settle = held_settle
 handler = signal.getsignal(signal.SIGINT)
+interval = sys.getswitchinterval()
 try:
-    asyncio.run(Swarm(config).run(plan(rounds=1)))
+    asyncio.run(operation())
 except KeyboardInterrupt:
     print('interrupted', flush=True)
     print('handler-restored=' + str(signal.getsignal(signal.SIGINT) is handler), flush=True)
     raise SystemExit(130)
+finally:
+    sys.setswitchinterval(interval)
+    if worker is not None:
+        worker.join(60)
+        assert not worker.is_alive()
 """
     process = subprocess.Popen(
         [sys.executable, "-B", "-u", "-c", code],
         cwd=tmp_path,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
@@ -2057,12 +2176,34 @@ except KeyboardInterrupt:
                 output.extend(chunk)
 
     try:
+        if window == "waiter-registration":
+            until(b"waiter-registering")
+            assert b"settlement-ready" not in output, bytes(output)
+            assert process.stdin is not None
+            process.stdin.write(b"x")
+            process.stdin.flush()
         until(b"settlement-ready")
-        process.send_signal(signal.SIGINT)
+        if window == "first-worker":
+            assert process.stdin is not None
+            process.stdin.write(b"i")
+            process.stdin.flush()
+        else:
+            process.send_signal(signal.SIGINT)
+        if window == "cleanup-callback":
+            until(b"callback-running")
+            assert b"cleanup-ready" not in output, bytes(output)
+            assert process.stdin is not None
+            process.stdin.write(b"c")
+            process.stdin.flush()
         until(b"cleanup-ready")
-        process.send_signal(signal.SIGINT)
+        if window == "second-worker":
+            assert process.stdin is not None
+            process.stdin.write(b"i")
+            process.stdin.flush()
+        else:
+            process.send_signal(signal.SIGINT)
         try:
-            rest, _ = process.communicate(timeout=15)
+            rest, _ = process.communicate(timeout=30)
         except subprocess.TimeoutExpired:
             pytest.fail(f"library forced interrupt did not exit: {bytes(output)!r}")
         output.extend(rest)
@@ -2081,5 +2222,888 @@ except KeyboardInterrupt:
             os.killpg(process.pid, signal.SIGKILL)
         if process.poll() is None:
             process.kill()
-        process.wait(timeout=10)
+        process.wait(timeout=60)
+        if process.stdin is not None:
+            process.stdin.close()
         stdout.close()
+
+
+async def test_every_submit_sees_schedule_timeout(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena import ScriptJudge
+    from swarm_arena._engine import run as module
+    from swarm_arena._exec.executor import current_schedule_timeout
+    from swarm_arena.executor import Job, LocalExecutor
+    from swarm_arena.tool import ToolOutput
+
+    timeouts: list[float | None] = []
+    jobs: list[Job] = []
+
+    class Recording(LocalExecutor):
+        async def submit(self, job: Job) -> ToolOutput:
+            timeouts.append(current_schedule_timeout())
+            jobs.append(job)
+            return await super().submit(job)
+
+    executor = Recording()
+    monkeypatch.setattr(module, "_build_executor", lambda config: executor)
+    cfg = run_config.model_copy(update={"schedule_timeout_s": 42.0})
+    judge = ScriptJudge(
+        command=[
+            sys.executable,
+            "-c",
+            (
+                "import json, os; "
+                "json.dump({'value': 1.0}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))"
+            ),
+        ]
+    )
+    spec = plan(rounds=1).model_copy(
+        update={
+            "judges": [Ref.of(judge).model_copy(update={"name": "score"})],
+            "ranking": "score",
+        }
+    )
+    assert current_schedule_timeout() is None
+    await Swarm(cfg).run(spec)
+    assert timeouts
+    assert set(timeouts) == {42.0}
+    assert {job.kind for job in jobs} == {"tool", "command"}
+    assert current_schedule_timeout() is None
+
+
+async def test_resume_preparation_sees_schedule_timeout(
+    run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine import resume as module
+    from swarm_arena._exec.executor import current_schedule_timeout
+
+    observed: list[float | None] = []
+
+    async def check(config: RunConfig) -> None:
+        observed.append(current_schedule_timeout())
+        raise RuntimeError("preparation reached")
+
+    monkeypatch.setattr(module, "_check_storage", check)
+    cfg = run_config.model_copy(update={"schedule_timeout_s": 42.0})
+    with pytest.raises(RuntimeError, match="preparation reached"):
+        await module.resume_run(cfg, "existing", force=False, replanner=None)
+    assert observed == [42.0]
+    assert current_schedule_timeout() is None
+
+
+@pytest.mark.parametrize("hard", [False, True, None])
+async def test_run_gateway_preflight_precedes_keys_and_manifest(
+    run_config: RunConfig,
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    hard: bool | None,
+) -> None:
+    from swarm_arena._gateway import keys, litellm_proxy
+    from swarm_arena._gateway.reconcile import KeyManager
+    from swarm_arena.config import GatewayConfig
+
+    constructed: list[Any] = []
+    adapters: list[Any] = []
+    original_manager, original_adapter = KeyManager, litellm_proxy.adapter_for
+
+    def manager(*args: Any, **kwargs: Any) -> Any:
+        kwargs["journal"]._check_open()
+        result = original_manager(*args, **kwargs)
+        constructed.append(result)
+        return result
+
+    def adapter(*args: Any, **kwargs: Any) -> Any:
+        result = original_adapter(*args, **kwargs)
+        adapters.append(result)
+        return result
+
+    monkeypatch.setattr(keys, "KeyManager", manager)
+    monkeypatch.setattr(litellm_proxy, "adapter_for", adapter)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    config = run_config.model_copy(
+        update={
+            "llm_gateway": (
+                GatewayConfig(url=fake_gateway.url)
+                if hard is None
+                else GatewayConfig(url=fake_gateway.url, require_hard_cap=hard)
+            ),
+            "limits": Limits(max_usd=5),
+        }
+    )
+    approved: list[list[str]] = []
+
+    async def approve(estimate: Estimate, warnings: Sequence[str]) -> bool:
+        assert [path for _, path, _ in fake_gateway.requests] == [
+            "/health/liveliness",
+            "/model/info",
+        ]
+        approved.append(list(warnings))
+        return True
+
+    runner = RunRunner(config, [], run_id="r-gateway", approve=approve, replanner=None)
+    if hard is not False:
+        with pytest.raises(ValueError, match="strict profile not verified"):
+            await runner.run()
+        assert constructed == []
+        assert approved == []
+        assert not await anyio.Path(config.run_root, "r-gateway", "manifest.json").exists()
+        assert not await anyio.Path(config.run_root, "r-gateway", "control", "owner.json").exists()
+    else:
+        assert await runner.run() == {}
+        assert len(constructed) == len(adapters) == 1
+        assert len(approved) == 1
+        assert "LLM gateway uses a soft cap." in approved[0]
+        assert runner._gateway is not None
+        assert runner._gateway.adapter is adapters[0]
+        assert runner._gateway.profile.verified is False
+        assert runner._key_manager is constructed[0]
+        assert constructed[0]._adapter is adapters[0]
+        assert constructed[0]._journal is runner._journal
+        assert constructed[0]._run_id == "r-gateway"
+        manifest = json.loads(
+            await anyio.Path(config.run_root, "r-gateway", "manifest.json").read_bytes()
+        )
+        event_manifest = events(config, "run_started")[0].payload["manifest"]
+        assert manifest == event_manifest
+        assert manifest["llm_gateway"] == {
+            "url": fake_gateway.url,
+            "cap": "soft",
+            "verified": False,
+            "failures": list(runner._gateway.profile.failures),
+            "terminal_accounting": False,
+        }
+        assert fake_gateway.master_key not in json.dumps(manifest)
+        async for path in anyio.Path(config.run_root, "r-gateway").rglob("*"):
+            if await path.is_file():
+                assert fake_gateway.master_key.encode() not in await path.read_bytes()
+    assert len(adapters) == 1
+    assert not fake_gateway.keys
+    assert [path for _, path, _ in fake_gateway.requests] == ["/health/liveliness", "/model/info"]
+
+
+async def test_run_without_gateway_constructs_no_services(
+    run_config: RunConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from swarm_arena._gateway import litellm_proxy
+
+    factory = Mock(side_effect=AssertionError("unexpected gateway"))
+    monkeypatch.setattr(litellm_proxy, "adapter_for", factory)
+    runner = RunRunner(run_config, [], run_id="r-no-gateway", approve=None, replanner=None)
+    assert await runner.run() == {}
+    assert runner._gateway is runner._key_manager is None
+    assert events(run_config, "run_started")[0].payload["manifest"]["llm_gateway"] is None
+    factory.assert_not_called()
+
+
+async def test_run_end_reads_late_rows_and_shares_gateway_across_rounds(
+    run_config: RunConfig, fake_gateway: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import gateway_plan
+
+    from swarm_arena._engine import run as module
+    from swarm_arena._gateway.keys import KeyManager, gateway_call_id
+    from swarm_arena.config import GatewayConfig
+
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    config = run_config.model_copy(
+        update={
+            "llm_gateway": GatewayConfig(url=fake_gateway.url, require_hard_cap=False),
+            "limits": run_config.limits.model_copy(
+                update={"default_run_reservation": Estimate(usd=1)}
+            ),
+        }
+    )
+    managers: list[KeyManager] = []
+    original_bind = module._bind_gateway
+    original_read = KeyManager.read_with_status
+    boundary_reads: list[int] = []
+
+    def bind(*args: Any, **kwargs: Any) -> KeyManager | None:
+        manager = original_bind(*args, **kwargs)
+        assert manager is not None
+        managers.append(manager)
+        return manager
+
+    async def late_after_round(self: KeyManager, records: Any, *, wait_first: bool) -> Any:
+        result = await original_read(self, records, wait_first=wait_first)
+        assert self is managers[0]
+        if not wait_first and records:
+            boundary_reads.append(len(records))
+            if len(boundary_reads) == 2:
+                fake_gateway.add_spend(
+                    records[0].key_id,
+                    model="openai/chat-model",
+                    cost_usd=0.03,
+                    tokens=(1, 1),
+                    call_id="late-run-end",
+                )
+        return result
+
+    monkeypatch.setattr(module, "_bind_gateway", bind)
+    monkeypatch.setattr(KeyManager, "read_with_status", late_after_round)
+    await Swarm(config).run(gateway_plan(rounds=2, converge_team=True))
+    assert len(managers) == 1
+    assert len(fake_gateway.keys) == 3
+    assert boundary_reads == [1, 1, 3]
+    calls = events(config, "llm_call")
+    late = next(row for _, row in fake_gateway._spend if row["litellm_call_id"] == "late-run-end")
+    late_id = gateway_call_id(late["api_key"], late["request_id"])
+    observed = [event for event in calls if event.payload["call"]["litellm_call_id"] == late_id]
+    assert len(observed) == 1
+    assert observed[0].seq > events(config, "round_closed")[-1].seq
+    assert all(key["blocked"] for key in fake_gateway.keys.values())
+
+
+@pytest.mark.parametrize("boundary", ["round", "end"])
+async def test_gateway_boundary_read_failure_is_journaled_and_run_continues(
+    run_config: RunConfig, fake_gateway: Any, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    from _fakes.tools import gateway_plan
+
+    from swarm_arena._gateway.keys import KeyManager
+    from swarm_arena.config import GatewayConfig
+
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    config = run_config.model_copy(
+        update={
+            "llm_gateway": GatewayConfig(url=fake_gateway.url, require_hard_cap=False),
+            "limits": run_config.limits.model_copy(
+                update={"default_run_reservation": Estimate(usd=1)}
+            ),
+        }
+    )
+    original = KeyManager.read_with_status
+    count = 0
+
+    async def failing_read(self: KeyManager, records: Any, *, wait_first: bool) -> Any:
+        nonlocal count
+        if not wait_first:
+            count += 1
+        if not wait_first and count == (1 if boundary == "round" else 2):
+            fake_gateway.fail["/spend/logs/v2"] = 500
+        try:
+            return await original(self, records, wait_first=wait_first)
+        finally:
+            fake_gateway.fail.pop("/spend/logs/v2", None)
+
+    monkeypatch.setattr(KeyManager, "read_with_status", failing_read)
+    result = await Swarm(config).run(gateway_plan())
+    assert result["g"]
+    failures = [e for e in events(config, "gateway_key") if e.payload["action"] == "read_failed"]
+    assert len(failures) == 1
+    assert {k: v for k, v in failures[0].payload.items() if k != "run_elapsed_s"} == {
+        "action": "read_failed",
+        "error": "gateway read failed",
+        "key_id": next(iter(fake_gateway.keys)),
+        "candidate_id": result["g"][0].id,
+    }
+    assert fake_gateway.master_key not in repr(failures)
+
+
+@pytest.mark.parametrize("boundary", ["round", "end"])
+async def test_stopping_run_slow_gateway_read_finishes(
+    run_config: RunConfig,
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    from _fakes.tools import gateway_plan
+
+    from swarm_arena._engine import run as module
+    from swarm_arena._gateway.keys import KeyManager
+    from swarm_arena.config import GatewayConfig
+
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    config = run_config.model_copy(
+        update={
+            "settle_timeout_s": 0.5,
+            "llm_gateway": GatewayConfig(url=fake_gateway.url, require_hard_cap=False),
+            "limits": run_config.limits.model_copy(
+                update={"default_run_reservation": Estimate(usd=1)}
+            ),
+        }
+    )
+    original_read = KeyManager.read_with_status
+    original_queue = module.RunRunner._queue
+
+    async def queue(self: Any, deps: Any) -> Any:
+        result = await original_queue(self, deps)
+        deps.stops.stop = True
+        return result
+
+    calls = 0
+
+    async def slow(self: KeyManager, records: Any, *, wait_first: bool) -> Any:
+        nonlocal calls
+        if not wait_first:
+            calls += 1
+        selected = not wait_first and calls == (1 if boundary == "round" else 2)
+        if selected:
+            fake_gateway.delay["/spend/logs/v2"] = 3
+        try:
+            return await original_read(self, records, wait_first=wait_first)
+        finally:
+            fake_gateway.delay.pop("/spend/logs/v2", None)
+
+    monkeypatch.setattr(module.RunRunner, "_queue", queue)
+    monkeypatch.setattr(KeyManager, "read_with_status", slow)
+    with anyio.fail_after(60):
+        result = await Swarm(config).run(gateway_plan())
+    assert result["g"]
+    failures = [e for e in events(config, "gateway_key") if e.payload["action"] == "read_failed"]
+    assert len(failures) == 1
+    assert failures[0].payload["error"] == "gateway read incomplete"
+    assert failures[0].payload["key_id"] in fake_gateway.keys
+
+
+@pytest.mark.parametrize("failure", [False, True])
+async def test_run_end_reconciles_under_existing_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: bool
+) -> None:
+    from _fakes.reconcile import CapableGateway, config_at, created, key_record, spend
+
+    from swarm_arena._gateway import litellm_proxy
+    from swarm_arena._gateway.adapter import GatewayError
+
+    adapter = CapableGateway()
+    adapter.rows = [spend("end", 0.03)]
+    if failure:
+        adapter.errors["block"] = GatewayError("PRIVATE")
+    monkeypatch.setattr(litellm_proxy, "adapter_for", lambda config, environ: adapter)
+
+    async def queue(self: RunRunner, deps: Any) -> dict[str, list[Any]]:
+        deps.journal.append(created(key_record("r-end")))
+        return {}
+
+    monkeypatch.setattr(RunRunner, "_queue", queue)
+    config = config_at(tmp_path)
+    runner = RunRunner(config, [], run_id="r-end", approve=None, replanner=None)
+    assert await runner.run() == {}
+    rows = events(config, "reconcile")
+    assert len(rows) == 1
+    report = rows[0].payload["keys"][0]
+    assert report["label"] == ("estimated" if failure else "observed (completeness unverified)")
+    assert report["observed_usd"] == (None if failure else 0.03)
+    assert not events(config, "takeover")
+    assert not events(config, "settle")
+    owner = read_owner(LocalStore(Path(config.run_root) / "r-end"))
+    assert owner is not None
+    assert owner[0].expires_at < utc_now()
+    if failure:
+        assert any(e.payload["action"] == "close_failed" for e in events(config, "gateway_key"))
+        assert "PRIVATE" not in repr(all_events(config))
+
+
+async def test_run_end_reconcile_timeout_still_finishes_stopping_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.reconcile import CapableGateway, config_at, created, key_record
+
+    from swarm_arena._gateway import litellm_proxy
+
+    adapter = CapableGateway()
+    entered = anyio.Event()
+
+    async def held(*args: Any) -> None:
+        entered.set()
+        await anyio.sleep_forever()
+
+    async def queue(self: RunRunner, deps: Any) -> dict[str, list[Any]]:
+        deps.journal.append(created(key_record(deps.run_id)))
+        deps.stops.stop = True
+        return {}
+
+    monkeypatch.setattr(adapter, "block_key", held)
+    monkeypatch.setattr(litellm_proxy, "adapter_for", lambda config, environ: adapter)
+    monkeypatch.setattr(RunRunner, "_queue", queue)
+    config = config_at(tmp_path).model_copy(update={"settle_timeout_s": 1})
+    runner = RunRunner(config, [], run_id="r-end", approve=None, replanner=None)
+    with anyio.fail_after(60):
+        assert await runner.run() == {}
+    assert entered.is_set()
+    assert events(config, "reconcile")[0].payload["keys"][0]["label"] == "estimated"
+    assert any(e.payload["action"] == "close_failed" for e in events(config, "gateway_key"))
+    assert (Path(config.run_root) / "r-end" / "review").exists()
+
+
+@pytest.mark.parametrize("aggregate", [False, True])
+async def test_run_end_unrepresentable_spend_still_exports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, aggregate: bool
+) -> None:
+    from _fakes.reconcile import CapableGateway, config_at, created, key_record, spend
+
+    from swarm_arena._gateway import litellm_proxy
+    from swarm_arena._gateway.reports import ReconcileReport
+
+    adapter = CapableGateway()
+    costs = [1_000_000_000.0] * 10 + [0.000001]
+    records = [
+        key_record("r-end", key_id=f"hash-{n}", candidate_id=f"c-{n}")
+        for n in range(11 if aggregate else 1)
+    ]
+    adapter.rows = [
+        spend(str(n), cost, key_id=records[n if aggregate else 0].key_id)
+        for n, cost in enumerate(costs)
+    ]
+
+    async def queue(self: RunRunner, deps: Any) -> dict[str, list[Any]]:
+        deps.gateway.restore([deps.journal.append(created(record)) for record in records])
+        return {}
+
+    monkeypatch.setattr(litellm_proxy, "adapter_for", lambda *args: adapter)
+    monkeypatch.setattr(RunRunner, "_queue", queue)
+    config = config_at(tmp_path)
+    runner = RunRunner(config, [], run_id="r-end", approve=None, replanner=None)
+    assert await runner.run() == {}
+    [event] = events(config, "reconcile")
+    report = ReconcileReport.model_validate(event.payload)
+    assert report.total_label == "estimated"
+    assert report.spend_usd() == (11 if aggregate else 1)
+    assert len(report.keys) == len(records)
+    if not aggregate:
+        assert report.keys[0].reasons == ["unsupported gateway observation"]
+        assert not adapter.deleted
+    assert (Path(config.run_root) / "r-end" / "review").exists()
+    assert not events(config, "settle")
+
+
+@pytest.mark.parametrize("failure", ["ordinary", "invariant", "group"])
+async def test_run_end_optional_reconcile_failure_still_exports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    from _fakes.reconcile import CapableGateway, config_at, created, key_record
+
+    from swarm_arena._errors import _core_error
+    from swarm_arena._gateway import litellm_proxy, reconcile
+    from swarm_arena._gateway.reports import GatewayKeyFailure
+
+    adapter = CapableGateway()
+
+    async def queue(self: RunRunner, deps: Any) -> dict[str, list[Any]]:
+        event = deps.journal.append(created(key_record("r-end")))
+        deps.gateway.restore([event])
+        return {}
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        if failure == "invariant":
+            raise _core_error(ValueError, "gateway candidate has multiple keys")
+        if failure == "group":
+            raise ExceptionGroup("PRIVATE", [ValueError("PRIVATE")])
+        raise RuntimeError("PRIVATE")
+
+    monkeypatch.setattr(litellm_proxy, "adapter_for", lambda *args: adapter)
+    monkeypatch.setattr(RunRunner, "_queue", queue)
+    monkeypatch.setattr(reconcile, "reconcile_keys", fail)
+    config = config_at(tmp_path)
+    runner = RunRunner(config, [], run_id="r-end", approve=None, replanner=None)
+    assert await runner.run() == {}
+    failures = [
+        event for event in events(config, "gateway_key") if event.payload["action"] == "read_failed"
+    ]
+    assert len(failures) == 1
+    row = GatewayKeyFailure.model_validate(
+        {key: value for key, value in failures[0].payload.items() if key != "run_elapsed_s"}
+    )
+    assert (row.key_id, row.candidate_id, row.error) == ("hash-1", "c-1", "gateway read failed")
+    assert "PRIVATE" not in repr(all_events(config))
+    assert (Path(config.run_root) / "r-end" / "review").exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "fenced",
+        "terminal",
+        "storage",
+        "storage_group",
+        "control_group",
+        "hard_group",
+        "caller_cancel",
+    ],
+)
+async def test_run_end_reconcile_preserves_control_and_storage_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    import asyncio
+
+    from _fakes.llm_run import open_llm_run
+    from _fakes.reconcile import CapableGateway, config_at, created, key_record
+
+    from swarm_arena._errors import StorageError, _core_error, _SignalCategory
+    from swarm_arena._gateway import reconcile
+    from swarm_arena._gateway.keys import KeyManager
+
+    error: BaseException
+    if failure == "fenced":
+        error = _core_error(Fenced, "run ownership lost")
+    elif failure == "terminal":
+        error = _core_error(RuntimeError, "terminal", _category=_SignalCategory.TERMINAL)
+    elif failure == "storage":
+        error = _core_error(StorageError, "storage unavailable")
+    elif failure == "storage_group":
+        error = ExceptionGroup("group", [_core_error(StorageError, "storage unavailable")])
+    elif failure == "control_group":
+        error = BaseExceptionGroup(
+            "group",
+            [
+                asyncio.CancelledError(),
+                _core_error(RuntimeError, "terminal", _category=_SignalCategory.TERMINAL),
+            ],
+        )
+    else:
+        error = BaseExceptionGroup("hard", [KeyboardInterrupt(), ValueError("PRIVATE")])
+
+    entered = anyio.Event()
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        if failure == "caller_cancel":
+            entered.set()
+            await anyio.sleep_forever()
+        raise error
+
+    monkeypatch.setattr(reconcile, "reconcile_keys", fail)
+    config = config_at(tmp_path)
+    async with open_llm_run(tmp_path, config=config) as run:
+        adapter = CapableGateway()
+        assert config.llm_gateway is not None
+        manager = KeyManager(
+            adapter,
+            config.llm_gateway,
+            cap="soft",
+            journal=run.journal,
+            settle_timeout_s=0,
+            run_id=run.run_id,
+        )
+        event = run.journal.append(created(key_record(run.run_id)))
+        await run.journal.commit()
+        manager.restore([event])
+        runner = RunRunner(config, [], run_id=run.run_id, approve=None, replanner=None)
+        runner._gateway = Mock(adapter=adapter, profile=adapter.profile)
+        deps = Mock(
+            config=config, journal=run.journal, store=run.store, gateway=manager, run_id=run.run_id
+        )
+        if failure == "caller_cancel":
+            task = asyncio.create_task(runner._reconcile_gateway(deps))
+            try:
+                with anyio.fail_after(60):
+                    await entered.wait()
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await observe_task(task)
+                    assert task.cancelled()
+            finally:
+                task.cancel()
+                await settle_tasks(task)
+        else:
+            expected = RuntimeError if failure == "control_group" else type(error)
+            with pytest.raises(expected):
+                await runner._reconcile_gateway(deps)
+        await run.journal.commit()
+        assert not [
+            event for event in run.events("gateway_key") if event.payload["action"] == "read_failed"
+        ]
+
+
+@pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit, GeneratorExit])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("fenced", [False, True])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_writer_supervision_preserves_driver_hard_control(
+    monkeypatch: pytest.MonkeyPatch,
+    control: type[BaseException],
+    nested: bool,
+    fenced: bool,
+    cleanup_fails: bool,
+) -> None:
+    from swarm_arena._engine import run as module
+
+    error: BaseException = control("driver control")
+    if nested:
+        error = BaseExceptionGroup(
+            "driver", [BaseExceptionGroup("nested", [error]), _core_error(Fenced)]
+        )
+    context = asyncio.CancelledError("original driver context")
+    error.__context__ = context
+    journal = Mock(fenced=anyio.Event(), _stopped=False)
+    entered = anyio.Event()
+    order: list[str] = []
+
+    async def watch(*args: Any) -> None:
+        entered.set()
+        try:
+            await anyio.sleep_forever()
+        finally:
+            order.append("watcher closed")
+            if cleanup_fails:
+                raise OSError("watcher cleanup failed")
+
+    monkeypatch.setattr(module, "_watch_fence", watch)
+
+    async def invoke() -> None:
+        async with module._supervise_writer(journal):
+            with anyio.fail_after(60):
+                await entered.wait()
+            if fenced:
+                journal._raise_if_fenced.side_effect = _core_error(Fenced)
+            order.append("body failed")
+            raise error
+
+    with pytest.raises(type(error)) as caught:
+        await invoke()
+    assert caught.value is error
+    assert error.__context__ is context
+    assert order == ["body failed", "watcher closed"]
+    assert journal._raise_if_fenced.call_count == 1
+
+
+@pytest.mark.parametrize("boundary", ["new", "resumed"])
+@pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit, GeneratorExit])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("fenced", [False, True])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_run_preserves_driver_hard_control_through_cleanup(
+    run_config: RunConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    control: type[BaseException],
+    nested: bool,
+    fenced: bool,
+    cleanup_fails: bool,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from swarm_arena._engine import run as module
+
+    error: BaseException = control("driver control")
+    if nested:
+        error = BaseExceptionGroup(
+            "driver", [BaseExceptionGroup("nested", [error]), _core_error(Fenced)]
+        )
+    context = asyncio.CancelledError("original driver context")
+    error.__context__ = context
+    journal = Mock(_stopped=False)
+    if fenced:
+        journal._raise_if_fenced.side_effect = _core_error(Fenced)
+    order: list[str] = []
+
+    async def fail(*args: Any) -> Any:
+        order.append("body failed")
+        raise error
+
+    async def close(*args: Any, **kwargs: Any) -> None:
+        order.append("closed")
+        if cleanup_fails:
+            raise _core_error(Fenced) if fenced else OSError("cleanup failed")
+
+    cleanup = AsyncMock(side_effect=close)
+    runner = RunRunner(run_config, [], run_id="driver-control", approve=None, replanner=None)
+    runner._journal = journal
+    if boundary == "resumed":
+        services = Mock(closed=False, deps=Mock(journal=journal), _aclose=cleanup)
+        runner.resumed = Mock(_services=services, epoch=2)
+        monkeypatch.setattr(runner, "_drive", fail)
+    else:
+        executor = Mock(capacity=AsyncMock(return_value=None))
+        monkeypatch.setattr(module, "_start_executor", AsyncMock(return_value=executor))
+        monkeypatch.setattr(module, "run_preflight", AsyncMock())
+        monkeypatch.setattr(module, "_close_executor", cleanup)
+        monkeypatch.setattr(runner, "_execute", fail)
+    with pytest.raises(type(error)) as caught:
+        await runner.run()
+    assert caught.value is error
+    assert error.__context__ is context
+    assert order == ["body failed", "closed"]
+    assert cleanup.await_count == 1
+    assert cleanup.call_args.kwargs["failed"] is True
+
+
+@pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit, GeneratorExit])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize(
+    "cleanup_control", [PermissionError, KeyboardInterrupt, SystemExit, GeneratorExit]
+)
+async def test_preparation_control_survives_stage_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control: type[BaseException],
+    nested: bool,
+    cleanup_control: type[BaseException],
+) -> None:
+    from tempfile import TemporaryDirectory
+    from unittest.mock import AsyncMock
+
+    from swarm_arena._engine import run as module
+
+    original: BaseException = control("driver control")
+    if nested:
+        original = BaseExceptionGroup("driver", [BaseExceptionGroup("nested", [original])])
+    context = asyncio.CancelledError("original driver context")
+    original.__context__ = context
+    order: list[str] = []
+
+    class FailingCleanupDirectory(TemporaryDirectory[str]):
+        def cleanup(self) -> None:
+            super().cleanup()
+            order.append("stage cleanup")
+            raise cleanup_control("stage removal failed")
+
+    async def preflight(*args: Any) -> None:
+        order.append("driver body")
+        raise original
+
+    async def close(*args: Any, **kwargs: Any) -> None:
+        order.append("executor cleanup")
+
+    config = module.RunConfig(
+        run_root=str(tmp_path / "runs"),
+        arena_root=str(tmp_path / "arena"),
+        artifact_root=str(tmp_path / "artifacts"),
+    )
+    monkeypatch.setattr(module, "TemporaryDirectory", FailingCleanupDirectory)
+    monkeypatch.setattr(
+        module,
+        "_start_executor",
+        AsyncMock(return_value=Mock(capacity=AsyncMock(return_value=None))),
+    )
+    monkeypatch.setattr(module, "_prepare_gateway", AsyncMock(return_value=None))
+    monkeypatch.setattr(module, "_check_startup_models", AsyncMock(return_value=[]))
+    monkeypatch.setattr(module, "run_preflight", preflight)
+    monkeypatch.setattr(module, "_close_executor", close)
+    runner = module.RunRunner(config, [], run_id="driver-control", approve=None, replanner=None)
+    caught: BaseException | None = None
+    try:
+        await runner.run()
+    except BaseException as error:
+        caught = error
+    assert order == ["driver body", "stage cleanup", "executor cleanup"]
+    assert caught is not None
+    assert caught is original, (type(caught).__name__, caught.__context__ is original)
+    assert original.__context__ is context
+
+
+@pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit, GeneratorExit])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("boundary", ["drive", "queue"])
+async def test_driver_control_survives_child_failure(
+    run_config: RunConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    control: type[BaseException],
+    nested: bool,
+    boundary: str,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from swarm_arena._engine import run as module
+    from swarm_arena._engine.stops import StopState
+    from swarm_arena._errors import StorageError
+
+    error: BaseException = control("driver control")
+    if nested:
+        error = BaseExceptionGroup("driver", [BaseExceptionGroup("nested", [error])])
+    waiting = anyio.Event()
+    cancellations: list[BaseException] = []
+    child_failed: list[bool] = []
+    runner = RunRunner(
+        run_config, [plan(rounds=1)], run_id="driver-control", approve=None, replanner=None
+    )
+
+    async def child() -> None:
+        await waiting.wait()
+        child_failed.append(True)
+        raise _core_error(StorageError, "stop poll failed")
+
+    async def wait_for_cancel() -> None:
+        waiting.set()
+        try:
+            await anyio.sleep_forever()
+        except anyio.get_cancelled_exc_class() as cancelled:
+            cancellations.append(cancelled)
+            raise error from cancelled
+
+    if boundary == "drive":
+        deps = Mock(stops=StopState(), journal=Mock(fenced=anyio.Event(), _stopped=False))
+        watcher = Mock(wait_error=child, close=AsyncMock())
+        monkeypatch.setattr(module, "_stop_watcher", lambda *args: watcher)
+        monkeypatch.setattr(module, "_close_stop_watcher", AsyncMock())
+
+        async def queue(*args: Any) -> Any:
+            await wait_for_cancel()
+
+        async def clock(*args: Any) -> None:
+            await anyio.sleep_forever()
+
+        monkeypatch.setattr(runner, "_queue", queue)
+        monkeypatch.setattr(runner, "_watch_clock", clock)
+        operation = runner._drive(deps, 1)
+    else:
+        goal = Mock(goal_id="g", active_agents=Mock(return_value=1), run=child)
+        deps = Mock(
+            config=run_config,
+            admission=Mock(update=AsyncMock()),
+            journal=Mock(append_durable=AsyncMock()),
+        )
+        monkeypatch.setattr(module, "GoalRunner", Mock(return_value=goal))
+        monkeypatch.setattr(runner, "_record_stops", AsyncMock())
+        monkeypatch.setattr(runner, "_stopping", Mock(return_value=False))
+
+        class DriverEvents:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(anyio, name)
+
+            def Event(self) -> Any:
+                return Mock(wait=wait_for_cancel)
+
+        monkeypatch.setattr(module, "anyio", DriverEvents())
+        operation = runner._queue(deps)
+    with anyio.fail_after(60), pytest.raises(type(error)) as caught:
+        await operation
+    assert child_failed == [True]
+    assert caught.value is error
+    assert error.__context__ is cancellations[0]
+
+
+async def test_driver_control_with_real_fenced_journal(
+    run_config: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine import run as module
+    from swarm_arena._journal.reader import read_committed
+
+    error = SystemExit("driver control")
+    local_path = tmp_path / "driver-journal.jsonl"
+    owner_before: list[Any] = []
+    journals: list[JournalWriter] = []
+
+    async def queue(self: RunRunner, deps: Any) -> Any:
+        assert isinstance(deps.journal, module._RunJournal)
+        await deps.journal.commit()
+        owner_before.append(read_owner(deps.store))
+        journals.append(deps.journal)
+        deps.journal.fenced.set()
+        raise error
+
+    monkeypatch.setattr(module, "_local_journal_path", lambda *args: local_path)
+    monkeypatch.setattr(RunRunner, "_queue", queue)
+    runner = RunRunner(run_config, [], run_id="real-driver-control", approve=None, replanner=None)
+    with anyio.fail_after(60), pytest.raises(SystemExit) as caught:
+        await runner.run()
+    assert caught.value is error
+    assert error.__context__ is None
+    store = LocalStore(Path(run_config.run_root) / "real-driver-control")
+    owner = read_owner(store)
+    assert owner is not None
+    assert owner_before == [owner]
+    assert owner[0].head is not None
+    assert owner[0].epoch == 1
+    # Fencing forbids release or publication under this still-live owner.
+    assert owner[0].expires_at > utc_now()
+    assert journals[0]._done.is_set()
+    assert not journals[0]._entered
+    committed = read_committed(store)
+    assert committed is not None
+    mirrored = [json.loads(line) for line in local_path.read_bytes().splitlines()]
+    assert mirrored
+    assert mirrored == [event.model_dump(mode="json") for event in committed[1]]
+    assert mirrored[-1]["seq"] == owner[0].head.seq

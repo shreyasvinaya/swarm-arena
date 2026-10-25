@@ -6,10 +6,14 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
-from typing import Any, Literal, cast, get_args
+from typing import Annotated, Any, Literal, cast, get_args
+
+from pydantic import ConfigDict, Field
 
 from swarm_arena._errors import ChainError, _core_error
 from swarm_arena._exec.executor import Job
+from swarm_arena._gateway.reports import KeyReport as _GatewaySpend
+from swarm_arena._gateway.reports import ReconcileReport
 from swarm_arena._journal.event import Event, EventType
 from swarm_arena._model.base import FrozenModel, Origin
 from swarm_arena._model.board_types import Frontier
@@ -173,6 +177,21 @@ class ReservationState(FrozenModel):
     actual: dict[str, Any] | None = None
 
 
+_GatewayId = Annotated[str, Field(strict=True, min_length=1, max_length=256)]
+_GatewayUsd = Annotated[float, Field(strict=True, ge=0)]
+
+
+class _GatewayKey(FrozenModel):
+    """Project only nonsecret creation fields used by a committed trace."""
+
+    model_config = ConfigDict(extra="ignore")
+    candidate_id: _GatewayId
+    key_id: _GatewayId
+    alias: _GatewayId
+    max_budget_usd: _GatewayUsd
+    cap: Literal["hard", "soft"]
+
+
 @dataclass
 class RunState:
     """
@@ -190,6 +209,9 @@ class RunState:
     ``llm_calls`` retains recorded calls, ``llm_request_sha256`` their request
     hashes, and ``llm_cache_identity`` the opaque generating-response identities
     used for proven cache-origin links. Payload storage is not required.
+    ``gateway_keys`` and ``gateway_reconcile`` retain nonsecret creation and
+    latest spend-report projections indexed by candidate and key within this
+    producing run. They never change reservations or candidate call links.
 
     Examples
     --------
@@ -219,6 +241,8 @@ class RunState:
     llm_request_sha256: dict[str, str] = field(default_factory=dict)
     llm_calls: dict[str, LLMCall] = field(default_factory=dict)
     llm_cache_identity: dict[str, str] = field(default_factory=dict)
+    gateway_keys: dict[tuple[str, str], _GatewayKey] = field(default_factory=dict)
+    gateway_reconcile: dict[tuple[str, str], _GatewaySpend] = field(default_factory=dict)
     provider_generations: dict[str, int] = field(default_factory=dict)
     provider_failed: dict[str, int] = field(default_factory=dict)
     provider_causes: dict[str, dict[str, int]] = field(default_factory=dict)
@@ -319,6 +343,17 @@ class RunState:
             self._goal_event(event)
 
         match event.type:
+            case EventType.GATEWAY_KEY:
+                if payload.get("action") == "created":
+                    if payload.get("run_id", event.run_id) != event.run_id:
+                        raise ValueError("invalid gateway run identity")
+                    key = _GatewayKey.model_validate(payload)
+                    self.gateway_keys[(key.candidate_id, key.key_id)] = key
+            case EventType.RECONCILE:
+                if payload["run_id"] != event.run_id or not isinstance(payload["keys"], list):
+                    raise ValueError("invalid gateway report identity")
+                for report in ReconcileReport.model_validate(payload).keys:
+                    self.gateway_reconcile[(report.candidate_id, report.key_id)] = report
             case EventType.PROVIDER_FAILED:
                 self._provider_event(payload)
             case EventType.GOAL_FINISHED:
@@ -378,7 +413,18 @@ class RunState:
                 self.plan_first_rounds.setdefault(event.goal_id, []).append(first_round)
             case EventType.RESERVE:
                 reservation = deepcopy(payload["reservation"])
-                self.reservations[reservation["id"]] = ReservationState(reservation=reservation)
+                if payload.get("action") == "keep_charged":
+                    old = self.reservations[reservation["id"]]
+                    if old.state != "open" or reservation != {
+                        **old.reservation,
+                        "keep_charged": True,
+                    }:
+                        raise ValueError("invalid reservation promotion")
+                    self.reservations[reservation["id"]] = old.model_copy(
+                        update={"reservation": reservation}
+                    )
+                else:
+                    self.reservations[reservation["id"]] = ReservationState(reservation=reservation)
             case EventType.SETTLE:
                 id = payload["id"]
                 self.reservations[id] = self.reservations[id].model_copy(
@@ -387,7 +433,7 @@ class RunState:
                         "actual": deepcopy(payload["actual"]),
                     }
                 )
-            case EventType.TOOL_START:
+            case EventType.TOOL_START | EventType.TOOL_DISPATCH:
                 self.started[payload["candidate_id"]] = Job.Started.model_validate(
                     payload["started"]
                 )

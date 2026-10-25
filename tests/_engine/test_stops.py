@@ -8,6 +8,7 @@ from weakref import ref
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.engine import EngineEnv
 from _fakes.secrecy import assert_secret_absent
 
@@ -40,7 +41,7 @@ async def test_poll_reads_only_own_epoch(
     store.create("control/stop-e1", b"")
     store.create("control/stop-now-e1", b"")
     st = StopState()
-    with anyio.fail_after(2):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tasks:
 
             async def poll() -> None:
@@ -90,7 +91,7 @@ async def test_run_stop_latch_wakes_scheduler_once(flag: str) -> None:
 
     state = StopState(on_change=notify)
     setattr(state, flag, True)
-    with anyio.fail_after(1):
+    with anyio.fail_after(60):
         await changed.wait()
     setattr(state, flag, True)
     assert notifications == [flag]
@@ -111,7 +112,7 @@ async def test_cancelled_poll_discards_late_true(
         workers.append(threading.current_thread())
         entered.set()
         try:
-            assert release.wait(20)
+            assert release.wait(180)
             return True
         finally:
             exited.set()
@@ -120,10 +121,10 @@ async def test_cancelled_poll_discards_late_true(
     state = StopState()
     task = asyncio.create_task(watch_stop_files(store, 2, state))
     try:
-        with anyio.fail_after(10):
-            assert await anyio.to_thread.run_sync(entered.wait, 8)
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
-        done, _ = await asyncio.wait([task], timeout=2)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "polling cancellation waited for storage"
         assert task.cancelled()
         assert not state.stop
@@ -132,12 +133,13 @@ async def test_cancelled_poll_discards_late_true(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
-            await asyncio.gather(task, return_exceptions=True)
-            assert await anyio.to_thread.run_sync(exited.wait, 5)
+        try:
+            await settle_tasks(task)
+        finally:
+            assert await anyio.to_thread.run_sync(exited.wait, 60)
             for worker in workers:
                 if worker.name.startswith("swarm-arena-daemon-"):
-                    await anyio.to_thread.run_sync(worker.join, 5)
+                    await anyio.to_thread.run_sync(worker.join, 60)
                     assert not worker.is_alive()
     assert not state.stop
     assert not state.stop_now

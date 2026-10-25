@@ -14,6 +14,7 @@ from typing import Any
 from swarm_arena._exec.executor import Job
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._model.tooling import FileRef, check_parent_id
+from swarm_arena._outcomes import _propagate_control
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._tooling.files import _listed_path
 from swarm_arena._tooling.paths import (
@@ -317,30 +318,39 @@ def collect_output_files(
     left = max_bytes
     listings: dict[Path, dict[str, list[str]]] = {}
     for rel in paths:
-        try:
-            if symlinked_component(workspace, rel) is not None:
-                raise ValueError(f"symlink not allowed: {rel}")
-            if _inspect_path(workspace, rel)[1] is None:
-                raise FileNotFoundError
-            listed = _listed_path(workspace, rel, listings)
-        except FileNotFoundError:
-            raise ValueError(f"{rel} is missing") from None
-        except OSError:
-            raise ValueError(f"cannot inspect output path: {rel}") from None
-        if listed != rel:  # a case-sensitive disk would not find it
-            raise ValueError(f"declared output {rel} is spelled {listed} on disk")
-        fd = open_regular_file(workspace, rel)
+        fd = _open_output_file(workspace, rel, listings)
         try:
             try:
-                digest, size = artifacts._put_chunks(_chunks(fd, rel, left, step=2**20))
+                digest, size = artifacts._put_chunks(
+                    _chunks(fd, rel, left, step=2**20), max_bytes=left
+                )
             except ValueError as exc:
+                _propagate_control(exc)
                 if str(exc) == f"{rel} crosses the size cap":
                     raise ValueError(f"{rel} crosses the size cap") from None
                 raise ValueError(f"cannot store output path: {rel}") from None
-            except Exception:
+            except Exception as exc:
+                _propagate_control(exc)
                 raise ValueError(f"cannot store output path: {rel}") from None
         finally:
             os.close(fd)
         left -= size
         output.append(FileRef(name=PurePosixPath(rel).name, path=rel, sha256=digest, size=size))
     return output
+
+
+def _open_output_file(workspace: Path, rel: str, listings: dict[Path, dict[str, list[str]]]) -> int:
+    """Validate spelling and safety, then open one pinned regular output."""
+    try:
+        if symlinked_component(workspace, rel) is not None:
+            raise ValueError(f"symlink not allowed: {rel}")
+        if _inspect_path(workspace, rel)[1] is None:
+            raise FileNotFoundError
+        listed = _listed_path(workspace, rel, listings)
+    except FileNotFoundError:
+        raise ValueError(f"{rel} is missing") from None
+    except OSError:
+        raise ValueError(f"cannot inspect output path: {rel}") from None
+    if listed != rel:  # a case-sensitive disk would not find it
+        raise ValueError(f"declared output {rel} is spelled {listed} on disk")
+    return open_regular_file(workspace, rel)

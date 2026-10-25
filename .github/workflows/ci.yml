@@ -76,7 +76,27 @@ jobs:
           name: durations-extras-${{ matrix.python-version || '3.11' }}-${{ matrix.shard }}
           path: test-durations.json
       - if: matrix.shard == 1
-        run: uv run pytest -m s3 -v
+        run: uv run pytest -m "s3 and not ray" -v
+
+  ray:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --locked --all-extras --all-groups
+      - run: uv run --no-sync pytest -n 0 -m "ray and not s3" -v
 
   docs:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
@@ -115,6 +135,7 @@ jobs:
           path: test-durations.json
 
   lowest-direct-extras:
+    timeout-minutes: 60
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     strategy:
@@ -131,6 +152,11 @@ jobs:
       - run: uv sync --all-extras --all-groups --resolution lowest-direct --upgrade
       - run: cp .test_durations test-durations.json
       - run: uv run --no-sync pytest -q -n 4 --dist worksteal --durations=25 --store-durations --clean-durations --durations-path test-durations.json --splits 2 --group ${{ matrix.shard }} --splitting-algorithm least_duration
+      - if: matrix.shard == 1
+        timeout-minutes: 30
+        env:
+          RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
+        run: uv run --no-sync pytest -n 0 -m "ray and not s3" -v
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -138,7 +164,7 @@ jobs:
           path: test-durations.json
 
       - if: matrix.shard == 1
-        run: uv run --no-sync pytest -m s3 -v
+        run: uv run --no-sync pytest -m "s3 and not ray" -v
 
   macos:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository

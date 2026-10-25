@@ -165,6 +165,25 @@ its SHA-256). So a file that the program writes but `collect()` does not list
 is lost, and so are `usage` and `failed_provider` if `collect()` does not set
 them. The `RouteTool.collect()` above keeps `data` only.
 
+### Tools that call an LLM
+
+A tool that calls an LLM must declare `providers()`, returning the provider
+names (for example `frozenset({"openai"})`); for `FunctionTool`, use
+`providers=["openai"]`. With an LLM gateway, this declaration lets the driver
+create one virtual key per tool run and inject the gateway base URLs and key.
+The subprocess must use `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` instead of
+hard-coding a provider URL. A `Command.env` allowlist discovered only inside
+`command()` cannot trigger driver key creation and, with a gateway, never
+receives the real OpenAI or Anthropic credential. Driver-visible FunctionTool
+allowlists can trigger keying, but declare providers explicitly for clarity.
+
+Supply a positive USD reservation through `estimate()` or
+`limits.default_run_reservation.usd`; the full amount stays charged even after
+spend is read back. Never include virtual keys in results or logs. The pinned
+LiteLLM profile supports soft caps and estimated spend only. See
+[The LLM gateway on the cluster](running-on-ray.md#the-llm-gateway-on-the-cluster)
+for configuration, secret transport, proxy caching/tracing and network rules.
+
 ### Optional methods and their defaults
 
 | Method | Default | Override it to |
@@ -409,6 +428,101 @@ instance or as a `Ref`, for example
 `Ref(path="my_connector.tools:RouteTool", config={"timeout_s": 60})`, which is
 how a plan names it.
 
+### Connector CI
+
+Keep the local conformance tests above and add a sequential Ray job. Install
+the `llm` extra too when tests use `FakeModel`; scripted model turns need no
+API key. In a source checkout, this GitHub Actions job runs the kit and the
+Ray integration tests:
+
+```yaml
+jobs:
+  connector-ray:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
+      RAY_USAGE_STATS_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+      - run: uv sync --extra ray --extra llm --all-groups
+      - run: uv run pytest -n 0 tests/testing/test_conformance.py tests/e2e/test_rosenbrock_ray.py -m "not s3" -v
+```
+
+The repository's shared `ray_cluster` fixture owns the head. Its **CI-only
+two-CPU limit** keeps test load bounded. It launches the
+equivalent of `uv run ray start --head --num-cpus=2 --include-dashboard=true
+--disable-usage-stats --block` using the current Python interpreter, with
+isolated ports and a short temporary directory. Readiness includes a successful
+State API query. Teardown stops only its process group. Do not start a second
+head in the job, use `ray stop`, or run cluster tests under xdist. The fixture
+disables token authentication only for its loopback test head; that does not
+test remote authentication. See [Running on Ray](running-on-ray.md) for token,
+worker-image and module-path setup.
+
+In a separate connector repository, provide an equivalent cluster fixture
+(the test fixtures are not a public installed API), or connect to a cluster
+your CI already owns. Put the connector in the uv project's dependencies;
+until the first release, add the package with
+`uv add "swarm-arena[ray,llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`.
+Use your connector test paths in the job. A Ray tool case takes this form,
+using the `RouteTool` from this guide:
+
+```python
+import pytest
+
+from my_connector.tools import RouteTool
+from swarm_arena.ray import RayExecutor
+from swarm_arena.testing import check_tool, read_logs
+
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
+
+
+@pytest.mark.ray
+async def test_tool_on_ray(ray_cluster: str) -> None:
+    executor = RayExecutor()
+    try:
+        output = await check_tool(RouteTool(), {"target": "CCO"}, executor=executor)
+        assert output.data["target"] == "CCO"
+        stdout, stderr = read_logs(output)
+        assert isinstance(stdout, bytes) and isinstance(stderr, bytes)
+    finally:
+        await executor.aclose()
+```
+
+Register `ray` under `[tool.pytest.ini_options]` in `pyproject.toml`, for
+example `markers = ["ray: requires a Ray cluster"]`, including when using
+`--strict-markers`. The AnyIO marker and backend fixture make the async test
+runnable without `anyio_mode = "auto"`. This dedicated Ray job imports the
+runtime directly: a missing extra or broken installation fails the job.
+For mixed core/extras suites, skip only when the `ray` **distribution** is
+absent; when installed, any failure to import `swarm_arena.ray` must fail.
+The repository uses one shared `ray_dependency()` test helper for that rule;
+`CI` does not change the decision.
+
+Keep tests for `check_check` and `check_judge` alongside this tool case, and
+use `check_manager` with the registered `FakeModel` catalog shown below for
+model-driven managers. `FakeModel` can also supply scripted turns to an
+`LLMJudge` (see the offline judge example below). These checks need no provider
+credentials. A caller-supplied executor belongs to the caller and remains open
+after a kit call; close it in `finally`.
+
+Include assertions on file bytes, overlays and edits, both logs and stopped
+results. `read_output_file` and `read_logs` read retained artifacts after the
+worker workspace is gone. For cancellation, `Job.on_partial` receives only
+data: file, log and report references are removed and no new artifacts are
+uploaded. Shared-host data-only success does not demonstrate remote file
+transport; use explicit filesystem-access denial or a real remote worker and
+record which environment was exercised.
+
 ### Testing managers and judges offline
 
 Install the optional SDK with
@@ -649,3 +763,13 @@ The kit checks that the judge leaves no reservation pending and that closed
 charges equal journaled LLM costs. A contained terminal control fails the
 conformance check; propagated controls and ordinary judge errors retain their
 existing handling.
+
+### Reporting calls made by your tool
+
+A connector whose subprocess calls an LLM can write
+`swarm/llm_calls.jsonl`
+with one call per line, at most 64 KiB per line. See {ref}`Reporting LLM calls <reporting-llm-calls>`
+for the schema, limits, candidate source labels and trace correlation variables.
+The executor collects this optional file for tool jobs only; do not add its reserved
+workspace path to `ToolOutput.files`. Keep aggregate tool usage in the result
+file: individual report rows are informational and never create a second charge.

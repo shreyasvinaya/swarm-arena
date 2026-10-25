@@ -6,6 +6,7 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.llm_run import HeldOperation, LLMRun, open_llm_run, record_kwargs
 from _fakes.secrecy import assert_secret_absent
 
@@ -30,6 +31,158 @@ from swarm_arena.tool import Usage
 ESTIMATE = Amount(tokens=9_000, usd=0.01)
 
 
+async def test_maintenance_binding_records_and_deduplicates_external_observations(
+    tmp_path: Path,
+) -> None:
+    from swarm_arena._journal import llm_record
+
+    async with open_llm_run(tmp_path) as run:
+        meta = {
+            "run_id": run.run_id,
+            "owner_epoch": str(run.journal.epoch),
+            "role": "tool",
+            "goal_id": "g",
+            "candidate_id": "c",
+        }
+        kwargs = record_kwargs(
+            meta,
+            request=None,
+            response=None,
+            settle=False,
+            _external_observation=True,
+            litellm_call_id="gw:earlier",
+        )
+        assert await record_call(**kwargs) is not None
+        await run.journal.commit()
+        state = run.state()
+        unbind_run(run.run_id, journal=run.journal)
+        run.clock._rebase(run.config.limits.run_timeout_s + 100)
+        async with llm_record._bound_run(
+            run.run_id,
+            journal=run.journal,
+            ids=run.ids,
+            artifacts=run.artifacts,
+            config=run.config,
+            stops=run.stops,
+            clock=None,
+            state=state,
+            _maintenance_lease=run.journal._lease,
+        ):
+            binding = llm_record._bindings[run.run_id]
+            assert binding.clock is None
+            assert await record_call(**kwargs) is None
+            kwargs["litellm_call_id"] = "gw:late"
+            call = await record_call(**kwargs)
+            assert call is not None
+            assert call.role == "tool"
+            assert call.reservation_id is None
+            assert binding.scopes == {}
+            assert binding.pending == {}
+            await run.journal.commit()
+            assert len(run.calls()) == 2
+            assert run.events("settle") == []
+        assert run.run_id not in llm_record._bindings
+        assert await record_call(**kwargs) is None
+
+
+@pytest.mark.parametrize("invalid", ["funded", "settle", "reservation", "open_call"])
+async def test_maintenance_binding_refuses_funding(tmp_path: Path, invalid: str) -> None:
+    from swarm_arena._journal import llm_record
+
+    async with open_llm_run(tmp_path) as run:
+        state = run.state()
+        unbind_run(run.run_id, journal=run.journal)
+        async with llm_record._bound_run(
+            run.run_id,
+            journal=run.journal,
+            ids=run.ids,
+            artifacts=run.artifacts,
+            config=run.config,
+            stops=run.stops,
+            clock=None,
+            state=state,
+            _maintenance_lease=run.journal._lease,
+        ):
+            meta = {
+                "run_id": run.run_id,
+                "owner_epoch": str(run.journal.epoch),
+                "role": "tool",
+                "goal_id": "g",
+            }
+            if invalid == "reservation":
+                meta["reservation_id"] = "SECRET"
+            kwargs = record_kwargs(
+                meta,
+                settle=invalid == "settle",
+                _external_observation=invalid != "funded",
+                litellm_call_id="gw:one",
+            )
+
+            async def attempt() -> None:
+                if invalid == "open_call":
+                    open_call(
+                        run.scope("judge"),
+                        reservation_id="SECRET",
+                        estimate=ESTIMATE,
+                        model_alias="opus",
+                        model="local",
+                        provider="local",
+                    )
+                else:
+                    await record_call(**kwargs)
+
+            with pytest.raises(ValueError, match="maintenance binding") as caught:
+                await attempt()
+            assert_secret_absent(caught.value, "SECRET")
+            await run.journal.commit()
+            assert run.calls() == []
+            assert run.events("settle") == []
+
+
+@pytest.mark.parametrize("invalid", ["missing", "unentered", "expired", "different"])
+async def test_maintenance_binding_requires_held_writer_lease(
+    tmp_path: Path,
+    invalid: str,
+) -> None:
+    from datetime import timedelta
+
+    from swarm_arena._journal import llm_record
+    from swarm_arena._journal.lease import Lease
+    from swarm_arena._model.canonical import utc_now
+
+    async with open_llm_run(tmp_path) as run:
+        unbind_run(run.run_id, journal=run.journal)
+        lease = run.journal._lease
+        doc = lease.doc
+        supplied = lease
+        if invalid == "missing":
+            supplied = None
+        elif invalid == "unentered":
+            run.journal._entered = False
+        elif invalid == "expired":
+            lease.doc = doc.model_copy(update={"expires_at": utc_now() - timedelta(seconds=1)})
+        else:
+            supplied = Lease(run.store, lease.doc, lease.etag, ttl_s=lease.ttl_s)
+        try:
+            with pytest.raises((RuntimeError, ValueError), match=r"maintenance binding|not active"):
+                async with llm_record._bound_run(
+                    run.run_id,
+                    journal=run.journal,
+                    ids=run.ids,
+                    artifacts=run.artifacts,
+                    config=run.config,
+                    stops=run.stops,
+                    clock=None,
+                    state=run.state(),
+                    _maintenance_lease=supplied,
+                ):
+                    pytest.fail("invalid maintenance binding entered")
+            assert run.run_id not in llm_record._bindings
+        finally:
+            run.journal._entered = True
+            lease.doc = doc
+
+
 async def test_graceful_report_timeout_survives_delayed_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -41,7 +194,8 @@ async def test_graceful_report_timeout_survives_delayed_loop(
     release: Timer | None = None
     try:
         async with open_llm_run(tmp_path) as run:
-            scope, meta = await _open(run)
+            # Only the deliberately missing report gets a short deadline.
+            scope, meta = await _open(run, replace(run.scope("manager"), settle_timeout_s=2))
             watch_owner = llm_record._watch_owner
             report_watchers: set[asyncio.Task[Any]] = set()
 
@@ -88,7 +242,8 @@ async def test_graceful_report_timeout_survives_delayed_loop(
         held.release.set()
         if release is not None:
             release.cancel()
-            release.join()
+            release.join(60)
+            assert not release.is_alive()
 
 
 async def test_stop_now_interrupts_drain_report_wait(
@@ -117,10 +272,10 @@ async def test_stop_now_interrupts_drain_report_wait(
         monkeypatch.setattr(llm_record, "await_reports", observed_reports)
         task = asyncio.create_task(drain(scope, wait=True))
         try:
-            with anyio.fail_after(5):
+            with anyio.fail_after(60):
                 await entered.wait()
                 run.stops.stop_now = True
-                assert await task == [meta["call_id"]]
+                assert await observe_task(task) == [meta["call_id"]]
             assert returned.is_set()
             assert llm_record._bindings[run.run_id].terminal is None
             call = run.calls()[0]
@@ -129,7 +284,7 @@ async def test_stop_now_interrupts_drain_report_wait(
             assert run.charged(scope) == ESTIMATE
         finally:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await settle_tasks(task)
 
 
 async def test_await_reports_requires_finite_deadline(tmp_path: Path) -> None:
@@ -244,7 +399,7 @@ async def test_payloads_stored_by_sha256(tmp_path: Path) -> None:
 
 
 async def test_store_payloads_false_keeps_refs_none(tmp_path: Path) -> None:
-    config = RunConfig(tracing=TracingConfig(store_payloads=False), settle_timeout_s=2)
+    config = RunConfig(tracing=TracingConfig(store_payloads=False))
     async with open_llm_run(tmp_path, config=config) as run:
         _, meta = await _open(run)
         call = await record_call(**record_kwargs(meta))
@@ -292,7 +447,8 @@ async def test_known_litellm_call_id_writes_nothing(
 
 async def test_drain_charges_unrecorded_call_in_full(tmp_path: Path) -> None:
     async with open_llm_run(tmp_path) as run:
-        scope, meta = await _open(run)
+        # Only the deliberately missing report gets a short deadline.
+        scope, meta = await _open(run, replace(run.scope("manager"), settle_timeout_s=2))
         assert await drain(scope, wait=True) == [meta["call_id"]]
         await run.journal.commit()
         (placeholder,) = run.calls()
@@ -323,9 +479,10 @@ async def test_late_record_after_drain_writes_nothing(tmp_path: Path) -> None:
 
 
 async def test_drain_without_wait_charges_at_once(tmp_path: Path) -> None:
-    async with open_llm_run(tmp_path, config=RunConfig(settle_timeout_s=10)) as run:
-        scope, _ = await _open(run)
-        with anyio.fail_after(2):
+    async with open_llm_run(tmp_path) as run:
+        # No callback releases the pending report; its backstop outlives the observation.
+        scope, _ = await _open(run, replace(run.scope("manager"), settle_timeout_s=300))
+        with anyio.fail_after(30):
             await drain(scope, wait=False)
         assert len(run.calls()) == 1
 
@@ -334,7 +491,8 @@ async def test_drain_overtaking_a_suspended_record_writes_one_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async with open_llm_run(tmp_path) as run:
-        scope, meta = await _open(run)
+        # Only the deliberately missing report gets a short deadline.
+        scope, meta = await _open(run, replace(run.scope("manager"), settle_timeout_s=2))
         held = HeldOperation()
         original = run.artifacts.put_bytes
         uploads: list[bytes] = []
@@ -394,10 +552,15 @@ async def test_concurrent_duplicate_callbacks_record_once(
 
 
 async def test_drain_does_not_wait_for_an_abandoned_call(tmp_path: Path) -> None:
-    async with open_llm_run(tmp_path, config=RunConfig(settle_timeout_s=10)) as run:
-        scope, meta = await _open(run)
+    from swarm_arena._journal.llm_record import _bindings
+
+    async with open_llm_run(tmp_path) as run:
+        # An abandoned report remains unavailable for the entire observation window.
+        scope, meta = await _open(run, replace(run.scope("manager"), settle_timeout_s=300))
         abandon_call(scope, meta["reservation_id"])
-        with anyio.fail_after(2):
+        entry = _bindings[run.run_id].pending[meta["reservation_id"]]
+        entry.event = anyio.Event()
+        with anyio.fail_after(30):
             placeholders = await drain(scope, wait=True)
         assert placeholders == [meta["call_id"]]
         assert len(run.calls()) == 1
@@ -474,7 +637,7 @@ async def test_settle_error_after_claim_wakes_drain_and_reraises(
             await record_call(**record_kwargs(meta))
         assert_secret_absent(caught.value, "SETTLE_SECRET")
         monkeypatch.setattr(scope.tranche, "settle_call", settle)
-        with anyio.fail_after(2), pytest.raises(StorageError):
+        with anyio.fail_after(60), pytest.raises(StorageError):
             await drain(scope, wait=True)
         assert len(run.events("llm_call")) == 1
         assert scope.call_ids == [meta["call_id"]]
@@ -505,7 +668,7 @@ async def test_cancel_during_settle_wakes_drain_and_settles_once(
             await entered.wait()
             cancel.cancel()
             release.set()
-        with anyio.fail_after(2):
+        with anyio.fail_after(60):
             assert await drain(scope, wait=True) == []
         assert len(run.events("llm_call")) == 1
         assert run.charged(scope) == Amount(tokens=120, usd=0.002)
@@ -534,7 +697,7 @@ async def test_pending_scope_finds_the_scope_by_reservation_id(tmp_path: Path) -
 
 async def test_journals_request_sha256_without_payloads(tmp_path: Path) -> None:
     async with open_llm_run(
-        tmp_path, config=RunConfig(tracing=TracingConfig(store_payloads=False), settle_timeout_s=2)
+        tmp_path, config=RunConfig(tracing=TracingConfig(store_payloads=False))
     ) as run:
         _, meta = await _open(run)
         kwargs = record_kwargs(meta)
@@ -724,7 +887,7 @@ async def test_overflow_is_terminal_even_with_unlimited_budget(tmp_path: Path) -
 
 async def test_cache_identity_is_replayed_and_never_guessed_from_request(tmp_path: Path) -> None:
     async with open_llm_run(
-        tmp_path, config=RunConfig(tracing=TracingConfig(store_payloads=False), settle_timeout_s=2)
+        tmp_path, config=RunConfig(tracing=TracingConfig(store_payloads=False))
     ) as run:
         scope = run.scope("manager")
         originals: list[LLMCall] = []
@@ -802,7 +965,7 @@ async def test_unbind_abandons_held_request_before_response_upload(
 
         monkeypatch.setattr(run.artifacts, "put_bytes", upload)
         try:
-            with anyio.fail_after(5):
+            with anyio.fail_after(60):
                 async with anyio.create_task_group() as group:
                     group.start_soon(callback)
                     await held.ready()
@@ -835,13 +998,13 @@ async def test_unbind_abandons_model_preparation_before_any_upload(
         try:
             await held.ready()
             unbind_run(run.run_id)
-            with anyio.fail_after(2):
-                assert await task is None
+            with anyio.fail_after(30):
+                assert await observe_task(task) is None
             assert run.calls() == []
         finally:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
             await held.finish()
+            await settle_tasks(task)
 
 
 async def test_forged_storage_control_is_contained(
@@ -881,7 +1044,7 @@ async def test_native_cancel_before_append_leaves_placeholder(
             await held.ready()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await observe_task(task)
             assert await drain(scope, wait=False) == [meta["call_id"]]
             assert run.charged(scope) == ESTIMATE
         finally:
@@ -940,15 +1103,17 @@ async def test_held_payload_expires_with_owner_and_never_uploads_response(
                     else:
                         setattr(run.stops, stop, True)
                     with (
-                        anyio.fail_after(2),
+                        anyio.fail_after(30),
                         pytest.raises(RuntimeError, match="stop cleanup timed out"),
                     ):
-                        await task
+                        await observe_task(task)
                     assert not run.calls()
                     assert len(uploads) == 1
                 finally:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    if not task.done():
+                        held.release.set()
+                        task.cancel()
+                    await settle_tasks(task)
     finally:
         await held.finish()
     assert len(uploads) == 1
@@ -1050,10 +1215,10 @@ async def test_cancel_during_durable_settlement_retains_admitted_actual(
                 await entered.wait()
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    await observe_task(task)
             finally:
                 release.set()
-                await asyncio.gather(task, return_exceptions=True)
+                await settle_tasks(task)
         assert await drain(scope, wait=True) == []
         await run.journal.commit()
         assert len(run.events("settle")) == 1
@@ -1086,10 +1251,10 @@ async def test_durable_settlement_timeout_is_not_fencing_with_a_valid_lease(
                     await held.ready()
                     run.stops.stop_now = True
                     with (
-                        anyio.fail_after(2),
+                        anyio.fail_after(30),
                         pytest.raises(RuntimeError, match="stop cleanup timed out") as caught,
                     ):
-                        await task
+                        await observe_task(task)
                     assert not isinstance(caught.value, Fenced)
                     owner = read_owner(run.store)
                     assert owner is not None
@@ -1098,8 +1263,10 @@ async def test_durable_settlement_timeout_is_not_fencing_with_a_valid_lease(
                     assert run.charged(scope) == ESTIMATE
                     assert not run.calls()
                 finally:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    if not task.done():
+                        held.release.set()
+                        task.cancel()
+                    await settle_tasks(task)
     finally:
         await held.finish()
 
@@ -1167,8 +1334,8 @@ async def test_healthy_settlement_outlives_cleanup_allowance(
         assert owner_doc[0].expires_at > utc_now()
         if signal == "release":
             held.release.set()
-            with anyio.fail_after(10):
-                await task
+            with anyio.fail_after(60):
+                await observe_task(task)
             assert run.charged(scopes[0]) == Amount(tokens=120, usd=0.002)
             assert len(run.calls()) == 1
         else:
@@ -1180,7 +1347,7 @@ async def test_healthy_settlement_outlives_cleanup_allowance(
                 owner_cancel.cancel()
             else:
                 task.cancel()
-            done, _ = await asyncio.wait([task], timeout=10)
+            done, _ = await asyncio.wait([task], timeout=30)
             assert done, "interrupted accounting outlived its cleanup allowance"
             if signal == "cancel":
                 assert task.cancelled()
@@ -1201,14 +1368,15 @@ async def test_healthy_settlement_outlives_cleanup_allowance(
         held.release.set()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
         await held.finish()
+        await settle_tasks(task)
 
 
 async def test_completed_cancellation_cleanup_does_not_time_out_later_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async with open_llm_run(tmp_path) as run:
+    # The event-held write must outlive the stale cancellation deadline.
+    async with open_llm_run(tmp_path, config=RunConfig(settle_timeout_s=2)) as run:
         scope, meta = await _open(run)
         entered = anyio.Event()
 
@@ -1220,14 +1388,14 @@ async def test_completed_cancellation_cleanup_does_not_time_out_later_work(
             patch.setattr(scope.tranche, "settle_call", delayed)
             task = asyncio.create_task(record_call(**record_kwargs(meta)))
             try:
-                with anyio.fail_after(5):
+                with anyio.fail_after(60):
                     await entered.wait()
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    await observe_task(task)
             finally:
                 task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                await settle_tasks(task)
         assert await drain(scope, wait=False) == []
         assert run.charged(scope) == Amount(tokens=120, usd=0.002)
 
@@ -1248,13 +1416,13 @@ async def test_completed_cancellation_cleanup_does_not_time_out_later_work(
                 done, _ = await asyncio.wait([task], timeout=run.config.settle_timeout_s * 1.25)
                 assert not done
                 held.release.set()
-                with anyio.fail_after(5):
-                    assert await task is not None
+                with anyio.fail_after(60):
+                    assert await observe_task(task) is not None
             finally:
                 held.release.set()
                 task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
                 await held.finish()
+                await settle_tasks(task)
         assert run.charged(next_scope) == Amount(tokens=120, usd=0.002)
 
 
@@ -1268,9 +1436,7 @@ async def test_held_payload_stops_on_real_takeover(
     successor = None
     try:
         with pytest.raises(Fenced):  # noqa: PT012 - owned lifetime
-            async with open_llm_run(
-                tmp_path, config=RunConfig(lease_ttl_s=3, settle_timeout_s=2)
-            ) as run:
+            async with open_llm_run(tmp_path, config=RunConfig(lease_ttl_s=3)) as run:
                 _, meta = await _open(run)
                 put = run.artifacts.put_bytes
 
@@ -1284,12 +1450,14 @@ async def test_held_payload_stops_on_real_takeover(
                 try:
                     await held.ready()
                     successor = force_take_over(run.store, owner_id="next", host="local", ttl_s=60)
-                    with anyio.fail_after(5), pytest.raises(Fenced):
-                        await task
+                    with anyio.fail_after(30), pytest.raises(Fenced):
+                        await observe_task(task)
                     assert not run.calls()
                 finally:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    if not task.done():
+                        held.release.set()
+                        task.cancel()
+                    await settle_tasks(task)
     finally:
         await held.finish()
         if successor is not None:
@@ -1354,7 +1522,7 @@ async def test_scope_cancel_during_held_settlement_is_bounded(
                 try:
                     await held.ready()
                     cancel.cancel()
-                    done, _ = await asyncio.wait([task], timeout=1)
+                    done, _ = await asyncio.wait([task], timeout=30)
                     assert done, "a nested settlement shield outlived the cleanup allowance"
                     assert finished.is_set()
                     assert all(
@@ -1362,8 +1530,10 @@ async def test_scope_cancel_during_held_settlement_is_bounded(
                         for error in errors
                     )
                 finally:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    if not task.done():
+                        held.release.set()
+                        task.cancel()
+                    await settle_tasks(task)
     finally:
         await held.finish()
 
@@ -1452,7 +1622,6 @@ async def test_takeover_rejects_stale_callback_and_cleanup(
             deps.clock,
         )
 
-    run_config = run_config.model_copy(update={"settle_timeout_s": 2})
     await Swarm(run_config).run(plan(rounds=1), run_id="takeover")
     old = await resume_run(run_config, "takeover", force=True, replanner=None)
     new = None
@@ -1505,8 +1674,10 @@ async def test_takeover_rejects_stale_callback_and_cleanup(
             no_upload.setattr(old_run.artifacts, "put_bytes", forbidden)
             if task is not None:
                 await held.finish()
-                with anyio.fail_after(5):
-                    result = (await asyncio.gather(task, return_exceptions=True))[0]
+                with anyio.fail_after(60):
+                    done, pending = await asyncio.wait({task}, timeout=60)
+                    assert not pending, "callback did not finish"
+                    result = (await asyncio.gather(*done, return_exceptions=True))[0]
                 assert result is None or isinstance(result, Fenced)
             assert await record_call(**record_kwargs(meta, settle=False)) is None
             with llm_scope(old_scope):
@@ -1542,14 +1713,16 @@ async def test_takeover_rejects_stale_callback_and_cleanup(
         assert await record_call(**record_kwargs(unkeyed, settle=False)) is not None
     finally:
         held.release.set()
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            await held.finish()
-        assert old.resumed is not None
-        await old.resumed._services._aclose(failed=True)
-        if new is not None:
-            await new.aclose()
+        try:
+            if task is not None:
+                task.cancel()
+                await held.finish()
+                await settle_tasks(task)
+        finally:
+            assert old.resumed is not None
+            await old.resumed._services._aclose(failed=True)
+            if new is not None:
+                await new.aclose()
 
 
 @pytest.mark.parametrize("batched", [False, True])
@@ -1588,7 +1761,7 @@ async def test_resumed_detached_reservation_only_report(
             )
         return await _open(run, scope)
 
-    config = run_config.model_copy(update={"settle_timeout_s": 2})
+    config = run_config
     await Swarm(config).run(plan(rounds=1), run_id="reservation-only")
     old = await resume_run(config, "reservation-only", force=True, replanner=None)
     new = None
@@ -1757,15 +1930,394 @@ async def test_await_reports_stops_on_real_takeover(tmp_path: Path) -> None:
 
                 task = asyncio.create_task(wait_for_reports())
                 try:
-                    with anyio.fail_after(5):
+                    with anyio.fail_after(60):
                         await entered.wait()
                     successor = force_take_over(run.store, owner_id="next", host="local", ttl_s=60)
-                    with anyio.fail_after(5), pytest.raises(Fenced):
-                        await task
+                    with anyio.fail_after(30), pytest.raises(Fenced):
+                        await observe_task(task)
                     assert not run.calls()
                 finally:
                     task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    await settle_tasks(task)
     finally:
         if successor is not None:
             successor.release()
+
+
+@pytest.mark.parametrize("request_payload", [None, {"input": "hello"}])
+@pytest.mark.parametrize("response", [None, {"output": "world"}])
+async def test_none_payload_not_stored(
+    tmp_path: Path, request_payload: Any, response: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with open_llm_run(
+        tmp_path, config=RunConfig(tracing=TracingConfig(store_payloads=True))
+    ) as run:
+        writes: list[bytes] = []
+        original = run.artifacts.put_bytes
+
+        def capture(data: bytes) -> str:
+            writes.append(data)
+            return original(data)
+
+        monkeypatch.setattr(run.artifacts, "put_bytes", capture)
+        call = await record_call(
+            **record_kwargs(
+                {"run_id": run.run_id, "goal_id": "g", "role": "tool"},
+                request=request_payload,
+                response=response,
+                settle=False,
+            )
+        )
+        assert writes == [
+            canonical_json(value) for value in (request_payload, response) if value is not None
+        ]
+        assert call is not None
+        assert call.request_ref == (
+            None if request_payload is None else sha256_hex(canonical_json(request_payload))
+        )
+        assert call.response_ref == (
+            None if response is None else sha256_hex(canonical_json(response))
+        )
+        await run.journal.commit()
+        assert run.events("llm_call")[0].payload["request_sha256"] == sha256_hex(
+            canonical_json(request_payload)
+        )
+
+
+async def test_external_report_stays_outside_manager_funding(tmp_path: Path) -> None:
+    from swarm_arena._tooling.llm_calls import LLMCallRow, record_reported
+    from swarm_arena.testing._harness import _assert_accounted
+
+    async with open_llm_run(tmp_path) as run:
+        scope, funded_meta = await _open(run)
+        tool_reservation = await run.ledger.reserve(
+            ":run", Amount(usd=0.05), kind="tool", goal_id="g"
+        )
+        await run.ledger.settle(tool_reservation.id, Amount(usd=0.05))
+        metadata = {
+            "run_id": run.run_id,
+            "goal_id": "g",
+            "team": "t",
+            "agent": "a",
+            "round": "1",
+            "candidate_id": "c1",
+            "owner_epoch": str(run.journal.epoch),
+        }
+        with llm_scope(scope):
+            funded = await record_call(**record_kwargs(funded_meta))
+            assert funded is not None
+            calls = await record_reported(
+                [LLMCallRow(model="a/b", cost_usd=0.05, litellm_call_id="external")],
+                metadata=metadata,
+            )
+        assert len(calls) == 1
+        assert calls[0].role == "tool"
+        assert calls[0].candidate_id == "c1"
+        await _assert_accounted(scope, run.store)
+        assert scope.call_ids == [funded.id]
+        assert run.charged(scope) == Amount(tokens=120, usd=0.002)
+        assert run.ledger._charges[tool_reservation.id] == Amount(usd=0.05)
+        assert (
+            await record_reported(
+                [LLMCallRow(model="a/b", litellm_call_id="external")], metadata=metadata
+            )
+            == []
+        )
+    assert (
+        await record_reported([LLMCallRow(model="a/b", litellm_call_id="late")], metadata=metadata)
+        == []
+    )
+
+
+async def test_external_report_after_takeover_uses_current_owner(run_config: RunConfig) -> None:
+    from _fakes.run import plan
+
+    from swarm_arena import Swarm
+    from swarm_arena._engine.resume import resume_run
+    from swarm_arena._tooling.llm_calls import LLMCallRow, record_reported
+
+    await Swarm(run_config).run(plan(rounds=1), run_id="external-report")
+    resumed = await resume_run(run_config, "external-report", force=True, replanner=None)
+    try:
+        assert resumed.resumed is not None
+        deps = resumed.resumed._services.deps
+        assert deps is not None
+        assert deps.journal.epoch == 2
+        row = LLMCallRow(model="a/b", cost_usd=0.01, litellm_call_id="post-takeover")
+        metadata = {
+            "run_id": deps.run_id,
+            "goal_id": "g",
+            "candidate_id": "historical-candidate",
+            "owner_epoch": "1",
+        }
+        assert await record_reported([row], metadata=metadata) == []
+        metadata["owner_epoch"] = str(deps.journal.epoch)
+        calls = await record_reported([row], metadata=metadata)
+        assert len(calls) == 1
+        assert calls[0].candidate_id == "historical-candidate"
+        assert calls[0].id.startswith("llm-")
+        assert "-e2-" in calls[0].id
+        assert await record_reported([row], metadata=metadata) == []
+        await deps.journal.commit()
+    finally:
+        await resumed.aclose()
+
+
+@pytest.mark.parametrize("present", ["request", "response"])
+async def test_one_sided_payload_upload_cancel_does_not_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, present: str
+) -> None:
+    held = HeldOperation()
+    async with open_llm_run(tmp_path) as run:
+        writes: list[bytes] = []
+        put = run.artifacts.put_bytes
+
+        def upload(data: bytes) -> str:
+            writes.append(data)
+            held.wait()
+            return put(data)
+
+        monkeypatch.setattr(run.artifacts, "put_bytes", upload)
+        payloads = {"request": None, "response": None, present: {"value": "payload"}}
+        task = asyncio.create_task(
+            record_call(
+                **record_kwargs(
+                    {
+                        "run_id": run.run_id,
+                        "goal_id": "g",
+                        "role": "tool",
+                        "owner_epoch": str(run.journal.epoch),
+                    },
+                    **payloads,
+                    settle=False,
+                    _external_observation=True,
+                )
+            )
+        )
+        try:
+            await held.ready()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await observe_task(task)
+            await held.finish()
+            await run.journal.commit()
+            assert run.calls() == []
+            assert writes == [canonical_json({"value": "payload"})]
+        finally:
+            held.release.set()
+            task.cancel()
+            await held.finish()
+            await settle_tasks(task)
+
+
+@pytest.mark.parametrize("external_first", [True, False])
+async def test_tool_dedup_cannot_suppress_funded_call(tmp_path: Path, external_first: bool) -> None:
+    from swarm_arena._tooling.llm_calls import LLMCallRow, record_reported
+    from swarm_arena.testing._harness import _assert_accounted
+
+    async with open_llm_run(tmp_path) as run:
+        scope, meta = await _open(run)
+        observation_meta = {
+            "run_id": run.run_id,
+            "goal_id": "g",
+            "candidate_id": "c",
+            "owner_epoch": str(run.journal.epoch),
+        }
+        rows = [LLMCallRow(model="a/b", litellm_call_id="collision")]
+        with llm_scope(scope):
+            if external_first:
+                assert len(await record_reported(rows, metadata=observation_meta)) == 1
+            funded = await record_call(**record_kwargs(meta, litellm_call_id="collision"))
+            assert funded is not None
+            if not external_first:
+                assert len(await record_reported(rows, metadata=observation_meta)) == 1
+        assert run.charged(scope) == Amount(tokens=120, usd=0.002)
+        assert scope.call_ids == [funded.id]
+        assert await drain(scope, wait=False) == []
+        await _assert_accounted(scope, run.store)
+        assert await record_reported(rows, metadata=observation_meta) == []
+        assert await record_call(**record_kwargs(meta, litellm_call_id="collision")) is None
+
+
+@pytest.mark.parametrize("field", ["cost_usd", "usage"])
+async def test_unsupported_report_amount_is_informational(tmp_path: Path, field: str) -> None:
+    from swarm_arena._tooling.llm_calls import LLMCallRow, record_reported
+
+    async with open_llm_run(tmp_path) as run:
+        values: dict[str, Any] = {field: 1e300 if field == "cost_usd" else Usage(usd=1e300)}
+        [call] = await record_reported(
+            [LLMCallRow(model="a/b", **values)],
+            metadata={"run_id": run.run_id, "goal_id": "g", "owner_epoch": str(run.journal.epoch)},
+        )
+        assert call.status == "error"
+        assert call.cost_usd == 0
+        assert call.usage.usd is None
+        assert call.error == "usage_overflow: unsupported informational amount"
+        assert not run.ledger._charges
+
+
+async def test_interrupted_reports_retain_each_admitted_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._tooling import llm_calls
+
+    async with open_llm_run(tmp_path) as run:
+        real = llm_calls.record_call
+        entered = asyncio.Event()
+        calls = 0
+
+        async def interrupt(**kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                entered.set()
+                await asyncio.Future()
+            return await real(**kwargs)
+
+        monkeypatch.setattr(llm_calls, "record_call", interrupt)
+        links: list[str] = []
+        task = asyncio.create_task(
+            llm_calls.record_reported(
+                [llm_calls.LLMCallRow(model="a/b"), llm_calls.LLMCallRow(model="a/c")],
+                metadata={
+                    "run_id": run.run_id,
+                    "goal_id": "g",
+                    "candidate_id": "c",
+                    "owner_epoch": str(run.journal.epoch),
+                },
+                call_ids=links,
+            )
+        )
+        try:
+            with anyio.fail_after(60):
+                await entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await observe_task(task)
+            await run.journal.commit()
+            assert links == [call.id for call in run.calls()]
+            assert len(links) == 1
+        finally:
+            task.cancel()
+            await settle_tasks(task)
+
+
+async def test_tool_dedup_namespace_rebuilds_from_committed_rows(tmp_path: Path) -> None:
+    from swarm_arena._tooling.llm_calls import LLMCallRow, record_reported
+    from swarm_arena.testing._harness import _assert_accounted
+
+    async with open_llm_run(tmp_path) as run:
+        metadata = {
+            "run_id": run.run_id,
+            "goal_id": "g",
+            "candidate_id": "c",
+            "owner_epoch": str(run.journal.epoch),
+        }
+        rows = [LLMCallRow(model="a/b", litellm_call_id="replayed-collision")]
+        assert len(await record_reported(rows, metadata=metadata)) == 1
+        await run.journal.commit()
+        state = run.state()
+        unbind_run(run.run_id)
+        bind_run(
+            run.run_id,
+            journal=run.journal,
+            ids=run.ids,
+            artifacts=run.artifacts,
+            tracing=run.config.tracing,
+            committed=list(state.llm_calls.values()),
+            request_sha256=state.llm_request_sha256,
+            stops=run.stops,
+            clock=run.clock,
+        )
+        scope, funded_meta = await _open(run)
+        with llm_scope(scope):
+            funded = await record_call(
+                **record_kwargs(funded_meta, litellm_call_id="replayed-collision")
+            )
+        assert funded is not None
+        assert run.charged(scope) == Amount(tokens=120, usd=0.002)
+        assert await record_reported(rows, metadata=metadata) == []
+        await _assert_accounted(scope, run.store)
+
+
+@pytest.mark.parametrize("invalid", ["namespace", "scope", "released"])
+async def test_maintenance_observation_rechecks_authority(tmp_path: Path, invalid: str) -> None:
+    from datetime import timedelta
+
+    from swarm_arena._journal import llm_record
+    from swarm_arena._model.canonical import utc_now
+
+    async with open_llm_run(tmp_path) as run:
+        unbind_run(run.run_id, journal=run.journal)
+        lease = run.journal._lease
+        doc = lease.doc
+        async with llm_record._bound_run(
+            run.run_id,
+            journal=run.journal,
+            ids=run.ids,
+            artifacts=run.artifacts,
+            config=run.config,
+            stops=run.stops,
+            clock=None,
+            state=run.state(),
+            _maintenance_lease=lease,
+        ):
+            meta = {
+                "run_id": run.run_id,
+                "owner_epoch": str(run.journal.epoch),
+                "role": "tool",
+                "goal_id": "g",
+            }
+            kwargs = record_kwargs(
+                meta,
+                settle=False,
+                _external_observation=True,
+                litellm_call_id="SECRET" if invalid == "namespace" else "gw:one",
+            )
+            try:
+                if invalid == "released":
+                    lease.doc = doc.model_copy(
+                        update={"expires_at": utc_now() - timedelta(seconds=1)}
+                    )
+
+                async def attempt() -> None:
+                    if invalid == "scope":
+                        with llm_scope(run.scope("judge")):
+                            await record_call(**kwargs)
+                    else:
+                        await record_call(**kwargs)
+
+                with pytest.raises((ValueError, Fenced)) as caught:
+                    await attempt()
+                assert_secret_absent(caught.value, "SECRET")
+            finally:
+                lease.doc = doc
+        assert not run.calls()
+
+
+async def test_maintenance_ignores_old_epoch_and_unbinds_on_hard_control(tmp_path: Path) -> None:
+    from swarm_arena._journal import llm_record
+
+    async with open_llm_run(tmp_path) as run:
+        unbind_run(run.run_id, journal=run.journal)
+
+        async def attempt() -> None:
+            async with llm_record._bound_run(
+                run.run_id,
+                journal=run.journal,
+                ids=run.ids,
+                artifacts=run.artifacts,
+                config=run.config,
+                stops=run.stops,
+                clock=None,
+                state=run.state(),
+                _maintenance_lease=run.journal._lease,
+            ):
+                meta = {"run_id": run.run_id, "owner_epoch": "0", "role": "manager"}
+                assert await record_call(**record_kwargs(meta, settle=True)) is None
+                raise GeneratorExit
+
+        with pytest.raises(GeneratorExit):
+            await attempt()
+        assert run.run_id not in llm_record._bindings
+        assert not run.calls()

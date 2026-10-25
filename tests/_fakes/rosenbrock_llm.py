@@ -142,7 +142,6 @@ def _example(root: Path) -> tuple[Plan, RunConfig]:
             "run_root": str(root / "runs"),
             "arena_root": str(root / "arena"),
             "artifact_root": str(root / "artifacts"),
-            "settle_timeout_s": 2,
             "executor": config.executor.model_copy(
                 update={"config": {"workspace_root": str(root / "ws")}}
             ),

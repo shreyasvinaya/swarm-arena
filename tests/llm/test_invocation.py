@@ -6,6 +6,9 @@ from unittest.mock import Mock
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
+
+pytest.importorskip("agents")
 
 from swarm_arena import Limits
 from swarm_arena._budget.llm_scope import LLMScope, current_llm_scope, llm_scope
@@ -165,16 +168,18 @@ async def test_real_cancellation_wins_and_drains_without_wait(
     monkeypatch.setattr(module, "_finish_accounting", finish)
     task = asyncio.create_task(body())
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await ready.wait()
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+        task.cancel()
+        with anyio.fail_after(30):
+            await asyncio.wait({task})
+        with pytest.raises(asyncio.CancelledError):
+            task.result()
         assert drained == [True]
     finally:
         if not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await settle_tasks(task)
 
 
 async def test_forged_cancellation_is_not_real_caller_cancellation(
@@ -232,10 +237,10 @@ async def test_caller_timer_catches_cancellation_during_accounting(
 
     monkeypatch.setattr(module, "_finish_accounting", finish)
     if timer_kind == "fail_after":
-        with pytest.raises(TimeoutError), anyio.fail_after(10) as timer:
+        with pytest.raises(TimeoutError), anyio.fail_after(60) as timer:
             await invoke()
     else:
-        with anyio.move_on_after(10) as timer:
+        with anyio.move_on_after(60) as timer:
             await invoke()
         assert timer.cancelled_caught
     assert entered

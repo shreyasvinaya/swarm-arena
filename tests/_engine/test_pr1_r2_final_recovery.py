@@ -119,7 +119,9 @@ async def test_resume_reuses_committed_final_scores_and_order(
         "anyio.run(final_crash_driver, Path(sys.argv[1]), "
         "sys.argv[2] == 'True', sys.argv[3] == 'True')"
     )
-    with anyio.fail_after(30):
+    # A whole child swarm run up to its crash point: a generous safety bound
+    # (CI-SWEEP), not the behaviour under test.
+    with anyio.fail_after(180):
         process = await anyio.run_process(
             [sys.executable, "-c", code, str(crashed), str(failed), str(flip)],
             env=environment,

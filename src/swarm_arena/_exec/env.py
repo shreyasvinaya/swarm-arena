@@ -134,7 +134,8 @@ def build_env(
     Build a fresh environment using the job's explicit precedence rules.
 
     Start with base node names, then resolve command and secret allowlists from
-    the node before falling back to the secrets file. Apply ``job.env``, set the
+    the node before falling back to the secrets file, skipping ``job.drop_env``
+    names before reading any source. Then apply ``job.env``, set the
     workspace result path, and finally apply driver-supplied ``secret_values``.
     Missing allowlisted names stay unset. Read the file at most once, only when
     an allowlisted name is absent from the node. Async callers must run this
@@ -161,9 +162,14 @@ def build_env(
     >>> env = build_env(job, command, workspace=workspace,
     ...                 node_env={"PATH": "/bin"})  # doctest: +SKIP
     """
-    env = {name: node_env[name] for name in BASE_ENV_NAMES if name in node_env}
+    dropped = frozenset(job.drop_env)
+    env = {
+        name: node_env[name] for name in BASE_ENV_NAMES if name not in dropped and name in node_env
+    }
     secrets: dict[str, str] | None = None
     for name in (*command.env, *job.secret_env):
+        if name in dropped:
+            continue
         if name in node_env:
             env[name] = node_env[name]
         elif job.secrets_file is not None:

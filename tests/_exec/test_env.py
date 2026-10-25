@@ -250,3 +250,89 @@ def test_invalid_utf8_secrets_is_sanitized(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="cannot read secrets file") as exc:
         read_secrets_file(str(path))
     assert_secret_absent(exc.value, secret)
+
+
+def test_drop_env_removes_node_values_not_secret_values(tmp_path: Path) -> None:
+    job = make_job(
+        drop_env=("GEMINI_API_KEY", "OPENAI_API_KEY"), secret_values={"OPENAI_API_KEY": "sk-v"}
+    )
+    env = build_env(
+        job,
+        Command(argv=["x"], env=["GEMINI_API_KEY", "OPENAI_API_KEY"]),
+        workspace=tmp_path,
+        node_env={"GEMINI_API_KEY": "real-g", "OPENAI_API_KEY": "real-o"},
+    )
+    assert "GEMINI_API_KEY" not in env
+    assert env["OPENAI_API_KEY"] == "sk-v"
+
+
+def test_drop_env_precedence_with_file_and_explicit_overlays(tmp_path: Path) -> None:
+    path = tmp_path / "secrets.env"
+    path.write_text("GEMINI_API_KEY=file-secret\nCUSTOM=from-file\n")
+    job = make_job(
+        drop_env=("PATH", "GEMINI_API_KEY", "CUSTOM", "SWARM_ARENA_RESULT"),
+        secrets_file=str(path),
+        secret_env=("CUSTOM", "GEMINI_API_KEY"),
+        env={"CUSTOM": "explicit", "SWARM_ARENA_RESULT": "wrong"},
+    )
+    env = build_env(job, Command(argv=["x"]), workspace=tmp_path, node_env={"PATH": "/bin"})
+    assert env == {"CUSTOM": "explicit", "SWARM_ARENA_RESULT": str(tmp_path / "swarm/result.json")}
+
+
+async def test_local_executor_applies_drop_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    from swarm_arena.executor import LocalExecutor
+
+    monkeypatch.setenv("GEMINI_API_KEY", "real-provider-SENTINEL")
+    monkeypatch.setenv("OPENAI_API_KEY", "real-openai-SENTINEL")
+    job = make_job(
+        command=Command(
+            argv=[
+                sys.executable,
+                "-c",
+                "import os, json; json.dump({'data': {"
+                "'dropped': 'GEMINI_API_KEY' not in os.environ, "
+                "'virtual': os.environ['OPENAI_API_KEY'] == 'sk-v'}}, "
+                "open(os.environ['SWARM_ARENA_RESULT'], 'w'))",
+            ],
+            env=["GEMINI_API_KEY", "OPENAI_API_KEY"],
+        ),
+        artifact_root=str(tmp_path / "artifacts"),
+        drop_env=("GEMINI_API_KEY", "OPENAI_API_KEY"),
+        secret_values={"OPENAI_API_KEY": "sk-v"},
+    )
+    executor = LocalExecutor(workspace_root=str(tmp_path / "jobs"))
+    try:
+        output = await executor.submit(job)
+        assert output.status == "ok"
+        assert output.data == {"data": {"dropped": True, "virtual": True}}
+    finally:
+        await executor.aclose()
+
+
+@pytest.mark.parametrize("source", ["missing", "malformed"])
+def test_dropped_names_do_not_read_secrets_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    path = tmp_path / "secret.env"
+    if source == "malformed":
+        path.write_text("not-an-env-line")
+
+    def refuse_read(path: str) -> dict[str, str]:
+        pytest.fail("dropped name caused a secrets-file read")
+
+    monkeypatch.setattr(exec_env, "read_secrets_file", refuse_read)
+    job = make_job(
+        secret_env=("GEMINI_API_KEY",),
+        secrets_file=str(path),
+        drop_env=("OPENAI_API_KEY", "GEMINI_API_KEY"),
+        secret_values={"OPENAI_API_KEY": "virtual"},
+    )
+    env = build_env(
+        job, Command(argv=["x"], env=["OPENAI_API_KEY"]), workspace=tmp_path, node_env={}
+    )
+    assert env["OPENAI_API_KEY"] == "virtual"
+    assert "GEMINI_API_KEY" not in env

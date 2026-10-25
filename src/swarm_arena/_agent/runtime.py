@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from swarm_arena._budget.tranche import Tranche
     from swarm_arena._engine.stops import ProviderStops
     from swarm_arena._exec.executor import Executor
+    from swarm_arena._gateway.keys import KeyManager
     from swarm_arena._journal.writer import JournalWriter
     from swarm_arena._model.catalog import CatalogEntry
     from swarm_arena._model.goal import Goal, GoalKey
@@ -148,15 +149,18 @@ class AgentRuntime:
     sibling_views : Mapping[str, BoardView], optional
         Fixed declared sibling capabilities; the main group key is empty.
     started_runs : int, default=0
-        Starts whose durable tool_start returned in this round. On resume the
-        runner restores the current goal/team/agent/round count from committed
-        tool_start events, including completed and lost runs.
+        Starts whose durable tool_start or tool_dispatch returned in this round.
+        On resume the runner restores the current goal/team/agent/round count
+        from committed tool_start or tool_dispatch events, including completed
+        and lost runs.
     seed_parents : tuple[str, ...], default=()
         Ordered assigned parent ids; exposed read-only to the manager and
         prepended to explicit parents with stable deduplication. The runner
         supplies a view permitting these assigned candidates.
     private_paths : frozenset[str], default=frozenset()
         Every check and judge file path of the current revision.
+    gateway : KeyManager or None, default=None
+        Run-owned virtual keys and informational spend observations for tools.
 
     Examples
     --------
@@ -210,6 +214,7 @@ class AgentRuntime:
     private_paths: frozenset[str] = frozenset()
     rankings: Mapping[str, str] = field(default_factory=dict)
     sibling_views: Mapping[str, BoardView] = field(default_factory=dict)
+    gateway: KeyManager | None = None
 
     def __post_init__(self) -> None:
         """Share the journal owner's provider service with the manager path."""

@@ -1,11 +1,13 @@
 """Validate, reserve, execute, and durably publish one agent tool request."""
 
+from __future__ import annotations
+
 import asyncio
-from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Awaitable, Callable, Generator, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import anyio
 
@@ -20,6 +22,7 @@ from swarm_arena._errors import (
     ConfigError,
     Fenced,
     SoftError,
+    StorageError,
     _core_error,
     _core_signal,
     _exception_type_name,
@@ -28,6 +31,8 @@ from swarm_arena._errors import (
 from swarm_arena._exec.env import tool_env_vars
 from swarm_arena._exec.executor import Executor, Job
 from swarm_arena._exec.threads import run_sync_daemon
+from swarm_arena._gateway.adapter import GatewayError
+from swarm_arena._gateway.keys import REPLACED_KEYS, gateway_job, needs_key
 from swarm_arena._journal.a2a import agent_task_id, task_to_json, tool_run_task
 from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.writer import JournalWriter
@@ -37,7 +42,7 @@ from swarm_arena._model.detach import _detach_model
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.ref import _validate_config
 from swarm_arena._model.results import Candidate, CheckResult
-from swarm_arena._model.tooling import RunStatus, ToolOutput, ToolRequest, parse_logs_ref
+from swarm_arena._model.tooling import FileRef, RunStatus, ToolOutput, ToolRequest, parse_logs_ref
 from swarm_arena._outcomes import (
     _classify_outcome,
     _has_core_fenced,
@@ -46,8 +51,21 @@ from swarm_arena._outcomes import (
 )
 from swarm_arena._scoring.check import CheckContext, _prepare_command_output
 from swarm_arena._scoring.runner import run_checks
+from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
 from swarm_arena._store.io import _create, _storage_io
+from swarm_arena._tooling.env_names import effective_secret_env
+from swarm_arena._tooling.llm_calls import (
+    MAX_LLM_CALLS_BYTES,
+    LLMCallRow,
+    _read_report_artifact,
+    llm_calls_source,
+    may_call_llm,
+    oversize_warning,
+    parse_llm_calls,
+    record_reported,
+)
+from swarm_arena._tooling.output import collection_warnings, detach_tool_output
 from swarm_arena._tooling.result_file import request_json
 from swarm_arena._tooling.staging import (
     parent_ref,
@@ -57,6 +75,9 @@ from swarm_arena._tooling.staging import (
     validate_edits,
 )
 from swarm_arena._tooling.tool import effective_tool_timeout, tool_grace
+
+if TYPE_CHECKING:
+    from swarm_arena._gateway.keys import KeyRecord
 
 FINGERPRINT_TIMEOUT_S = 10.0
 """Maximum seconds to await the optional fingerprint hook before recording null."""
@@ -338,11 +359,18 @@ def _prepare_started(value: object) -> Job.Started:
     return _detach_model(Job.Started, value)
 
 
+def _reported_rows(
+    artifacts: ArtifactStore, ref: FileRef
+) -> tuple[Iterator[LLMCallRow], list[str]]:
+    """Fetch bounded verified bytes and prepare a lazy parser in the storage worker."""
+    return parse_llm_calls(_read_report_artifact(artifacts, ref))
+
+
 def _prepare_output(value: object) -> ToolOutput:
     """Detach executor output serializers and validate before core completion."""
     if not isinstance(value, ToolOutput):
         raise TypeError("invalid tool output")
-    return _detach_model(ToolOutput, value)
+    return detach_tool_output(value)
 
 
 _T = TypeVar("_T")
@@ -540,7 +568,12 @@ class _ToolReservation:
 
 async def _refund_undispatched(rt: AgentRuntime, owner: _ToolReservation) -> None:
     """Book zero once before dispatch, bounding even the ledger's inner shield."""
-    if owner.admitted is None or owner.started or rt.journal.fenced.is_set():
+    if (
+        owner.admitted is None
+        or owner.admitted.keep_charged
+        or owner.started
+        or rt.journal.fenced.is_set()
+    ):
         return
     with anyio.CancelScope(shield=True):
         try:
@@ -550,6 +583,65 @@ async def _refund_undispatched(rt: AgentRuntime, owner: _ToolReservation) -> Non
                 await rt.ledger.settle(owner.admitted.id, Amount())
         except TimeoutError:
             pass
+
+
+def _gateway_cleanup_deadline(rt: AgentRuntime, inherited: float) -> float:
+    """Cap external cleanup by the remaining caller and writer allowances."""
+    deadline = min(
+        inherited,
+        rt.journal._closing_at,
+        anyio.current_time() + min(30.0, rt.config.settle_timeout_s),
+    )
+    if rt.journal._io_scope is not None:
+        deadline = min(deadline, rt.journal._io_scope.deadline)
+    return deadline
+
+
+async def _revoke_gateway_key(rt: AgentRuntime, record: KeyRecord, deadline: float) -> None:
+    """Attempt bounded no-journal revocation without replacing an escaping error."""
+    assert rt.gateway is not None
+    deadline = _gateway_cleanup_deadline(rt, deadline)
+    if deadline <= anyio.current_time():
+        rt.gateway._revoke_later(record)
+        return
+    with anyio.CancelScope(shield=True, deadline=deadline):
+        with suppress(Exception):
+            await rt.gateway.revoke(record)
+
+
+async def _read_tool_gateway(
+    rt: AgentRuntime,
+    record: KeyRecord,
+    inflight: Inflight,
+    generation: int,
+    warnings: list[str],
+) -> list[str]:
+    """Keep readback cancellable without imposing a timer on healthy recording."""
+    assert rt.gateway is not None
+    with anyio.CancelScope() as scope:
+        if not inflight._add_completion(scope, grace_s=0, generation=generation):
+            return []
+        try:
+            calls, status = await rt.gateway.read_with_status([record], wait_first=True)
+        finally:
+            inflight.discard(scope)
+    if scope.cancelled_caught:
+        warnings.append(
+            "LLM gateway spend read-back failed: gateway read interrupted; "
+            "later reads and reconcile retry"
+        )
+        return []
+    if status == "no_rows":
+        warnings.append(
+            "LLM gateway spend read-back: no rows observed within the first-row wait; "
+            "later reads and reconcile retry"
+        )
+    elif status != "ok":
+        warnings.append(
+            f"LLM gateway spend read-back failed: gateway read {status}; "
+            "later reads and reconcile retry"
+        )
+    return [call.id for call in calls]
 
 
 async def execute_tool_run(
@@ -620,6 +712,7 @@ async def execute_tool_run(
     )
     allocation_request = request
     index: int | None = None
+    boundary = _Outcome()
     try:
         if not deterministic:
             index = rt.repeats.next_replicate(rt, request, requested=replicate)
@@ -684,9 +777,16 @@ async def execute_tool_run(
                     if inflight is not None:
                         inflight.discard(admission_scope)
             raise _core_signal(LimitReached("stop", "the round is stopping"))
-        except BaseException as error:
+        except (Exception, anyio.get_cancelled_exc_class(), BaseExceptionGroup) as error:
+            if (
+                isinstance(error, BaseExceptionGroup)
+                and error.subgroup((KeyboardInterrupt, SystemExit, GeneratorExit)) is not None
+            ):
+                raise
             if not _has_core_fenced(error):
                 await _refund_undispatched(rt, owner)
+            if isinstance(error, BaseExceptionGroup):
+                raise boundary.classify(error) from None
             raise
     finally:
         if index is not None:
@@ -717,17 +817,23 @@ async def _run(
     output = ToolOutput(status=RunStatus.ERROR)
     amount = Amount.from_estimate(rt.limits.default_run_reservation)
     providers = False
+    secret_env: tuple[str, ...] = ()
     failed = False
+    submitted = False
+    call_ids: list[str] = []
+    gateway_record: KeyRecord | None = None
 
-    def estimate() -> tuple[Amount, bool]:
+    def estimate() -> tuple[Amount, frozenset[str], tuple[str, ...]]:
         value = rt.tool.estimate(request)
         return (
             amount if value is None else Amount.from_estimate(value),
-            bool(rt.tool.providers()),
+            frozenset(rt.tool.providers()),
+            effective_secret_env(rt.tool),
         )
 
     try:
-        amount, providers = await _prepare_sync(estimate)
+        amount, declared_providers, secret_env = await _prepare_sync(estimate)
+        providers = bool(declared_providers)
     except BaseException as error:
         error = outcome.classify(error)
         _raise_terminal(error)
@@ -735,6 +841,7 @@ async def _run(
             raise error from None
         warnings.append(f"tool error: {_exception_type_name(error)}")
         failed = True
+        declared_providers = frozenset()
     if inflight.closed or generation != inflight._cancel_generation:
         raise _core_signal(LimitReached("stop", "the round is stopping"))
 
@@ -746,10 +853,23 @@ async def _run(
             inflight.add(admission_scope, grace_s=grace_s, admitted_generation=generation)
         owner.admitted = reservation
 
+    keyed = rt.gateway is not None and needs_key(declared_providers, secret_env)
     res = await rt.ledger.reserve(
-        rt.holder, amount, kind="tool", goal_id=rt.goal_id, on_admit=on_admit
+        rt.holder,
+        amount,
+        kind="tool",
+        goal_id=rt.goal_id,
+        on_admit=on_admit,
     )
     await anyio.lowlevel.checkpoint()
+    if keyed and amount.usd <= 0:
+        warnings.append(
+            "LLM gateway key needs a USD reservation above 0; give Tool.estimate() a usd value "
+            "or set limits.default_run_reservation.usd"
+        )
+        failed = True
+    if failed:
+        inflight.discard(admission_scope)
 
     async def on_started(event: Job.Started) -> None:
         nonlocal started, admission_refusal
@@ -762,7 +882,7 @@ async def _run(
         await rt.journal.append_durable(
             _draft(
                 rt,
-                EventType.TOOL_START,
+                EventType.TOOL_DISPATCH if event.kind == "dispatch" else EventType.TOOL_START,
                 candidate_id=id,
                 reservation_id=res.id,
                 started=event.model_dump(mode="json"),
@@ -806,30 +926,95 @@ async def _run(
                     agent=rt.spec.name,
                     round=rt.round,
                 ),
-                secret_env=(),
+                secret_env=secret_env,
                 secrets_file=rt.config.secrets.file,
                 artifact_root=rt.config.artifact_root,
                 on_started=on_started,
                 on_partial=on_partial,
+                drop_env=tuple(sorted(REPLACED_KEYS)) if rt.gateway is not None else (),
             )
-            with anyio.CancelScope() as run_scope:
+            inherited_deadline = anyio.current_effective_deadline()
+            secret: str | None = None
+            if keyed:
+                assert rt.gateway is not None
+                res = await rt.ledger._keep_charged(
+                    res.id, on_admit=lambda admitted: setattr(owner, "admitted", admitted)
+                )
                 try:
-                    inflight.add(run_scope, grace_s=job.grace_s, admitted_generation=generation)
+                    gateway_record, secret = await rt.gateway.open(
+                        candidate_id=id,
+                        reservation=res,
+                        run_id=rt.repeats.run_id,
+                        goal_id=rt.goal_id,
+                        team=rt.team.name,
+                        agent=rt.spec.name,
+                        round=rt.round,
+                    )
+                except GatewayError:
+                    warnings.append("LLM gateway key creation failed: gateway open failed")
+                    failed = True
                     inflight.discard(admission_scope)
-                except LimitReached as error:
-                    admission_refusal = error
+            try:
+                if not failed:
+                    if gateway_record is not None:
+                        assert secret is not None
+                        assert rt.config.llm_gateway is not None
+                        job = gateway_job(job, url=rt.config.llm_gateway.url, secret=secret)
+                        secret = None
+                    with anyio.CancelScope() as run_scope:
+                        try:
+                            inflight.add(
+                                run_scope, grace_s=job.grace_s, admitted_generation=generation
+                            )
+                            inflight.discard(admission_scope)
+                        except LimitReached as error:
+                            admission_refusal = error
+                            raise
+                        try:
+                            submitted = True
+                            output = await rt.executor.submit(job)
+                        finally:
+                            inflight.discard(run_scope)
+                    if run_scope.cancelled_caught:
+                        output = partial[0] if partial else ToolOutput(status=RunStatus.CANCELLED)
+                    if gateway_record is not None:
+                        assert rt.gateway is not None
+                        await anyio.lowlevel.checkpoint_if_cancelled()
+                        close_deadline = _gateway_cleanup_deadline(rt, inherited_deadline)
+                        with anyio.CancelScope(shield=True, deadline=close_deadline):
+                            gateway_record = await rt.gateway.close(gateway_record)
+                        if gateway_record.closed_at is None:
+                            warnings.append(
+                                "LLM gateway spend read-back failed: gateway closure unconfirmed; "
+                                "later reads and reconcile retry"
+                            )
+                        if not run_scope.cancelled_caught:
+                            call_ids.extend(
+                                await _read_tool_gateway(
+                                    rt, gateway_record, inflight, generation, warnings
+                                )
+                            )
+            except (Exception, anyio.get_cancelled_exc_class(), BaseExceptionGroup) as error:
+                if (
+                    isinstance(error, BaseExceptionGroup)
+                    and error.subgroup((KeyboardInterrupt, SystemExit, GeneratorExit)) is not None
+                ):
                     raise
-                try:
-                    output = await rt.executor.submit(job)
-                finally:
-                    inflight.discard(run_scope)
-            if run_scope.cancelled_caught:
-                output = partial[0] if partial else ToolOutput(status=RunStatus.CANCELLED)
-    except BaseException as error:
+                if gateway_record is not None:
+                    await _revoke_gateway_key(rt, gateway_record, inherited_deadline)
+                raise
+    except (Exception, anyio.get_cancelled_exc_class(), BaseExceptionGroup) as error:
+        if (
+            isinstance(error, BaseExceptionGroup)
+            and error.subgroup((KeyboardInterrupt, SystemExit, GeneratorExit)) is not None
+        ):
+            raise
         inflight.discard(admission_scope)
         refused = error is admission_refusal
         error = outcome.classify(error)
         _raise_terminal(error)
+        if submitted and isinstance(error, StorageError) and _is_core_signal(error):
+            raise error from None
         if refused and _is_core_signal(error) and isinstance(error, LimitReached) and not started:
             raise error from None
         warnings.append(f"tool error: {_exception_type_name(error)}")
@@ -856,6 +1041,42 @@ async def _run(
         warnings.append(f"tool error: {anyio.get_cancelled_exc_class().__name__}")
         output = ToolOutput(status=RunStatus.ERROR)
 
+    warnings.extend(collection_warnings(output))
+    reported_rows = 0
+    ref = output.llm_calls_file
+    if ref is not None:
+        if ref.size > MAX_LLM_CALLS_BYTES:
+            warnings.append(oversize_warning(ref.size))
+        else:
+            # Reuse the output phase's remaining allowance after stop; every read
+            # and recorder payload remains under the current completion owner.
+            with anyio.CancelScope(deadline=deadline) as report_scope:
+                inflight._add_completion(
+                    report_scope, grace_s=0, generation=inflight._cancel_generation
+                )
+                try:
+                    rows, report_warnings = await _storage_io(_reported_rows, rt.artifacts, ref)
+                    metadata = {
+                        "run_id": rt.repeats.run_id,
+                        "goal_id": rt.goal_id,
+                        "team": rt.team.name,
+                        "agent": rt.spec.name,
+                        "round": str(rt.round),
+                        "candidate_id": id,
+                        "owner_epoch": str(rt.journal.epoch),
+                    }
+                    try:
+                        while (row := await run_sync_daemon(next, rows, None)) is not None:
+                            reported_rows += 1
+                            if not keyed:
+                                await record_reported([row], metadata=metadata, call_ids=call_ids)
+                    finally:
+                        warnings.extend(report_warnings)
+                finally:
+                    inflight.discard(report_scope)
+            if report_scope.cancelled_caught:
+                warnings.append("swarm/llm_calls.jsonl collection interrupted")
+
     # Deliver an outer cancellation before accounting and supervised log publication.
     await anyio.lowlevel.checkpoint()
     if rt.journal.fenced.is_set():
@@ -863,8 +1084,13 @@ async def _run(
     actual = Amount()
     estimated = False
     usage = output.usage
-    overflow = usage.usd is not None and usage.usd > USD_LIMIT
-    if overflow:
+    overflow = not keyed and usage.usd is not None and usage.usd > USD_LIMIT
+    if res.keep_charged:
+        # Gateway observations are the only actual-spend source. A tool's
+        # unsupported usage remains informational and never trips the run fuse.
+        estimated = True
+        actual = Amount(tokens=usage.total_tokens)
+    elif overflow:
         warnings.append("tool error: usage exceeds supported range")
         output = output.model_copy(update={"status": RunStatus.ERROR})
         actual = Amount(tokens=max(0, usage.total_tokens), usd=USD_LIMIT)
@@ -937,6 +1163,12 @@ async def _run(
         parent_ids=[parent.candidate_id for parent in request.parents],
         overlay=overlay,
         requested_by_call=current_requesting_call(),
+        llm_call_ids=call_ids,
+        llm_calls_source=llm_calls_source(
+            keyed=gateway_record is not None,
+            reported_rows=reported_rows,
+            may_call=providers or may_call_llm(frozenset(), secret_env),
+        ),
         read_ids=list(read_ids),
         warnings=warnings,
     )

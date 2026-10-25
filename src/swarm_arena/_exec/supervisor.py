@@ -66,6 +66,41 @@ def _launcher_args(rlimits: RLimits | None) -> list[str]:
     return [f"{flag}={value}" for flag, value in pairs if value is not None]
 
 
+def launch_argv(argv: Sequence[str], *, go_fd: int, rlimits: RLimits | None) -> list[str]:
+    """Build the shared isolated launcher command without spawning a process.
+
+    Parameters
+    ----------
+    argv : Sequence[str]
+        Tool executable and arguments.
+    go_fd : int
+        Inherited descriptor carrying the start handshake.
+    rlimits : RLimits or None
+        Child resource limits, or no overrides.
+
+    Returns
+    -------
+    list[str]
+        Launcher invocation with the original resource-option spelling.
+
+    Examples
+    --------
+    >>> launch_argv(["true"], go_fd=5, rlimits=None)[-4:]
+    ['--go-fd', '5', '--', 'true']
+    """
+    return [
+        sys.executable,
+        "-I",
+        "-m",
+        "swarm_arena._launch",
+        "--go-fd",
+        str(go_fd),
+        *_launcher_args(rlimits),
+        "--",
+        *argv,
+    ]
+
+
 def _open_logs(stdout: Path, stderr: Path, fds: list[int]) -> None:
     """Open both logs with ``open_log`` (checked, then truncated), adding each fd to ``fds``."""
     for path in (stdout, stderr):
@@ -328,17 +363,7 @@ class ProcessSupervisor:
             f_out, f_err = fds
             r, w = os.pipe()
             fds += [r, w]
-            command = [
-                sys.executable,
-                "-I",
-                "-m",
-                "swarm_arena._launch",
-                "--go-fd",
-                str(r),
-                *_launcher_args(rlimits),
-                "--",
-                *argv,
-            ]
+            command = launch_argv(argv, go_fd=r, rlimits=rlimits)
             spawn = functools.partial(
                 _spawn,
                 command,

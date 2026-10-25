@@ -205,7 +205,7 @@ def test_download_does_not_hold_cache_lock(tmp_path: Path, monkeypatch: pytest.M
     with ThreadPoolExecutor(1) as pool:
 
         def read(key: str) -> Blob:
-            assert pool.submit(cache.newest_segment, "r1").result(timeout=5) is None
+            assert pool.submit(cache.newest_segment, "r1").result(timeout=30) is None
             return original(key)
 
         monkeypatch.setattr(run.store, "read", read)
@@ -226,14 +226,14 @@ def test_concurrent_ingest_counts_only_its_insertions(tmp_path: Path) -> None:
     def worker() -> int:
         cache = ArenaCache(tmp_path / "toy.sqlite")
         try:
-            barrier.wait(timeout=5)
+            barrier.wait(timeout=60)
             return ingest_run(cache, run.store, "r1", run.run_root, run.heads[-1])
         finally:
             cache.close()
 
     with ThreadPoolExecutor(2) as pool:
         futures = [pool.submit(worker) for _ in range(2)]
-        assert sum(f.result(timeout=30) for f in futures) == 11
+        assert sum(f.result(timeout=60) for f in futures) == 11
 
 
 def test_conflicting_marks_keep_registered_cli_diagnostic(tmp_path: Path) -> None:

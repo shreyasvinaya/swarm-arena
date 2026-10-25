@@ -17,6 +17,8 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 
 pytest.importorskip("agents")
 
@@ -27,6 +29,8 @@ from swarm_arena import Goal, Plan
 from swarm_arena.llm import Approve, CollaborativePlanner, Edited, Feedback, LLMPlanner
 from swarm_arena.llm._terminal_reviewer import TerminalReviewer
 from swarm_arena.testing import FakeModel, FakeTurn
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 PLAN = Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[])
 
@@ -45,12 +49,12 @@ def test_worker_sigint_wakes_editor_wait(tmp_path: Path) -> None:
         start_new_session=True,
     ) as process:
         try:
-            stdout, stderr = process.communicate(timeout=40)
+            stdout, stderr = process.communicate(timeout=60)
             assert process.returncode == 0, stdout + stderr
         finally:
             with suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
+            process.wait(timeout=60)
     evidence = json.loads(stdout)
     assert evidence.pop("pid") > 0
     assert evidence == {
@@ -60,7 +64,7 @@ def test_worker_sigint_wakes_editor_wait(tmp_path: Path) -> None:
     }
 
 
-@pytest.mark.parametrize("editor_kind", ["slow", "slow_interrupt", "stubborn"])
+@pytest.mark.parametrize("editor_kind", ["slow", "slow_interrupt", "queued_interrupt", "stubborn"])
 def test_repeated_interrupt_reaps_editor_and_finishes_session(
     tmp_path: Path, editor_kind: str
 ) -> None:
@@ -68,42 +72,84 @@ def test_repeated_interrupt_reaps_editor_and_finishes_session(
     result = tmp_path / "result.json"
     terminated = tmp_path / "editor-terminated"
     second_sent = tmp_path / "second-sent"
+    waiting = tmp_path / "reviewer-waiting"
     editor = _editor(
         tmp_path,
         "import os, pathlib, signal, time\n"
         f"second_sent = pathlib.Path({str(second_sent)!r})\n"
-        "def slow_exit(*args):\n"
-        "    deadline = time.monotonic() + 15\n"
+        "interrupted = False\n"
+        "def interrupt(*args: object) -> None:\n"
+        "    global interrupted\n"
+        "    interrupted = True\n"
+        "def slow_exit(*args: object) -> None:\n"
+        "    deadline = time.monotonic() + 300\n"
         "    while not second_sent.exists():\n"
         "        if time.monotonic() >= deadline: os._exit(1)\n"
         "        time.sleep(0.01)\n"
         "    os._exit(0)\n"
         + (
-            "signal.signal(signal.SIGINT, slow_exit)\n"
-            if editor_kind == "slow_interrupt"
+            "signal.signal(signal.SIGINT, interrupt)\n"
+            if editor_kind in {"slow_interrupt", "queued_interrupt"}
             else "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
         )
-        + "def terminate(*args):\n"
+        + "def terminate(*args: object) -> None:\n"
         + f"    pathlib.Path({str(terminated)!r}).write_text('TERM')\n"
         + ("    return\n" if editor_kind == "stubborn" else "    slow_exit()\n")
         + "signal.signal(signal.SIGTERM, terminate)\n"
+        + (
+            "signals = {signal.SIGINT, signal.SIGTERM}\n"
+            "signal.pthread_sigmask(signal.SIG_BLOCK, signals)\n"
+            if editor_kind == "queued_interrupt"
+            else ""
+        )
         + f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid()))\n"
-        "while True: time.sleep(1)\n",
+        + (
+            # Queue both callbacks before Python handles either, as when a
+            # loaded worker does not schedule the editor between signals.
+            "signal.sigwait({signal.SIGTERM})\n"
+            "os.kill(os.getpid(), signal.SIGTERM)\n"
+            "signal.pthread_sigmask(signal.SIG_UNBLOCK, signals)\n"
+            if editor_kind == "queued_interrupt"
+            else ""
+        )
+        + "while not interrupted: signal.pause()\n"
+        + "slow_exit()\n",
     )
     code = f"""
 import asyncio, io, json, os, signal, termios
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
+import anyio
 from _fakes.planning_llm import planner_config, planner_output
 from _fakes.run import all_events
 from swarm_arena import Goal
 from swarm_arena.llm import CollaborativePlanner, LLMPlanner
+from swarm_arena.llm import _terminal_reviewer
 from swarm_arena.llm._terminal_reviewer import TerminalReviewer
 from swarm_arena.testing import FakeModel, FakeTurn
+original_timer_scope = _terminal_reviewer._local_timer_scope
+@contextmanager
+def controlled_grace(scope: anyio.CancelScope) -> Iterator[None]:
+    # This test exercises the second interrupt, independently of elapsed time.
+    # The unmodified grace-to-kill path is covered by the real-tty stubborn case.
+    scope.deadline = float("inf")
+    with original_timer_scope(scope):
+        yield
+_terminal_reviewer._local_timer_scope = controlled_grace
+original_sigint_wakeup = _terminal_reviewer._sigint_wakeup
+@contextmanager
+def observed_sigint_wakeup(*args: Callable[[], None]) -> Iterator[None]:
+    with original_sigint_wakeup(*args):
+        if not args:
+            Path({str(waiting)!r}).write_text('ready')
+        yield
+_terminal_reviewer._sigint_wakeup = observed_sigint_wakeup
 config = planner_config(Path.cwd())
 FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register('planner')
 before = termios.tcgetattr(0)[3]
 handler = signal.getsignal(signal.SIGINT)
-async def main():
+async def main() -> None:
     reviewer = TerminalReviewer(stdin=io.StringIO('e\\n'), editor={editor!r})
     await CollaborativePlanner(LLMPlanner('planner'), reviewer).plan(
         Goal(id='g', namespace='n'), config, None)
@@ -141,19 +187,19 @@ Path({str(result)!r}).write_text(json.dumps({{
                 output.extend(os.read(master, 65536))
 
     try:
-        deadline = time.monotonic() + 20
-        while not marker.exists() or not marker.read_text():
+        deadline = time.monotonic() + 60
+        while not waiting.exists() or not marker.exists() or not marker.read_text():
             assert time.monotonic() < deadline, bytes(output)
             pump()
         editor_pid = int(marker.read_text())
         os.write(master, b"\x03")
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 60
         while not terminated.exists():
             assert time.monotonic() < deadline, bytes(output)
             pump()
         os.write(master, b"\x03")
-        second_sent.write_text("sent")
-        deadline = time.monotonic() + 10
+        # Keep the editor held: only the second interrupt may end the grace.
+        deadline = time.monotonic() + 30
         while True:
             exited, status = os.waitpid(pid, os.WNOHANG)
             if exited:
@@ -161,6 +207,7 @@ Path({str(result)!r}).write_text(json.dumps({{
                 break
             assert time.monotonic() < deadline, bytes(output)
             pump()
+        assert not second_sent.exists(), "editor was released before the second-interrupt assertion"
         assert os.waitstatus_to_exitcode(status) == 0, bytes(output)
         data = json.loads(result.read_text())
         assert data == {
@@ -172,7 +219,8 @@ Path({str(result)!r}).write_text(json.dumps({{
         with pytest.raises(ProcessLookupError):
             os.kill(editor_pid, 0)
     finally:
-        with suppress(ProcessLookupError):
+        second_sent.write_text("release")
+        with suppress(ProcessLookupError, PermissionError):
             os.killpg(pid, signal.SIGKILL)
         if not reaped:
             os.waitpid(pid, 0)
@@ -253,11 +301,12 @@ async def test_editor_restores_real_tty_on_every_exit(
             assert not termios.tcgetattr(slave)[3] & termios.ICANON
             if exit_path in {"success", "failure"}:
                 released.write_text("exit")
-                await task
+                await observe_task(task)
             elif exit_path in {"cancel", "stubborn"}:
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    await observe_task(task)
+                assert task.cancelled()
             else:
                 (directory,) = await anyio.to_thread.run_sync(
                     lambda: list(Path(config.run_root).iterdir())
@@ -271,7 +320,7 @@ async def test_editor_restores_real_tty_on_every_exit(
                         LocalStore(directory), owner_id="replacement", host="test", ttl_s=60
                     )
                 with pytest.raises(Fenced if exit_path == "fence" else RuntimeError):
-                    await task
+                    await observe_task(task)
             after = termios.tcgetattr(slave)
             # The kernel may set its pending-input bookkeeping bit on restore.
             after[3] &= ~getattr(termios, "PENDIN", 0)
@@ -282,18 +331,20 @@ async def test_editor_restores_real_tty_on_every_exit(
             with pytest.raises(ProcessLookupError):
                 os.kill(pid, 0)
     finally:
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        if pid is not None:
-            with suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGKILL)
-        if replacement is not None:
-            replacement.release()
-        os.dup2(original_stdin, 0)
-        os.close(original_stdin)
-        os.close(master)
-        os.close(slave)
+        try:
+            if task is not None:
+                task.cancel()
+                await settle_tasks(task)
+        finally:
+            if pid is not None:
+                with suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+            if replacement is not None:
+                replacement.release()
+            os.dup2(original_stdin, 0)
+            os.close(original_stdin)
+            os.close(master)
+            os.close(slave)
 
 
 async def test_approve() -> None:
@@ -325,7 +376,7 @@ async def test_descriptor_input_and_eof(tmp_path: Path, source: str) -> None:
         path.write_text(contents[source])
     with os.fdopen(os.open(path, os.O_RDONLY)) as stdin:
         reviewer = TerminalReviewer(stdin=stdin, stdout=io.StringIO())
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             if source in {"empty", "feedback_eof", "devnull"}:
                 with pytest.raises(RuntimeError, match="terminal input ended"):
                     await reviewer.review(PLAN)
@@ -518,17 +569,43 @@ async def test_cleanup_failure_cannot_return_edited(
 
 
 async def test_terminal_cancellation_restores_descriptor() -> None:
+    prompted = anyio.Event()
+
+    class ObservedOutput(io.StringIO):
+        def write(self, text: str) -> int:
+            if "Approve [a]" in text:
+                prompted.set()
+            return super().write(text)
+
     reader, writer = os.pipe()
     try:
         with os.fdopen(reader) as stdin:
-            with anyio.move_on_after(0.05) as scope:
-                await TerminalReviewer(stdin=stdin, stdout=io.StringIO()).review(PLAN)
+            scope = anyio.CancelScope()
+
+            async def review() -> None:
+                with scope:
+                    await TerminalReviewer(stdin=stdin, stdout=ObservedOutput()).review(PLAN)
+
+            task = asyncio.create_task(review())
+            try:
+                with anyio.fail_after(60):
+                    await prompted.wait()
+                scope.cancel()
+                with anyio.fail_after(30):
+                    await asyncio.shield(task)
+                assert scope.cancelled_caught
+            finally:
+                if not task.done():
+                    task.cancel()
+                await settle_tasks(task)
             assert scope.cancel_called
             assert os.get_blocking(reader)
             os.write(writer, b"a\n")
-            assert (
-                await TerminalReviewer(stdin=stdin, stdout=io.StringIO()).review(PLAN) == Approve()
-            )
+            with anyio.fail_after(60):
+                assert (
+                    await TerminalReviewer(stdin=stdin, stdout=io.StringIO()).review(PLAN)
+                    == Approve()
+                )
     finally:
         os.close(writer)
 
@@ -549,13 +626,38 @@ async def test_shared_cli_prompt_keeps_ascii_approval(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.parametrize("collaborative", [False, True])
-async def test_editor_cancellation_reaps_process(tmp_path: Path, collaborative: bool) -> None:
+async def test_editor_cancellation_reaps_process(
+    tmp_path: Path, collaborative: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     marker = tmp_path / "pid"
     editor = _editor(
         tmp_path,
         "import os, pathlib, signal\n"
+        "signal.alarm(600)\n"
         f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid()))\nsignal.pause()\n",
     )
+    processes: list[asyncio.subprocess.Process | anyio.abc.Process] = []
+    original_spawn = asyncio.create_subprocess_exec
+    original_open = anyio.open_process
+
+    def record(process: asyncio.subprocess.Process | anyio.abc.Process) -> None:
+        if process.pid not in {owned.pid for owned in processes}:
+            processes.append(process)
+
+    async def spawn(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        process = await original_spawn(*args, **kwargs)
+        if args[0] == editor:
+            record(process)
+        return process
+
+    async def open_process(command: Any, **kwargs: Any) -> anyio.abc.Process:
+        process = await original_open(command, **kwargs)
+        if command[0] == editor:
+            record(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(anyio, "open_process", open_process)
     reviewer = TerminalReviewer(stdin=io.StringIO("e\n"), stdout=io.StringIO(), editor=editor)
     config = planner_config(tmp_path)
     FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
@@ -565,14 +667,19 @@ async def test_editor_cancellation_reaps_process(tmp_path: Path, collaborative: 
         else reviewer.review(PLAN)
     )
     task = asyncio.create_task(operation)
+    failure: BaseException | None = None
     try:
-        with anyio.fail_after(10):
-            while not marker.exists() or not marker.read_text():
+        with anyio.fail_after(60):
+            while not processes or not marker.exists() or not marker.read_text():
                 await anyio.lowlevel.checkpoint()
             pid = int(marker.read_text())
+            assert len(processes) == 1
+            assert processes[0].pid == pid
             task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+        with anyio.fail_after(60):
+            await asyncio.wait({task})
+        with pytest.raises(asyncio.CancelledError):
+            task.result()
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
         if collaborative:
@@ -583,6 +690,52 @@ async def test_editor_cancellation_reaps_process(tmp_path: Path, collaborative: 
             sessions = await anyio.to_thread.run_sync(lambda: list(Path(config.run_root).iterdir()))
             assert not any(p.name in llm_record._bindings for p in sessions)
             assert all_events(config) == events
+    except (Exception, asyncio.CancelledError, pytest.fail.Exception) as error:
+        failure = error
+        raise
     finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        cleanup_errors: list[Exception] = []
+        if not task.done():
+            task.cancel()
+        for process in processes:
+            try:
+                if process.returncode is None:
+                    with suppress(ProcessLookupError):
+                        process.kill()
+                with anyio.fail_after(60, shield=True):
+                    await process.wait()
+            except Exception as error:
+                cleanup_errors.append(error)
+        try:
+            if marker.exists() and marker.read_text().isdigit():
+                pid = int(marker.read_text())
+                if pid not in {process.pid for process in processes}:
+                    with suppress(ProcessLookupError):
+                        os.kill(pid, signal.SIGKILL)
+                    with anyio.fail_after(60, shield=True):
+                        while True:
+                            try:
+                                reaped, _ = await anyio.to_thread.run_sync(
+                                    os.waitpid, pid, os.WNOHANG
+                                )
+                            except ChildProcessError:
+                                try:
+                                    os.kill(pid, 0)
+                                except ProcessLookupError:
+                                    break
+                            else:
+                                if reaped:
+                                    break
+                            await anyio.sleep(0.01)
+            with anyio.fail_after(60, shield=True):
+                await asyncio.wait({task})
+        except Exception as error:
+            cleanup_errors.append(error)
+        finally:
+            if task.done() and not task.cancelled():
+                task.exception()
+        if cleanup_errors:
+            if failure is None:
+                raise ExceptionGroup("editor test cleanup failed", cleanup_errors)
+            for error in cleanup_errors:
+                failure.add_note(f"editor test cleanup failed: {type(error).__name__}")

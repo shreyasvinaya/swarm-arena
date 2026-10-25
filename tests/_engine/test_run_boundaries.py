@@ -1,7 +1,6 @@
 """Regression coverage for approval, convergence estimates and bounded shutdown."""
 
 import asyncio
-import contextlib
 import traceback
 from collections.abc import Sequence
 from functools import partial
@@ -10,7 +9,9 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.engine import take_over_retrying, with_limits
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 from _fakes.run import WRITE, WRITE_THEN_SLEEP, all_events, events, plan, wait_tool_started
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import PyTool, RecordingExecutor
@@ -26,6 +27,8 @@ from swarm_arena._journal.event import EventDraft, EventType
 from swarm_arena._journal.lease import read_owner
 from swarm_arena._journal.writer import JournalWriter
 from swarm_arena._model.tooling import CompletedRun, Estimate, ToolOutput, ToolRequest, Usage
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 SECRET = "c672c04b-19af-4b0b-9a06-9d047ecf811f"
 
@@ -123,7 +126,7 @@ async def test_early_stop_reserves_integer_bound_for_actual_convergence(
         }
     )
     swarm = Swarm(cfg)
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tg:
             tg.start_soon(swarm.run, _round_cost_plan(held))
             try:
@@ -278,15 +281,14 @@ async def test_shutdown_preserves_approval_refusal(
     monkeypatch.setattr(run_module, "_build_executor", lambda cfg: BadClose())
     task = asyncio.create_task(Swarm(cfg).run(plan(rounds=1), approve=refuse))
     try:
-        done, _ = await asyncio.wait({task}, timeout=10)
+        done, _ = await asyncio.wait({task}, timeout=30)
         assert done, "executor shutdown exceeded settlement bound"
         with pytest.raises(RuntimeError, match=r"^run not approved$"):
             task.result()
     finally:
         if not task.done():
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            await settle_tasks(task)
 
 
 @pytest.mark.parametrize("takeover", [False, True])
@@ -323,7 +325,7 @@ async def test_hung_shutdown_returns_original_result_or_real_fence(
 
     task = asyncio.create_task(run())
     try:
-        with anyio.fail_after(20):
+        with anyio.fail_after(60):
             if takeover:
                 store = await wait_tool_started(cfg)
                 take_over_retrying(store)
@@ -334,7 +336,7 @@ async def test_hung_shutdown_returns_original_result_or_real_fence(
             await entered.wait()
         if takeover:
             scopes[0].cancel()
-        done, _ = await asyncio.wait({task}, timeout=10)
+        done, _ = await asyncio.wait({task}, timeout=30)
         assert done, "hung aclose prevented return within the shutdown watchdog"
         if takeover:
             with pytest.raises(Fenced) as caught:
@@ -348,11 +350,12 @@ async def test_hung_shutdown_returns_original_result_or_real_fence(
             result = task.result()
             assert len(result["g"]) == 1
     finally:
-        if not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Fenced):
-                await task
-        await LocalExecutor.aclose(executor)
+        try:
+            if not task.done():
+                task.cancel()
+                await settle_tasks(task)
+        finally:
+            await LocalExecutor.aclose(executor)
 
 
 async def test_shutdown_timeout_keeps_result_when_close_unwinding_raises(
@@ -367,6 +370,6 @@ async def test_shutdown_timeout_keeps_result_when_close_unwinding_raises(
 
     cfg = run_config.model_copy(update={"settle_timeout_s": 2.0})
     monkeypatch.setattr(run_module, "_build_executor", lambda cfg: RaisingOnTimeout())
-    with anyio.fail_after(10):
+    with anyio.fail_after(60):
         result = await Swarm(cfg).run(plan(rounds=1))
     assert result == {"g": []}

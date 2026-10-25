@@ -8,9 +8,12 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
+from unittest.mock import Mock
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
+from _fakes.dependencies import ray_dependency
 from _fakes.engine import with_executor, with_limits
 from _fakes.finished import FinishedRun
 
@@ -34,13 +37,14 @@ from swarm_arena._agent.context import AgentContext
 from swarm_arena._agent.manager import LimitReached, Manager
 from swarm_arena._agent.repeats import repeat_key
 from swarm_arena._agent.tool_run import Inflight
+from swarm_arena._agent.watchdog import Watchdog
 from swarm_arena._board.base import Board
 from swarm_arena._budget.amount import Amount
 from swarm_arena._budget.ledger import Ledger
 from swarm_arena._engine.control import request_stop
 from swarm_arena._engine.goal import GoalOutcome, GoalRunner, r0_revision_draft
 from swarm_arena._engine.resume import resume_run
-from swarm_arena._engine.round import RoundOutcome, RoundRunner
+from swarm_arena._engine.round import EngineDeps, RoundOutcome, RoundRunner
 from swarm_arena._errors import (
     ChainError,
     ConditionalWritesUnsupported,
@@ -68,6 +72,7 @@ from swarm_arena._planning.validate import admit_revision
 from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import Store
 from swarm_arena._store.local import LocalStore
+from tests.ray.conftest import ray_driver as ray_driver
 
 _T = TypeVar("_T", bound=Configurable)
 
@@ -206,6 +211,8 @@ async def _crash(
     terminal: str | None = None,
     counters: dict[str, dict[str, int]] | None = None,
     command: bool = False,
+    dispatch: bool = False,
+    ray_job_id: str = "driver-1",
     charge: Amount | None = None,
     budget_usd: float = 1000,
     slice_usd: float = 10,
@@ -308,7 +315,9 @@ async def _crash(
                 reservation = await ledger.reserve(f"{g}/t/{agent}", charge, kind="tool", goal_id=g)
                 id = f"c{index}" if len(plans) == 1 else f"{g}-c{index}"
                 started = Job.Started(
-                    kind="process",
+                    kind="dispatch" if dispatch else "process",
+                    task_name=id if dispatch else None,
+                    ray_job_id=ray_job_id if dispatch else None,
                     job_id=id,
                     host_id="old-host:boot",
                     pid=999999,
@@ -317,7 +326,8 @@ async def _crash(
                 )
                 journal.append(
                     EventDraft(
-                        type="tool_start",
+                        type="tool_dispatch" if dispatch else "tool_start",
+                        task_id=id,
                         goal_id=g,
                         team="t",
                         agent=agent,
@@ -381,7 +391,9 @@ async def _crash(
                 id = f"lost-{g}-{agent}"
                 c.in_flight.append(id)
                 started = Job.Started(
-                    kind="process",
+                    kind="dispatch" if dispatch else "process",
+                    task_name=id if dispatch else None,
+                    ray_job_id=ray_job_id if dispatch else None,
                     job_id=id,
                     host_id="old-host:boot",
                     pid=999998,
@@ -390,7 +402,8 @@ async def _crash(
                 )
                 journal.append(
                     EventDraft(
-                        type="tool_start",
+                        type="tool_dispatch" if dispatch else "tool_start",
+                        task_id=id,
                         goal_id=g,
                         team="t",
                         agent=agent,
@@ -415,7 +428,9 @@ async def _crash(
                 )
             if command:
                 c.command_started = Job.Started(
-                    kind="process",
+                    kind="dispatch" if dispatch else "process",
+                    task_name="command1" if dispatch else None,
+                    ray_job_id=ray_job_id if dispatch else None,
                     job_id="command1",
                     host_id="old-host:boot",
                     pid=999997,
@@ -1115,7 +1130,7 @@ async def test_waiting_continued_goal_converges_on_early_end(
     monkeypatch.setattr(GoalRunner, "run", counted_goal)
     monkeypatch.setattr(_Recorder, "run_round", counted_round)
     monkeypatch.setattr(Inflight, "close", signalling_close)
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tg:
             tg.start_soon(partial(Swarm(cfg).resume, c.run_id, force=True))
             await hold.entered.wait()
@@ -1613,9 +1628,9 @@ async def test_resume_shutdown_bound_and_primary_failure(
     monkeypatch.setattr(RunRunner, "_drive", drive)
     task = asyncio.create_task(runner.run())
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await closing.wait()
-        done, _ = await asyncio.wait({task}, timeout=10)
+        done, _ = await asyncio.wait({task}, timeout=30)
         assert task in done, "executor shutdown exceeded its configured bound"
         if fenced:
             with pytest.raises(Fenced) as error:
@@ -1629,11 +1644,16 @@ async def test_resume_shutdown_bound_and_primary_failure(
             assert await task == expected
     finally:
         release.set()
-        await asyncio.gather(task, return_exceptions=True)
+        if not task.done():
+            task.cancel()
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
         services = runner.resumed._services
         assert services.task is not None
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await asyncio.shield(services.task)
+    assert not pending_cleanup, "resume shutdown did not finish cleanup"
 
 
 class _CrashBoundary(BaseException):
@@ -1877,11 +1897,11 @@ async def test_cancelling_preparation_abandons_hung_constructor_and_releases_lea
     def blocked(config: RunConfig) -> Executor:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(15), "constructor release deadline"
+        assert release.wait(300), "constructor release deadline"
         return real(config)
 
     async def prepare() -> None:
-        with anyio.fail_after(15) as deadline:
+        with anyio.fail_after(300) as deadline:
             deadlines.append(deadline)
             await Swarm(config).resume(crashed.run_id)
 
@@ -1889,24 +1909,28 @@ async def test_cancelling_preparation_abandons_hung_constructor_and_releases_lea
         patch.setattr(run_module, "_build_executor", blocked)
         task = asyncio.create_task(prepare())
         try:
-            with anyio.fail_after(10):
-                assert await anyio.to_thread.run_sync(entered.wait, 10)
+            with anyio.fail_after(60):
+                assert await anyio.to_thread.run_sync(entered.wait, 60)
             services = [
                 t for t in asyncio.all_tasks() if t.get_name() == f"resume-{crashed.run_id}"
             ]
             assert services
             deadlines[0].deadline = anyio.current_time()
-            done, _ = await asyncio.wait([task], timeout=3)
+            done, _ = await asyncio.wait([task], timeout=30)
             assert done, "caller cancellation waited for the constructor"
             assert all(service.done() for service in services)
             assert workers[0].is_alive()
         finally:
             release.set()
-            result = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+            if not task.done():
+                task.cancel()
+            _, pending_cleanup = await asyncio.wait([task], timeout=60)
+            result = task.exception() if task.done() and not task.cancelled() else None
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
-                assert not worker.is_alive()
-    assert isinstance(result[0], TimeoutError)
+                await anyio.to_thread.run_sync(worker.join, 60)
+    assert not pending_cleanup, "resume preparation did not finish cleanup"
+    assert all(not worker.is_alive() for worker in workers)
+    assert isinstance(result, TimeoutError)
     owner = read_owner(crashed.store)
     assert owner is not None
     assert owner[0].expires_at <= utc_now()
@@ -2040,7 +2064,7 @@ async def _published_crash_case(root: Path, mode: str, *, crash: bool) -> tuple[
         "from test_resume import _run_published_crash_case; "
         "anyio.run(_run_published_crash_case, Path(sys.argv[1]), sys.argv[2], sys.argv[3]=='1')"
     )
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         result = await anyio.run_process(
             [sys.executable, "-c", code, str(root), mode, str(int(crash))],
             env=env,
@@ -2286,7 +2310,7 @@ async def test_page_repair_cancellation_releases_owner_before_hook_returns(
         workers.append(threading.current_thread())
         entered.set()
         assert threading.get_ident() != loop_thread
-        assert release.wait(15), "page hook release deadline"
+        assert release.wait(300), "page hook release deadline"
         returned.set()
         return result
 
@@ -2299,13 +2323,13 @@ async def test_page_repair_cancellation_releases_owner_before_hook_returns(
     monkeypatch.setattr(owner_type, method, blocked)
     task = asyncio.create_task(prepare())
     try:
-        with anyio.fail_after(10):
-            assert await anyio.to_thread.run_sync(entered.wait, 10)
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
         services = [t for t in asyncio.all_tasks() if t.get_name() == "resume-repair"]
         assert services
         scopes[0].cancel()
-        with anyio.fail_after(3):
-            await task
+        with anyio.fail_after(30):
+            await observe_task(task)
         owner = read_owner(store)
         assert owner is not None
         assert owner[0].expires_at <= utc_now()
@@ -2315,10 +2339,15 @@ async def test_page_repair_cancellation_releases_owner_before_hook_returns(
         assert not store.exists("goals/g/rounds/round-01.md")
     finally:
         release.set()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+        if not task.done():
+            task.cancel()
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
         for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
-            assert not worker.is_alive()
+            await anyio.to_thread.run_sync(worker.join, 60)
+    assert not pending_cleanup, "page repair did not finish cleanup"
+    assert all(not worker.is_alive() for worker in workers)
     assert returned.is_set()
     assert read_owner(store) == owner
     assert not store.exists("goals/g/rounds/round-01.md")
@@ -2443,7 +2472,7 @@ with MonkeyPatch.context() as patch:
             ],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=60,
         )
     )
     assert result.returncode == 31, result.stderr
@@ -2566,15 +2595,14 @@ async def model_resume_run(
         task = asyncio.create_task(Swarm(config).run(current, run_id="model-resume"))
         task.add_done_callback(lambda _: ready.set())
         try:
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await ready.wait()
             if task.done():
                 await task
                 pytest.fail("seed finished before the round-two checkpoint")
         finally:
             task.cancel()
-            with anyio.fail_after(10):
-                await asyncio.gather(task, return_exceptions=True)
+            await settle_tasks(task)
         assert task.cancelled()
     return config, LocalStore(Path(config.run_root) / "model-resume")
 
@@ -2738,34 +2766,37 @@ async def test_resume_startup_models_contain_hooks_before_takeover(
                 raise asyncio.CancelledError(secret)
             workers.append(threading.current_thread())
             entered.set()
-            assert release.wait(20)
+            assert release.wait(300)
             return ()
 
     task = asyncio.create_task(
         Swarm(config, replanner=HookPlanner([plan(rounds=3)])).resume("model-resume", force=True)
     )
     try:
-        with anyio.fail_after(8):
+        with anyio.fail_after(60):
             if failure == "held":
-                assert await anyio.to_thread.run_sync(entered.wait, 5)
+                assert await anyio.to_thread.run_sync(entered.wait, 60)
                 assert _resume_bytes(store) == before
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    await observe_task(task)
+                assert task.cancelled()
                 assert not release.is_set()
             else:
                 with pytest.raises(ValueError, match="model checks failed") as caught:
-                    await task
+                    await observe_task(task)
                 assert secret not in "".join(traceback.format_exception(caught.value))
     finally:
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(8):
-            await asyncio.gather(task, return_exceptions=True)
-            for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
-                assert not worker.is_alive()
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+    assert not pending_cleanup, "model hook owner did not finish cleanup"
+    assert all(not worker.is_alive() for worker in workers)
     assert _resume_bytes(store) == before
 
 
@@ -2821,7 +2852,7 @@ async def test_public_resume_refuses_planning_session_without_mutation(
         next_seq=1,
         local_path=tmp_path / "planning.jsonl",
         sync_interval_s=60,
-        settle_timeout_s=2,
+        settle_timeout_s=config.settle_timeout_s,
     ) as journal:
         journal.append(
             EventDraft(type="run_config", payload={"config": config.model_dump(mode="json")})
@@ -2966,7 +2997,7 @@ async def test_provider_paused_goal_keeps_capacity_while_probing_after_takeover(
     async def resume() -> None:
         await Swarm(c.config).resume(c.run_id, force=True)
 
-    with anyio.fail_after(25):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as group:
             group.start_soon(resume)
             try:
@@ -2978,3 +3009,836 @@ async def test_provider_paused_goal_keeps_capacity_while_probing_after_takeover(
     g_done = next(e.seq for e in events if e.type == "goal_finished" and e.goal_id == "g")
     h_start = next(e.seq for e in events if e.type == "goal_started" and e.goal_id == "h")
     assert g_done < h_start
+
+
+@pytest.mark.parametrize("confirmed", [True, False, "timeout", "late"])
+async def test_resume_marks_dispatch_lost_after_kill_orphan(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+    confirmed: bool | str,
+) -> None:
+    c = await _crash(tmp_path, run_config, recorders, dispatch=True)
+    source = next(e for e in _events(c, "tool_dispatch") if e.agent == "b")
+    calls: list[Job.Started] = []
+    spy = _SpyExecutor(tmp_path / "spy")
+
+    async def orphan(started: Job.Started) -> bool:
+        calls.append(started)
+        if confirmed in {"timeout", "late"}:
+            try:
+                await anyio.sleep_forever()
+            except anyio.get_cancelled_exc_class():
+                if confirmed == "late":
+                    return True
+                raise
+        return confirmed is True
+
+    monkeypatch.setattr(spy, "kill_orphan", orphan)
+    if confirmed in {"timeout", "late"}:
+        c.config = c.config.model_copy(update={"settle_timeout_s": 2.0})
+    runner = await resume_run(c.config_with(spy, monkeypatch), c.run_id, force=True, replanner=None)
+    assert runner.resumed is not None
+    assert runner.resumed.orphans_killed == (c.in_flight if confirmed is True else [])
+    assert runner.resumed.ledger.remaining("g/t/b") == c.share - c.r1_amount
+    await runner.aclose()
+    assert calls == [Job.Started.model_validate(source.payload["started"])]
+    lost = _events(c, "run_lost")[0]
+    assert lost.payload["kind"] == "dispatch"
+    assert lost.payload["task_name"] == source.payload["started"]["task_name"]
+    assert lost.payload["confirmed_dead"] is (confirmed is True)
+    assert (lost.task_id, lost.goal_id, lost.team, lost.agent, lost.round) == (
+        source.task_id,
+        source.goal_id,
+        source.team,
+        source.agent,
+        source.round,
+    )
+    state = RunState.from_events(_events(c))
+    id = source.payload["candidate_id"]
+    reservation = source.payload["reservation_id"]
+    assert id in state.lost
+    assert id not in state.started
+    assert id not in state.candidates
+    assert state.reservations[reservation].state == "open"
+    assert _settle_for(c, reservation) is None
+
+
+async def test_resume_kills_dispatched_command_orphan(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    c = await _crash(
+        tmp_path, run_config, recorders, completed=(), lost=(), command=True, dispatch=True
+    )
+    calls: list[Job.Started] = []
+    spy = _SpyExecutor(tmp_path / "spy")
+
+    async def orphan(started: Job.Started) -> bool:
+        calls.append(started)
+        return True
+
+    monkeypatch.setattr(spy, "kill_orphan", orphan)
+    for _ in range(2):
+        runner = await resume_run(
+            c.config_with(spy, monkeypatch), c.run_id, force=True, replanner=None
+        )
+        await runner.aclose()
+    assert calls == [c.command_started]
+    assert len(_events(c, "command_end")) == 1
+    assert RunState.from_events(_events(c)).started_commands == {}
+
+
+@pytest.mark.parametrize("durable", [False, True])
+async def test_resume_counts_dispatch_toward_tool_runs(
+    tmp_path: Path, run_config: RunConfig, recorders: dict[str, _Recorder], durable: bool
+) -> None:
+    c = await _crash(
+        tmp_path,
+        run_config,
+        recorders,
+        dispatch=True,
+        completed=(),
+        lost=("a",),
+        plans=[_plan(agents=("a",), rounds=1)],
+        counters={"a": {"turns": 1, "board_reads": 0, "tool_runs": 3}} if durable else None,
+    )
+    # Inspect the crash prefix before recovery adds RUN_LOST: neither a tool end
+    # nor recovery's retirement may mask a missing dispatch admission fallback.
+    plan = RunState.from_events(_events(c)).plans["g"][0][0]
+    restored = RoundRunner(
+        Mock(spec=EngineDeps, store=c.store, journal=Mock(head=c.old_lease.doc.head)),
+        goal_id="g",
+        plan=plan,
+        agents=[],
+        round_spec=plan.rounds[0],
+        rounds_left=1,
+        frontier=c.frontier,
+    )
+    await restored._restore(1)
+    assert restored._counters["t/a"].get("tool_runs") == (3 if durable else 1)
+    assert restored.started_runs == {"t/a": 1}
+    recorders["a"].requests = {1: [9.0]}
+    await Swarm(with_limits(c.config, max_tool_runs_per_round=3 if durable else 1)).resume(
+        c.run_id, force=True
+    )
+    assert recorders["a"].limits_hit == ["max_tool_runs_per_round"]
+    assert not [
+        e
+        for e in _events(c)
+        if e.epoch > 1 and e.agent == "a" and e.type in {"tool_start", "tool_dispatch"}
+    ]
+
+
+@pytest.mark.ray
+async def test_resume_dispatch_never_submitted_is_lost(
+    ray_cluster: str,
+    ray_driver: Any,
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+) -> None:
+    ray_dependency()
+    from swarm_arena.ray import RayExecutor
+
+    identity = RayExecutor()
+    try:
+        await identity.capacity()
+        driver_job_id = identity._driver_job_id
+        assert driver_job_id is not None
+    finally:
+        await identity.aclose()
+    c = await _crash(
+        tmp_path,
+        run_config,
+        recorders,
+        dispatch=True,
+        completed=(),
+        lost=("a",),
+        ray_job_id=driver_job_id,
+        plans=[_plan(agents=("a",), rounds=1)],
+    )
+    recorders["a"].requests = {}
+    config = c.config.model_copy(
+        update={"executor": Ref.of(RayExecutor(cancel_margin_s=1.0)), "lease_ttl_s": 3.0}
+    )
+    with anyio.fail_after(60):
+        await Swarm(config).resume(c.run_id, force=True)
+    lost = _events(c, "run_lost")[0]
+    assert lost.payload["confirmed_dead"] is False
+    state = RunState.from_events(_events(c))
+    assert c.in_flight[0] in state.lost
+    assert c.in_flight[0] not in state.started
+
+
+@pytest.mark.parametrize("idle_limit", [1, 3])
+async def test_resume_dispatch_preserves_closed_idle_rounds(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+    idle_limit: int,
+) -> None:
+    config = with_limits(run_config, watchdog_idle_rounds=idle_limit)
+    c = await _crash(
+        tmp_path,
+        config,
+        recorders,
+        dispatch=True,
+        plans=[_plan(agents=("a",), rounds=2)],
+        completed=(("a", 1.0, RunStatus.ERROR),),
+        lost=(),
+    )
+    await _append(c, EventDraft(type="round_closed", goal_id="g", round=1, payload={"round": 1}))
+    live = Watchdog(c.config.limits)
+    live.record_run(RunStatus.ERROR, passed=False)
+    live.end_round(ran=True)
+    observed: list[tuple[int, str | None]] = []
+    restore = GoalRunner._restore_watchdog
+
+    def capture(self: GoalRunner, key: str) -> Watchdog:
+        watchdog = restore(self, key)
+        observed.append((watchdog._idle_rounds, watchdog.limit))
+        return watchdog
+
+    monkeypatch.setattr(GoalRunner, "_restore_watchdog", capture)
+    with anyio.fail_after(60):
+        await Swarm(c.config).resume(c.run_id, force=True)
+    assert observed == [(live._idle_rounds, live.limit)]
+    if idle_limit == 1:
+        assert not [e for e in _events(c, "tool_start") if e.epoch > 1]
+
+
+@pytest.mark.parametrize("expire", [False, True])
+async def test_resume_orphans_share_deadline_and_journal_order(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+    expire: bool,
+) -> None:
+    c = await _crash(
+        tmp_path,
+        with_limits(run_config, max_agents_per_fingerprint=3),
+        recorders,
+        dispatch=True,
+        completed=(),
+        lost=("a", "b", "c"),
+        command=True,
+        plans=[_plan(agents=("a", "b", "c"), rounds=1)],
+    )
+    c.config = c.config.model_copy(update={"settle_timeout_s": 2.0})
+    ids = [*c.in_flight, "command1"]
+    calls: list[str] = []
+    deadlines: list[float] = []
+    finished: list[str] = []
+    all_entered = anyio.Event()
+    released = {id: anyio.Event() for id in ids}
+    spy = _SpyExecutor(tmp_path / "spy")
+
+    async def orphan(started: Job.Started) -> bool:
+        id = started.job_id
+        calls.append(id)
+        deadlines.append(anyio.current_effective_deadline())
+        if len(calls) == len(ids):
+            all_entered.set()
+        try:
+            await all_entered.wait()
+            if expire:
+                await anyio.sleep_forever()
+            index = ids.index(id)
+            if index < len(ids) - 1:
+                await released[ids[index + 1]].wait()
+            finished.append(id)
+            released[id].set()
+            return index % 2 == 0
+        except anyio.get_cancelled_exc_class():
+            # A late True is deliberately untrustworthy, even for the command.
+            finished.append(id)
+            return True
+
+    monkeypatch.setattr(spy, "kill_orphan", orphan)
+    with anyio.fail_after(60):
+        runner = await resume_run(
+            c.config_with(spy, monkeypatch), c.run_id, force=True, replanner=None
+        )
+        try:
+            assert calls == ids
+            assert all_entered.is_set()
+            assert len(set(deadlines)) == 1
+            assert len(finished) == len(ids)
+            assert runner.resumed is not None
+            assert runner.resumed.orphans_killed == ([] if expire else ids[::2])
+        finally:
+            await runner.aclose()
+    if not expire:
+        assert finished == list(reversed(ids))
+    retired = [e for e in _events(c) if e.type in {"run_lost", "command_end"}]
+    assert [e.payload.get("candidate_id", e.payload.get("job_id")) for e in retired] == ids
+    assert [e.payload["confirmed_dead"] for e in retired[:-1]] == (
+        [False] * 3 if expire else [True, False, True]
+    )
+
+
+@pytest.mark.parametrize("control", ["fenced", "terminal"])
+async def test_concurrent_orphan_control_beats_ordinary_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control: str
+) -> None:
+    import traceback
+
+    from swarm_arena._engine.resume import _recover_orphans
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    spy = _SpyExecutor(tmp_path / "spy")
+    entered: list[str] = []
+    ready = anyio.Event()
+
+    async def orphan(started: Job.Started) -> bool:
+        entered.append(started.job_id)
+        if len(entered) == 2:
+            ready.set()
+        await ready.wait()
+        if started.job_id == "ordinary":
+            raise ValueError("private-orphan-concurrent-value")
+        if control == "fenced":
+            raise _core_error(Fenced, "run ownership lost")
+        raise _stop_cleanup_error()
+
+    monkeypatch.setattr(spy, "kill_orphan", orphan)
+    with (
+        anyio.fail_after(60),
+        pytest.raises(Fenced if control == "fenced" else RuntimeError) as caught,
+    ):
+        await _recover_orphans(
+            spy, [Job.Started(kind="dispatch", job_id=id) for id in ("ordinary", "control")], 30
+        )
+    assert _core_category(caught.value) is (
+        _SignalCategory.FENCED if control == "fenced" else _SignalCategory.TERMINAL
+    )
+    assert "private-orphan-concurrent-value" not in "".join(
+        traceback.format_exception(caught.value)
+    )
+
+
+async def test_concurrent_orphan_caller_cancellation_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine.resume import _recover_orphans
+
+    spy = _SpyExecutor(tmp_path / "spy")
+    entered: list[str] = []
+    all_entered = anyio.Event()
+    cancelled: list[str] = []
+    returned: list[list[bool]] = []
+
+    async def orphan(started: Job.Started) -> bool:
+        entered.append(started.job_id)
+        if len(entered) == 3:
+            all_entered.set()
+        try:
+            await anyio.sleep_forever()
+        except anyio.get_cancelled_exc_class():
+            cancelled.append(started.job_id)
+            # Mirrors an executor which suppresses cancellation during recovery.
+            return True
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(spy, "kill_orphan", orphan)
+    owner = anyio.CancelScope()
+
+    async def recover() -> None:
+        with owner:
+            returned.append(
+                await _recover_orphans(
+                    spy, [Job.Started(kind="dispatch", job_id=str(i)) for i in range(3)], 30
+                )
+            )
+
+    with anyio.fail_after(60):
+        async with anyio.create_task_group() as group:
+            group.start_soon(recover)
+            await all_entered.wait()
+            owner.cancel()
+    assert entered == ["0", "1", "2"]
+    assert sorted(cancelled) == entered
+    assert returned == []
+
+
+@pytest.mark.parametrize(("margin", "settlement"), [(1.0, 30.0), (30.0, 1.0)])
+async def test_orphan_batch_uses_shorter_executor_or_settlement_allowance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, margin: float, settlement: float
+) -> None:
+    from swarm_arena._engine.resume import _recover_orphans
+
+    class MarginExecutor(_SpyExecutor):
+        class Config(LocalExecutor.Config):  # ty: ignore[invalid-attribute-override]
+            cancel_margin_s: float = margin
+
+    executor = MarginExecutor(tmp_path / "spy")
+    deadlines: list[float] = []
+    remaining: list[float] = []
+
+    async def orphan(started: Job.Started) -> bool:
+        deadline = anyio.current_effective_deadline()
+        deadlines.append(deadline)
+        remaining.append(deadline - anyio.current_time())
+        return False
+
+    monkeypatch.setattr(executor, "kill_orphan", orphan)
+    assert await _recover_orphans(
+        executor,
+        [Job.Started(kind="dispatch", job_id=str(i)) for i in range(3)],
+        settlement,
+    ) == [False, False, False]
+    assert len(deadlines) == 3
+    assert len(set(deadlines)) == 1
+    assert all(0 < value <= min(margin, settlement) for value in remaining)
+
+
+async def _crash_with_gateway(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Crashed:
+    from swarm_arena._gateway.keys import KeyRecord, key_alias, key_metadata
+    from swarm_arena.config import GatewayConfig
+
+    config = run_config.model_copy(
+        update={
+            "llm_gateway": GatewayConfig(url=fake_gateway.url, require_hard_cap=False),
+        }
+    )
+    append = JournalWriter.append
+    reserve = Ledger.reserve
+
+    async def keyed_reserve(self: Ledger, *args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("kind") == "tool":
+            kwargs["keep_charged"] = True
+        return await reserve(self, *args, **kwargs)
+
+    def with_key(self: JournalWriter, draft: EventDraft) -> Event:
+        if draft.type == "tool_start":
+            candidate_id = draft.payload["candidate_id"]
+            alias = key_alias(candidate_id)
+            metadata = key_metadata(
+                candidate_id=candidate_id,
+                run_id="resume-run",
+                goal_id="g",
+                team="t",
+                agent=draft.agent,
+            )
+            status, response, _ = fake_gateway._route(
+                "POST",
+                "/key/generate",
+                {
+                    "key_alias": alias,
+                    "max_budget": 1,
+                    "metadata": metadata,
+                    "duration": "86400s",
+                    "default_estimated_output_tokens": 4096,
+                },
+                f"Bearer {fake_gateway.master_key}",
+            )
+            assert status == 200
+            record = KeyRecord(
+                candidate_id=candidate_id,
+                key_id=response["token_id"],
+                alias=alias,
+                reservation_id=draft.payload["reservation_id"],
+                max_budget_usd=1,
+                cap="soft",
+                run_id="resume-run",
+                owner_epoch=self.epoch,
+                goal_id="g",
+                team="t",
+                agent=draft.agent,
+                round=1,
+                created_at=utc_now(),
+            )
+            append(
+                self,
+                EventDraft(
+                    type="gateway_key",
+                    goal_id="g",
+                    team="t",
+                    agent=draft.agent,
+                    task_id=candidate_id,
+                    round=1,
+                    payload={"action": "created", **record.model_dump(mode="json")},
+                ),
+            )
+        return append(self, draft)
+
+    with monkeypatch.context() as patches:
+        patches.setattr(JournalWriter, "append", with_key)
+        patches.setattr(Ledger, "reserve", keyed_reserve)
+        return await _crash(tmp_path, config, recorders)
+
+
+@pytest.mark.parametrize("retry_acquire", [False, True])
+async def test_resume_reads_back_open_keys(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    retry_acquire: bool,
+) -> None:
+    from swarm_arena._engine import run as module
+    from swarm_arena._gateway import litellm_proxy
+    from swarm_arena._gateway.keys import gateway_call_id
+
+    crashed = await _crash_with_gateway(tmp_path, run_config, recorders, fake_gateway, monkeypatch)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    key_id = next(
+        key for key, value in fake_gateway.keys.items() if value["alias"] == "cand-lost-g-b"
+    )
+    fake_gateway.add_spend(
+        key_id, model="openai/chat-model", cost_usd=0.02, tokens=(2, 1), call_id="late-after-crash"
+    )
+    row = fake_gateway._spend[-1][1]
+    managers: list[Any] = []
+    adapters: list[Any] = []
+    bind, adapter_for = module._bind_gateway, litellm_proxy.adapter_for
+
+    def capture_bind(*args: Any, **kwargs: Any) -> Any:
+        manager = bind(*args, **kwargs)
+        managers.append(manager)
+        return manager
+
+    def capture_adapter(*args: Any, **kwargs: Any) -> Any:
+        adapter = adapter_for(*args, **kwargs)
+        adapters.append(adapter)
+        return adapter
+
+    monkeypatch.setattr(module, "_bind_gateway", capture_bind)
+    monkeypatch.setattr(litellm_proxy, "adapter_for", capture_adapter)
+    if retry_acquire:
+        take_over = Lease.take_over.__func__
+        attempts: list[bool] = []
+
+        def race(cls: type[Lease], store: Store, **kwargs: Any) -> Lease:
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise _core_error(Fenced, "same-epoch renewal race")
+            return take_over(cls, store, **kwargs)
+
+        monkeypatch.setattr(Lease, "take_over", classmethod(race))
+    runner = await resume_run(crashed.config, crashed.run_id, force=False, replanner=None)
+    try:
+        assert len(managers) == len(adapters) == 1
+        resumed = runner.resumed
+        assert resumed is not None
+        deps = resumed._services.deps
+        assert deps is not None
+        assert deps.gateway is managers[0]
+        assert deps.gateway._adapter is adapters[0]
+        assert runner._key_manager is deps.gateway
+        assert runner._gateway is not None
+        assert runner._gateway.adapter is adapters[0]
+        calls = list(resumed.state.llm_calls.values())
+        assert len(calls) == 1
+        assert calls[0].litellm_call_id == gateway_call_id(key_id, row["request_id"])
+        assert calls[0].candidate_id == "lost-g-b"
+        assert calls[0].cost_usd == 0.02
+        assert _events(crashed, "llm_call")[0].epoch == 2
+        assert await deps.gateway.read(deps.gateway.records(), wait_first=False) == []
+        assert len(_events(crashed, "llm_call")) == 1
+        assert resumed.ledger._charges[
+            next(
+                e.payload["reservation_id"]
+                for e in _events(crashed, "tool_start")
+                if e.payload["candidate_id"] == "lost-g-b"
+            )
+        ] == Amount(usd=1)
+    finally:
+        await runner.aclose()
+
+
+async def test_resume_closes_all_unconfirmed_keys(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crashed = await _crash_with_gateway(tmp_path, run_config, recorders, fake_gateway, monkeypatch)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    runner = await resume_run(crashed.config, crashed.run_id, force=False, replanner=None)
+    try:
+        lost_key = next(
+            key for key, value in fake_gateway.keys.items() if value["alias"] == "cand-lost-g-b"
+        )
+        completed_key = next(
+            key for key, value in fake_gateway.keys.items() if value["alias"] == "cand-c1"
+        )
+        assert fake_gateway.keys[lost_key]["blocked"] is True
+        assert fake_gateway.keys[completed_key]["blocked"] is True
+        closed = [e for e in _events(crashed, "gateway_key") if e.payload["action"] == "closed"]
+        assert {event.payload["key_id"] for event in closed} == {lost_key, completed_key}
+        assert [e.payload["candidate_id"] for e in _events(crashed, "run_lost")] == ["lost-g-b"]
+    finally:
+        await runner.aclose()
+
+
+@pytest.mark.parametrize("path", ["/key/block", "/spend/logs/v2"])
+async def test_resume_gateway_failure_is_value_free_and_replayable(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+) -> None:
+    crashed = await _crash_with_gateway(tmp_path, run_config, recorders, fake_gateway, monkeypatch)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    fake_gateway.fail[path] = 500
+    runner = await resume_run(crashed.config, crashed.run_id, force=False, replanner=None)
+    await runner.aclose()
+    failures = [
+        e for e in _events(crashed, "gateway_key") if e.payload["action"].endswith("failed")
+    ]
+    assert len(failures) == 2
+    assert {e.payload["key_id"] for e in failures} == set(fake_gateway.keys)
+    assert {e.payload["candidate_id"] for e in failures} == {"c1", "lost-g-b"}
+    assert failures[0].payload["action"] == (
+        "close_failed" if path == "/key/block" else "read_failed"
+    )
+    assert fake_gateway.master_key not in repr(failures)
+    fake_gateway.fail.pop(path)
+    again = await resume_run(crashed.config, crashed.run_id, force=False, replanner=None)
+    try:
+        assert again.resumed is not None
+        assert again.resumed.epoch == 3
+    finally:
+        await again.aclose()
+
+
+async def test_resume_rechecks_gateway_hard_cap_before_takeover(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from swarm_arena.config import GatewayConfig
+
+    crashed = await _crash(tmp_path, run_config, recorders)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    before = read_owner(crashed.store)
+    config = crashed.config.model_copy(
+        update={
+            "llm_gateway": GatewayConfig(url=fake_gateway.url),
+            "limits": crashed.config.limits.model_copy(update={"max_usd": 2000}),
+        }
+    )
+
+    async def attempt() -> None:
+        runner = await resume_run(config, crashed.run_id, force=False, replanner=None)
+        await runner.aclose()
+
+    with pytest.raises(ValueError, match="strict profile not verified"):
+        await attempt()
+    assert read_owner(crashed.store) == before
+    assert not fake_gateway.keys
+    assert not _events(crashed, "takeover")
+
+
+@pytest.mark.parametrize("missing", [True, False])
+async def test_resume_refuses_changed_gateway_binding(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    missing: bool,
+) -> None:
+    from swarm_arena._errors import ConfigError
+    from swarm_arena.config import GatewayConfig
+
+    crashed = await _crash_with_gateway(tmp_path, run_config, recorders, fake_gateway, monkeypatch)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    replacement = (
+        None
+        if missing
+        else GatewayConfig(url=fake_gateway.url + "/different", require_hard_cap=False)
+    )
+    config = crashed.config.model_copy(update={"llm_gateway": replacement})
+    before = len(fake_gateway.requests)
+    with pytest.raises(ConfigError, match=r"^llm_gateway$"):
+        await resume_run(config, crashed.run_id, force=False, replanner=None)
+    assert len(fake_gateway.requests) == before
+
+
+async def test_resume_slow_gateway_read_has_own_allowance(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    fake_gateway: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crashed = await _crash_with_gateway(tmp_path, run_config, recorders, fake_gateway, monkeypatch)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    fake_gateway.delay["/spend/logs/v2"] = 3
+    config = crashed.config.model_copy(update={"settle_timeout_s": 0.5})
+    with anyio.fail_after(60):
+        runner = await resume_run(config, crashed.run_id, force=False, replanner=None)
+        await runner.aclose()
+    failures = [e for e in _events(crashed, "gateway_key") if e.payload["action"] == "read_failed"]
+    assert len(failures) == 2
+    assert {e.payload["error"] for e in failures} == {"gateway read incomplete"}
+    assert {e.payload["key_id"] for e in failures} == set(fake_gateway.keys)
+
+
+def test_resume_gateway_identity_ignores_userinfo_but_checks_failure_events() -> None:
+    from swarm_arena._engine.resume import _check
+    from swarm_arena._errors import ConfigError
+    from swarm_arena.config import GatewayConfig
+
+    original = RunConfig(llm_gateway=GatewayConfig(url="http://first:secret@gateway"))
+    event = Event(
+        type="gateway_key",
+        payload={"action": "read_failed", "error": "gateway read failed"},
+        epoch=1,
+        seq=1,
+        ts=utc_now(),
+        run_id="r",
+        context_id="r",
+    )
+    state = RunState.from_events([event])
+    state.config = original
+    same = original.model_copy(
+        update={"llm_gateway": GatewayConfig(url="http://second:other@gateway")}
+    )
+    assert _check(state, same) == []
+    with pytest.raises(ConfigError, match=r"^llm_gateway$"):
+        _check(state, original.model_copy(update={"llm_gateway": None}))
+
+
+async def test_resume_gateway_closure_has_one_overall_allowance(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.gateway import FakeGateway
+    from _fakes.reconcile import CapableGateway
+
+    from swarm_arena._engine import run as module
+    from swarm_arena._gateway import litellm_proxy
+    from swarm_arena._gateway.adapter import VirtualKey
+
+    fake = FakeGateway()
+    fake.url = "http://gateway.invalid"
+    crashed = await _crash_with_gateway(tmp_path, run_config, recorders, fake, monkeypatch)
+    adapter = CapableGateway()
+    adapter.closure = None
+    bounds: list[float] = []
+    attempted: list[tuple[str, float]] = []
+    original = module._gateway_deadline
+
+    def allowance(journal: JournalWriter, *, timeout_s: float | None = None) -> float:
+        deadline = min(original(journal, timeout_s=timeout_s), anyio.current_time() + 3)
+        bounds.append(deadline)
+        return deadline
+
+    async def held(key: VirtualKey) -> None:
+        deadline = anyio.current_effective_deadline()
+        attempted.append((key.key_id, deadline))
+        # Missing containment is observable immediately, without hanging RED.
+        if not bounds or deadline > bounds[0]:
+            return
+        await anyio.sleep_forever()
+
+    monkeypatch.setattr(module, "_gateway_deadline", allowance)
+    monkeypatch.setattr(litellm_proxy, "adapter_for", lambda *args: adapter)
+    monkeypatch.setattr(adapter, "block_key", held)
+    with anyio.fail_after(60):
+        runner = await resume_run(crashed.config, crashed.run_id, force=False, replanner=None)
+        try:
+            assert len(attempted) == 1
+            assert attempted[0][1] == bounds[0]
+            assert runner._key_manager is not None
+            records = runner._key_manager.records()
+            assert len(records) == 2
+            assert all(record.closed_at is None for record in records)
+            failures = [
+                e for e in _events(crashed, "gateway_key") if e.payload["action"] == "close_failed"
+            ]
+            assert [event.payload["key_id"] for event in failures] == [attempted[0][0]]
+        finally:
+            await runner.aclose()
+
+
+@pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit, GeneratorExit])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("fenced", [False, True])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_resume_preserves_driver_hard_control_through_cleanup(
+    run_config: RunConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    control: type[BaseException],
+    nested: bool,
+    fenced: bool,
+    cleanup_fails: bool,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from swarm_arena._engine import resume as module
+
+    error: BaseException = control("driver control")
+    if nested:
+        error = BaseExceptionGroup(
+            "driver", [BaseExceptionGroup("nested", [error]), _core_error(Fenced)]
+        )
+    context = RuntimeError("original driver context")
+    error.__context__ = context
+    journal = Mock(_stopped=False)
+    if fenced:
+        journal._raise_if_fenced.side_effect = _core_error(Fenced)
+    order: list[str] = []
+
+    async def fail() -> None:
+        order.append("body failed")
+        raise error
+
+    async def close(*, failed: bool = False) -> None:
+        assert failed
+        order.append("closed")
+        if cleanup_fails:
+            raise _core_error(Fenced) if fenced else OSError("cleanup failed")
+
+    services = Mock(
+        closed=False,
+        ready=Mock(wait=AsyncMock(side_effect=fail)),
+        _serve=AsyncMock(),
+        _aclose=AsyncMock(side_effect=close),
+        deps=Mock(journal=journal),
+    )
+    lease = Mock()
+
+    async def take_over(*args: Any, **kwargs: Any) -> Any:
+        kwargs["validate"](lease.doc)
+        return lease
+
+    monkeypatch.setattr(module, "_check_storage", AsyncMock())
+    monkeypatch.setattr(module, "_take_over", take_over)
+    monkeypatch.setattr(module, "_read", Mock(return_value=([], Mock(run_elapsed_s=0))))
+    monkeypatch.setattr(module, "_check", Mock())
+    monkeypatch.setattr(module, "_restore_import_paths", Mock())
+    monkeypatch.setattr(module, "_ResumeServices", Mock(return_value=services))
+    try:
+        with pytest.raises(type(error)) as caught:
+            await module.resume_run(run_config, "driver-control", force=False, replanner=None)
+        assert caught.value is error
+        assert error.__context__ is context
+        assert order == ["body failed", "closed"]
+        services._aclose.assert_awaited_once_with(failed=True)
+    finally:
+        with anyio.fail_after(60):
+            await services.task

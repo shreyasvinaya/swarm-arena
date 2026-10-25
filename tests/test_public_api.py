@@ -7,6 +7,7 @@ import sys
 import types
 
 import pytest
+from _fakes.dependencies import ray_dependency
 from pydantic import BaseModel
 
 import swarm_arena
@@ -136,6 +137,14 @@ else:
     ]
 
 
+try:
+    importlib.metadata.version("ray")
+except importlib.metadata.PackageNotFoundError:
+    pass
+else:
+    PUBLIC["swarm_arena.ray"] = ["RayExecutor"]
+
+
 @pytest.mark.parametrize("module", sorted(PUBLIC))
 def test_all_snapshot(module: str) -> None:
     names = importlib.import_module(module).__all__
@@ -238,7 +247,9 @@ def test_publish_lets_doctest_find_method_examples(monkeypatch: pytest.MonkeyPat
     } <= found
 
 
-CORE = sorted(set(PUBLIC) - {"swarm_arena", "swarm_arena.testing", "swarm_arena.llm"})
+CORE = sorted(
+    set(PUBLIC) - {"swarm_arena", "swarm_arena.testing", "swarm_arena.llm", "swarm_arena.ray"}
+)
 
 
 @pytest.mark.parametrize("pydantic_model", [False, True])
@@ -358,3 +369,19 @@ else:
     subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=30
     )
+
+
+def test_ray_all() -> None:
+    module = ray_dependency()
+    assert module.__all__ == ["RayExecutor"]
+
+
+def test_ray_facade_publishes_methods() -> None:
+    module = ray_dependency()
+    cls = module.RayExecutor
+    assert {
+        cls.__module__,
+        cls.Config.__module__,
+        cls.submit.__module__,
+        cls.confirm_dead.__module__,
+    } == {"swarm_arena.ray"}

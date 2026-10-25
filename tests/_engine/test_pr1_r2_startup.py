@@ -1,11 +1,11 @@
 """Startup and shutdown failure surfaces through public Swarm runs."""
 
 import traceback
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.pr1_r2 import SECRET, failure
 from _fakes.run import plan
 
@@ -193,7 +193,7 @@ def test_cli_startup_outcome_is_type_only(tmp_path: Path, run_config: RunConfig,
         env=dict(os.environ, PYTHONPATH=str(Path(__file__).parents[1])),
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=60,
     )
     assert process.returncode == 1
     output = process.stdout + process.stderr
@@ -227,14 +227,13 @@ async def test_startup_caller_cancel_wins_over_replacement(
         Swarm(run_config).run(plan(), approve=replace if site == "approve" else None)
     )
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             await ready.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError) as caught:
-            await task
+            await observe_task(task)
         assert SECRET not in "".join(traceback.format_exception(caught.value))
     finally:
         if not task.done():
             task.cancel()
-            with suppress(BaseException):
-                await task
+            await settle_tasks(task)

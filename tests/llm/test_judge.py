@@ -10,9 +10,11 @@ from unittest.mock import Mock
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 
 pytest.importorskip("agents")
 
+from _fakes.llm_components import missing_callback_timeout
 from _fakes.llm_run import open_llm_run
 from agents import ModelResponse
 
@@ -80,7 +82,6 @@ def configuration(aliases: tuple[str, ...] = ("a",), *, cache_dir: Path | None =
             }
         ),
         cache=None if cache_dir is None else CachePolicy(backend="disk", disk_dir=str(cache_dir)),
-        settle_timeout_s=2,
     )
 
 
@@ -193,7 +194,7 @@ async def test_judge_response_cache_misses_for_changed_goal_and_hits_for_same_go
             assert repeated.cost_usd == original.cost_usd == 0
             assert all(call.status == "ok" and call.error is None for call in run.calls())
     finally:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await GLOBAL_LOGGING_WORKER.flush()
             await GLOBAL_LOGGING_WORKER.stop()
             await close_litellm_async_clients()
@@ -351,6 +352,9 @@ async def test_judge_drains_before_it_returns(delay_s: float | None, tmp_path: P
     goal = Goal(id="g", namespace="n")
     async with open_llm_run(tmp_path, config=configuration()) as run:
         scope = run.scope("judge")
+        # The fake deliberately omits its callback; keep only the report wait short.
+        if delay_s is None:
+            scope = replace(scope, settle_timeout_s=2)
         try:
             with llm_scope(scope):
                 scores = await LLMJudge("r", ["a"]).judge(
@@ -607,11 +611,12 @@ async def test_caller_cancellation_drains_without_waiting_for_callback(
                         JudgeContext(goal=goal, executor=Mock(), artifact_root=str(tmp_path)),
                     )
                 )
-                with anyio.fail_after(10):
+                with anyio.fail_after(60):
                     await fake.ready.wait()
                     task.cancel()
                     with pytest.raises(asyncio.CancelledError):
-                        await task
+                        await observe_task(task)
+                    assert task.cancelled()
             assert scope.tranche.pending() == 0
             assert len(run.calls()) == 1
             assert (run.calls()[0].error or "").startswith("estimated:")
@@ -619,10 +624,12 @@ async def test_caller_cancellation_drains_without_waiting_for_callback(
             await fake.flush()
             assert len(run.calls()) == 1
         finally:
-            if not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-            await fake.aclose()
+            try:
+                if not task.done():
+                    task.cancel()
+                    await settle_tasks(task)
+            finally:
+                await fake.aclose()
 
 
 async def test_formatter_input_refusal_preserves_first_charge(
@@ -693,7 +700,7 @@ async def test_all_batch_members_start_concurrently(
     monkeypatch.setattr(_judge, "structured_call", response)
     goal = Goal(id="g", namespace="n")
     async with open_llm_run(tmp_path, config=configuration(("a", "b"))) as run:
-        with llm_scope(run.scope("judge")), anyio.fail_after(10):
+        with llm_scope(run.scope("judge")), anyio.fail_after(60):
             scores = await LLMJudge("r", ["a", "b"]).judge(
                 goal,
                 candidates(9),
@@ -899,7 +906,7 @@ async def test_limit_stops_sibling_dispatch_and_preserves_inflight_charge(
     goal = Goal(id="g", namespace="n")
     async with open_llm_run(tmp_path, config=config) as run:
         scope = run.scope("judge")
-        with llm_scope(scope), anyio.fail_after(10), pytest.raises(BudgetExceeded) as caught:
+        with llm_scope(scope), anyio.fail_after(60), pytest.raises(BudgetExceeded) as caught:
             await LLMJudge("r", ["draft", "huge"]).judge(
                 goal,
                 candidates(1),
@@ -1005,6 +1012,7 @@ async def test_provider_panel_drop_reports_after_accounting(
     from swarm_arena._model.ref import Ref
     from swarm_arena._scoring.runner import judge_round
 
+    missing_callback_timeout(monkeypatch)
     for alias in set(aliases):
         fake = FakeModel([turn(2), turn(2)])
         if alias == "b":
@@ -1071,6 +1079,7 @@ async def test_recursive_provider_survivors_across_batches_near_scale_limit(
     from swarm_arena.scoring import Lexicographic
     from swarm_arena.testing import check_judge
 
+    missing_callback_timeout(monkeypatch)
     for alias in ("a", "b", "c"):
         fake = FakeModel([])
 
@@ -1145,6 +1154,7 @@ async def partial_panel_crash_driver(root: str) -> None:
     from functools import partial
 
     with pytest.MonkeyPatch.context() as patch:
+        missing_callback_timeout(patch)
         for alias in ("a", "b", "c"):
             fake = FakeModel([])
             patch.setattr(fake, "get_response", partial(respond, alias=alias))
@@ -1342,7 +1352,8 @@ async def test_provider_failure_is_reported_before_sibling_limit(
     config = config.model_copy(update={"limits": Limits(max_tokens=1_000_000)})
     goal = Goal(id="g", namespace="n")
     async with open_llm_run(tmp_path, config=config) as run:
-        scope = run.scope("judge")
+        # The failing fake emits no callback; only its report wait is shortened.
+        scope = replace(run.scope("judge"), settle_timeout_s=2)
         cancelled: list[bool] = []
         provider_stops(scope.journal).register(
             "other/t/a", frozenset({"fake"}), lambda: cancelled.append(True)

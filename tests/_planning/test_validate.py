@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import pytest
 from _fakes.admission import SENTINEL as BOUNDARY_SECRET
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena import (
@@ -2604,7 +2605,11 @@ async def test_abandoned_draft_snapshot_starts_no_later_artifact_upload(
 
     def put(data: bytes) -> str:
         uploaded.append(data)
-        held.wait()
+        held.entered.set()
+        try:
+            assert held.release.wait(180), "test did not release snapshot upload"
+        finally:
+            held.exited.set()
         return original(data)
 
     monkeypatch.setattr(artifacts, "put_bytes", put)
@@ -2616,19 +2621,19 @@ async def test_abandoned_draft_snapshot_starts_no_later_artifact_upload(
         )
     )
     try:
-        await held.ready()
+        assert await anyio.to_thread.run_sync(held.entered.wait, 60)
         task.cancel()
-        with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
-            await task
-        assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 5)
+        with pytest.raises(asyncio.CancelledError), anyio.fail_after(30):
+            await observe_task(task)
+        assert not held.exited.is_set(), "cancellation waited for the held upload"
+        assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 60)
         await held.finish()
         assert len(uploaded) == 1
     finally:
         await held.finish()
         if not task.done():
             task.cancel()
-            with contextlib.suppress(BaseException):
-                await task
+            await settle_tasks(task)
 
 
 @pytest.mark.parametrize("count", [4, 24])
@@ -2738,27 +2743,110 @@ async def test_draft_spool_cleanup_after_failed_or_abandoned_preparation(
     def prepare(staging: ArtifactStore) -> Goal:
         staging.put_bytes(b"snapshot")
         if cancel:
-            held.wait()
+            held.entered.set()
+            try:
+                assert held.release.wait(180), "test did not release draft preparation"
+            finally:
+                held.exited.set()
             return Goal(id="g", namespace="n")
         raise ValueError("secret-sentinel")
 
     task = asyncio.create_task(_draft_work(prepare, artifacts))
     try:
         if cancel:
-            await held.ready()
+            assert await anyio.to_thread.run_sync(held.entered.wait, 60)
             task.cancel()
-            with anyio.fail_after(5), pytest.raises(asyncio.CancelledError):
-                await task
+            with pytest.raises(asyncio.CancelledError), anyio.fail_after(30):
+                await observe_task(task)
+            assert not held.exited.is_set(), "cancellation waited for held preparation"
             await held.finish()
         else:
             with pytest.raises(ValueError, match="draft admission failed") as caught:
-                await task
+                await observe_task(task)
             assert_secret_absent(caught.value, "secret-sentinel")
-        assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 5)
+        assert await anyio.to_thread.run_sync(draft_spool_closed.wait, 60)
         assert list(open_store(str(tmp_path / "artifacts")).list("")) == []
     finally:
         if cancel:
             await held.finish()
         if not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await settle_tasks(task)
+
+
+def test_providers_without_gateway_warns() -> None:
+    plan = _plan(tool=FunctionTool("_fakes.tools:add", providers=["openai"]))
+    warnings = validate_plan(plan, RunConfig())
+    assert warnings == [
+        "agent g/t0/a0: tool declares providers ['openai'] but there is no llm_gateway; "
+        "its LLM calls are logged only if it writes swarm/llm_calls.jsonl "
+        '(llm_calls_source = "unknown")'
+    ]
+
+
+def test_effective_secret_names_include_function_and_command_env() -> None:
+    from swarm_arena._tooling.env_names import effective_secret_env
+    from swarm_arena.tool import Command
+
+    ref = Ref.of(FunctionTool("_fakes.tools:add", env=["OPENAI_API_KEY"]))
+    assert effective_secret_env(ref) == ("OPENAI_API_KEY",)
+    assert effective_secret_env(ref, overrides={"timeout_s": 10}) == ("OPENAI_API_KEY",)
+    with pytest.raises(ValueError, match="human-only"):
+        effective_secret_env(ref, overrides={"env": ["GEMINI_API_KEY"]})
+    assert effective_secret_env(Command(argv=["python"], env=["MY_TOKEN"])) == ("MY_TOKEN",)
+
+
+def test_provider_warning_covers_converge_and_round_overrides() -> None:
+    plan = _plan(converge_agents=1, rounds=[RoundSpec(tool_overrides={"providers": ["openai"]})])
+    warnings = validate_plan(plan, RunConfig())
+    assert len(warnings) == 2
+    assert warnings[0].startswith("agent g/t0/a0:")
+    assert warnings[1].startswith("agent g/join/a0:")
+
+
+def test_provider_warning_absent_with_gateway() -> None:
+    from swarm_arena._model.settings import GatewayConfig
+
+    plan = _plan(tool=FunctionTool("_fakes.tools:add", providers=["openai"]))
+    config = RunConfig(llm_gateway=GatewayConfig(url="http://localhost:4000"))
+    assert validate_plan(plan, config) == []
+
+
+@pytest.mark.parametrize("tool_type", ["function", "script"])
+def test_unreplaced_provider_key_warns(tool_type: str) -> None:
+    from swarm_arena import ScriptTool
+    from swarm_arena._model.settings import GatewayConfig
+
+    names = ["OPENAI_API_KEY", "GEMINI_API_KEY", "UNRELATED_TOKEN"]
+    tool = (
+        FunctionTool("_fakes.tools:add", env=names)
+        if tool_type == "function"
+        else ScriptTool(command=["python", "run.py"], env=names)
+    )
+    warnings = validate_plan(
+        _plan(tool=tool),
+        RunConfig(
+            llm_gateway=GatewayConfig(url="http://gw:4000"),
+            secrets=SecretsPolicy(allow=names),
+        ),
+    )
+    assert warnings == [
+        "agent g/t0/a0: tool allowlists GEMINI_API_KEY, which the LLM gateway does not "
+        "replace; keyed tool runs do not get it; unkeyed tool runs get the node value "
+        "and bypass the gateway"
+    ]
+
+
+def test_effective_secret_names_detach_string_subclasses() -> None:
+    from swarm_arena._tooling.env_names import effective_secret_env
+    from swarm_arena.tool import Command
+
+    class ForeignName(str):
+        pass
+
+    tool = FunctionTool("_fakes.tools:add")
+    object.__setattr__(tool.config, "env", [ForeignName("OPENAI_API_KEY")])
+    names = effective_secret_env(tool)
+    assert all(type(name) is str for name in names)
+    command = Command.model_construct(argv=["python"], env=[ForeignName("OPENAI_API_KEY")])
+    assert all(type(name) is str for name in effective_secret_env(command))

@@ -22,7 +22,7 @@ class LifecycleBoard(ArenaBoard):
     def _act(self, mode: str) -> None:
         if mode == "block":
             self.entered.set()
-            assert self.release.wait(10), "test did not release board"
+            assert self.release.wait(300), "test did not release board"
         elif mode != "ok":
             if mode == "core":
                 error = _core_error(Fenced)

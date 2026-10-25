@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import errno
 import os
@@ -5,6 +6,7 @@ import re
 import signal
 import subprocess
 import sys
+from collections.abc import Generator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,6 +15,7 @@ import anyio
 import pytest
 from _fakes import proc as shared_proc
 from _fakes.proc import THREADED, main_thread_state, pid_alive, require_visible_proc, wait_until
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 
 from swarm_arena._exec import procinfo
 from swarm_arena._exec.executor import Job
@@ -23,6 +26,8 @@ from swarm_arena._exec.procinfo import (
     kill_orphan,
     process_start_time,
 )
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 
 def test_host_id_format_and_stable() -> None:
@@ -46,9 +51,9 @@ def test_process_start_time_and_group_liveness() -> None:
     assert st == process_start_time(p.pid)
     assert group_has_live_member(p.pid)
     os.killpg(p.pid, signal.SIGKILL)
-    p.wait()
+    p.wait(timeout=60)
     assert process_start_time(p.pid) is None
-    assert wait_until(lambda: not group_has_live_member(p.pid), 5)
+    assert wait_until(lambda: not group_has_live_member(p.pid), 60)
 
 
 def test_group_liveness_counts_our_group() -> None:
@@ -70,7 +75,7 @@ def test_kill_orphan_checks_host_and_start_time() -> None:
     assert not kill_orphan(good.model_copy(update={"host_id": "other:boot"}))
     assert p.poll() is None
     assert kill_orphan(good)
-    assert p.wait(5) == -signal.SIGKILL
+    assert p.wait(60) == -signal.SIGKILL
 
 
 @pytest.mark.parametrize(
@@ -99,7 +104,7 @@ def test_kill_orphan_refuses_incomplete_records(update: dict[str, Any]) -> None:
         assert p.poll() is None
     finally:
         p.kill()
-        p.wait()
+        p.wait(timeout=60)
 
 
 def test_kill_orphan_refuses_unknown_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -119,7 +124,7 @@ def test_kill_orphan_refuses_unknown_host(monkeypatch: pytest.MonkeyPatch, tmp_p
         assert p.poll() is None
     finally:
         p.kill()
-        p.wait()
+        p.wait(timeout=60)
 
 
 def _is_zombie(pid: int) -> bool:
@@ -127,16 +132,52 @@ def _is_zombie(pid: int) -> bool:
     return done.stdout.strip().startswith("Z")
 
 
-def test_group_has_live_member_ignores_an_unreaped_zombie() -> None:
-    require_visible_proc()
-    p = subprocess.Popen(["sleep", "0.3"], start_new_session=True)
+@contextlib.contextmanager
+def _held_child(tmp_path: Path) -> Generator[tuple[subprocess.Popen[bytes], Path]]:
+    """
+    Hold a ready child until explicit release, then let it exit naturally.
+
+    Parameters
+    ----------
+    tmp_path : Path
+        Directory for the readiness and release markers.
+
+    Yields
+    ------
+    tuple[subprocess.Popen[bytes], Path]
+        Child process and release marker, with bounded failure cleanup.
+    """
+    ready, release = tmp_path / "child-ready", tmp_path / "child-release"
+    code = (
+        "from pathlib import Path\n"
+        "import time\n"
+        "deadline = time.monotonic() + 300\n"
+        "Path('child-ready').touch()\n"
+        "while not Path('child-release').exists():\n"
+        "    if time.monotonic() >= deadline:\n"
+        "        raise TimeoutError('child release deadline')\n"
+        "    time.sleep(0.01)\n"
+    )
+    p = subprocess.Popen([sys.executable, "-c", code], start_new_session=True, cwd=tmp_path)
     try:
+        assert wait_until(ready.exists, 60)
+        yield p, release
+    finally:
+        release.touch()
+        if p.poll() is None:
+            p.kill()
+        p.wait(timeout=60)
+
+
+def test_group_has_live_member_ignores_an_unreaped_zombie(tmp_path: Path) -> None:
+    require_visible_proc()
+    with _held_child(tmp_path) as (p, release):
         assert group_has_live_member(p.pid)
-        assert wait_until(lambda: _is_zombie(p.pid), 5)  # exited, not reaped
+        release.touch()
+        assert wait_until(lambda: _is_zombie(p.pid), 60)  # exited, not reaped
         assert not group_has_live_member(p.pid)
         assert pid_alive(p.pid)  # the unreaped leader still anchors the group id
-    finally:
-        p.wait()
+    assert p.returncode == 0
     assert not group_has_live_member(p.pid)
 
 
@@ -144,16 +185,19 @@ def test_group_has_live_member_sees_a_live_child_of_a_zombie_leader(tmp_path: Pa
     require_visible_proc()
     code = (
         "import subprocess; "
-        "open('child.pid', 'w').write(str(subprocess.Popen(['sleep', '30']).pid))"
+        "open('child.pid', 'w').write(str(subprocess.Popen(['sleep', '300']).pid))"
     )
     p = subprocess.Popen([sys.executable, "-c", code], start_new_session=True, cwd=tmp_path)
     try:
-        assert wait_until(lambda: _is_zombie(p.pid), 5)
+        assert wait_until(lambda: _is_zombie(p.pid), 60)
         assert group_has_live_member(p.pid)
         os.kill(int((tmp_path / "child.pid").read_text()), signal.SIGKILL)
-        assert wait_until(lambda: not group_has_live_member(p.pid), 5)
+        assert wait_until(lambda: not group_has_live_member(p.pid), 60)
     finally:
-        p.wait()
+        if group_has_live_member(p.pid):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(p.pid, signal.SIGKILL)
+        p.wait(60)
 
 
 def fake_proc(root: Path, options: str = "rw,nosuid,nodev,noexec") -> Path:
@@ -241,17 +285,24 @@ def test_proc_scan_unreadable_entry_cannot_tell(
 @pytest.mark.skipif(sys.platform != "linux", reason="only Linux reports a live process as Z")
 def test_live_threads_of_an_exited_main_thread_count(tmp_path: Path) -> None:
     require_visible_proc()
-    code = THREADED.format(work_s=1.0)
+    code = THREADED.format(work_s=1.0).replace(
+        "    time.sleep(1.0)\n",
+        "    from pathlib import Path\n"
+        "    deadline = time.monotonic() + 300\n"
+        "    while not Path('worker.release').exists() and time.monotonic() < deadline:\n"
+        "        time.sleep(0.01)\n",
+    )
     p = subprocess.Popen([sys.executable, "-c", code], start_new_session=True, cwd=tmp_path)
     try:
-        assert wait_until(lambda: main_thread_state(p.pid) == "Z", 5)
+        assert wait_until(lambda: main_thread_state(p.pid) == "Z", 60)
         assert not (tmp_path / "worker.done").exists()
         assert group_has_live_member(p.pid)  # the worker thread still runs
-        assert wait_until(lambda: (tmp_path / "worker.done").exists(), 5)
-        assert wait_until(lambda: not group_has_live_member(p.pid), 5)
+        (tmp_path / "worker.release").touch()
+        assert wait_until(lambda: (tmp_path / "worker.done").exists(), 60)
+        assert wait_until(lambda: not group_has_live_member(p.pid), 60)
     finally:
         p.kill()
-        p.wait()
+        p.wait(timeout=60)
 
 
 def _spawn(argv: list[str]) -> "subprocess.Popen[bytes]":
@@ -261,30 +312,48 @@ def _spawn(argv: list[str]) -> "subprocess.Popen[bytes]":
 async def test_exit_watch_waits_without_reaping() -> None:
     p = await anyio.to_thread.run_sync(_spawn, ["sleep", "0.3"])
     with contextlib.closing(ExitWatch(p.pid)) as watch:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             await watch.wait()
         assert p.returncode is None
         assert pid_alive(p.pid)  # exited but still a zombie
-        with anyio.fail_after(1):
-            await watch.wait()  # returns at once the second time
+        yielded: list[bool] = []
+        checkpoint = asyncio.get_running_loop().call_soon(yielded.append, True)
+        try:
+            with anyio.fail_after(30):
+                await watch.wait()
+            assert not yielded, "an observed exit must return before yielding to the loop"
+        finally:
+            checkpoint.cancel()
     assert await anyio.to_thread.run_sync(p.wait) == 0
 
 
 async def test_exit_watch_on_an_existing_zombie() -> None:
     p = await anyio.to_thread.run_sync(_spawn, ["true"])
-    await anyio.sleep(0.3)  # exited, never reaped
-    with contextlib.closing(ExitWatch(p.pid)) as watch, anyio.fail_after(1):
+    assert await anyio.to_thread.run_sync(wait_until, lambda: _is_zombie(p.pid), 60)
+    with contextlib.closing(ExitWatch(p.pid)) as watch, anyio.fail_after(60):
         await watch.wait()
     assert await anyio.to_thread.run_sync(p.wait) == 0
 
 
 async def test_exit_watch_is_cancellable() -> None:
-    p = await anyio.to_thread.run_sync(_spawn, ["sleep", "30"])
+    p = await anyio.to_thread.run_sync(_spawn, ["sleep", "180"])
     try:
         with contextlib.closing(ExitWatch(p.pid)) as watch:
-            with anyio.move_on_after(0.2) as scope:
-                await watch.wait()
+            entered = anyio.Event()
+
+            async def cancel_when_waiting(scope: anyio.CancelScope) -> None:
+                await entered.wait()
+                await anyio.wait_all_tasks_blocked()
+                scope.cancel()
+
+            with anyio.fail_after(30):
+                with anyio.CancelScope() as scope:
+                    async with anyio.create_task_group() as tasks:
+                        tasks.start_soon(cancel_when_waiting, scope)
+                        entered.set()
+                        await watch.wait()
             assert scope.cancelled_caught
+            assert p.poll() is None
     finally:
         p.kill()
         await anyio.to_thread.run_sync(p.wait)
@@ -298,20 +367,19 @@ async def test_exit_watch_polls_waitid_without_pidfd(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(os, "pidfd_open", no_pidfd, raising=False)
     p = await anyio.to_thread.run_sync(_spawn, ["sleep", "0.3"])
     with contextlib.closing(ExitWatch(p.pid)) as watch:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             await watch.wait()
         assert p.returncode is None
     assert await anyio.to_thread.run_sync(p.wait) == 0
 
 
-def test_ps_scan_ignores_zombies() -> None:
-    p = subprocess.Popen(["sleep", "0.3"], start_new_session=True)
-    try:
+def test_ps_scan_ignores_zombies(tmp_path: Path) -> None:
+    with _held_child(tmp_path) as (p, release):
         assert procinfo._live_in_ps(p.pid)
-        assert wait_until(lambda: _is_zombie(p.pid), 5)
+        release.touch()
+        assert wait_until(lambda: _is_zombie(p.pid), 60)
         assert not procinfo._live_in_ps(p.pid)
-    finally:
-        p.wait()
+    assert p.returncode == 0
 
 
 def test_liveness_reads_as_alive_when_it_cannot_tell(

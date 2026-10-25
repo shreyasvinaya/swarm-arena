@@ -10,6 +10,7 @@ import anyio
 import pytest
 from _engine.test_goal import _curation_checkpoint, _plan
 from _engine.test_round import _round, _runner
+from _fakes.cleanup import settle_tasks
 from _fakes.engine import EngineEnv
 
 from swarm_arena._board.arena import ArenaView
@@ -69,7 +70,7 @@ async def test_blocked_io_does_not_retain_goal(
         entered.set()
         try:
             assert threading.get_ident() != loop_thread
-            assert release.wait(20), "controlled worker release deadline"
+            assert release.wait(180), "controlled worker release deadline"
             return original(*args, **kwargs)
         finally:
             exited.set()
@@ -77,15 +78,15 @@ async def test_blocked_io_does_not_retain_goal(
     monkeypatch.setattr(target, method, blocked)
     task = asyncio.create_task(operation)
     try:
-        with anyio.fail_after(10):
-            assert await anyio.to_thread.run_sync(entered.wait, 10)
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
         if signal == "cancel":
             task.cancel()
         elif signal == "fence":
             env.deps.journal.fenced.set()
         else:
             env.deps.stops.stop = env.deps.stops.stop_now = True
-        done, _ = await asyncio.wait([task], timeout=7)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, f"{site} retained its owner after {signal}"
         assert not exited.is_set()
         if signal == "fence":
@@ -97,11 +98,13 @@ async def test_blocked_io_does_not_retain_goal(
             assert not (Path(env.store.url) / page_key).exists()
     finally:
         release.set()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
-        assert await anyio.to_thread.run_sync(exited.wait, 5)
-        for worker in workers:
-            if worker.name.startswith("swarm-arena-daemon-"):
-                await anyio.to_thread.run_sync(worker.join, 5)
+        try:
+            await settle_tasks(task)
+        finally:
+            assert await anyio.to_thread.run_sync(exited.wait, 60)
+            for worker in workers:
+                if worker.name.startswith("swarm-arena-daemon-"):
+                    await anyio.to_thread.run_sync(worker.join, 60)
     assert exited.is_set()
     assert all(
         not worker.is_alive() for worker in workers if worker.name.startswith("swarm-arena-daemon-")

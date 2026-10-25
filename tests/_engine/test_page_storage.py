@@ -8,6 +8,7 @@ from typing import Any
 import anyio
 import pytest
 from _engine.test_resume import _finished_without_round_page
+from _fakes.cleanup import settle_tasks
 
 from swarm_arena import RunConfig, Swarm
 from swarm_arena._journal.lease import read_owner
@@ -33,7 +34,7 @@ async def test_resume_page_storage_abandons_cancelled_owner(
         workers.append(threading.current_thread())
         entered.set()
         try:
-            assert release.wait(20)
+            assert release.wait(180)
             return original(self, key, *args)
         finally:
             exited.set()
@@ -41,11 +42,11 @@ async def test_resume_page_storage_abandons_cancelled_owner(
     monkeypatch.setattr(LocalStore, site, blocked)
     task = asyncio.create_task(Swarm(config).resume("repair", force=True))
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         services = [t for t in asyncio.all_tasks() if t.get_name() == "resume-repair"]
         assert services
         task.cancel()
-        done, _ = await asyncio.wait([task, *services], timeout=3)
+        done, _ = await asyncio.wait([task, *services], timeout=30)
         assert len(done) == len(services) + 1
         assert not exited.is_set()
         owner = read_owner(store)
@@ -53,11 +54,13 @@ async def test_resume_page_storage_abandons_cancelled_owner(
         assert owner[0].expires_at <= utc_now()
     finally:
         release.set()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
-        assert await anyio.to_thread.run_sync(exited.wait, 5)
-        for worker in workers:
-            if worker.name.startswith("swarm-arena-daemon-"):
-                await anyio.to_thread.run_sync(worker.join, 5)
+        try:
+            await settle_tasks(task)
+        finally:
+            assert await anyio.to_thread.run_sync(exited.wait, 60)
+            for worker in workers:
+                if worker.name.startswith("swarm-arena-daemon-"):
+                    await anyio.to_thread.run_sync(worker.join, 60)
     assert read_owner(store) == owner
     if site == "exists":
         assert not (Path(store.url) / PAGE).exists()

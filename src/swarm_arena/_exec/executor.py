@@ -1,7 +1,9 @@
 """Define staged jobs and the asynchronous executor contract."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Generator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from math import isfinite
 from typing import Any, ClassVar, Literal
@@ -21,6 +23,23 @@ from swarm_arena._tooling.result_file import (
     RequestFile,
     _workspace_envelope,
 )
+
+_SCHEDULE_TIMEOUT: ContextVar[float | None] = ContextVar("schedule_timeout", default=None)
+
+
+@contextmanager
+def schedule_timeout_scope(seconds: float | None) -> Generator[None]:
+    """Bind the run's resource-feasibility allowance to all child execution tasks."""
+    token = _SCHEDULE_TIMEOUT.set(seconds)
+    try:
+        yield
+    finally:
+        _SCHEDULE_TIMEOUT.reset(token)
+
+
+def current_schedule_timeout() -> float | None:
+    """Return the enclosing run's schedule allowance, or None outside a run."""
+    return _SCHEDULE_TIMEOUT.get()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -62,6 +81,8 @@ class Job:
         Root holding content-addressed workspace artifacts and logs.
     secret_values : Mapping[str, str], optional
         Driver-supplied secrets overriding other environment sources.
+    drop_env : tuple[str, ...], optional
+        Tuple of names excluded from node/file resolution before explicit overlays.
     on_started : Callable[[Job.Started], Awaitable[None]] or None, default=None
         Await before releasing the job to run; None starts without a callback.
     on_partial : Callable[[ToolOutput], Awaitable[None]] or None, default=None
@@ -177,6 +198,8 @@ class Job:
             Recorded process start time used to guard against pid reuse.
         task_name : str or None, default=None
             Remote task name for a dispatch.
+        ray_job_id : str or None, default=None
+            Original Ray driver job identifier, retained for identity-bound recovery.
 
         Examples
         --------
@@ -195,6 +218,7 @@ class Job:
         pgid: int | None = None
         start_time: str | None = None
         task_name: str | None = None
+        ray_job_id: str | None = None
 
     id: str
     kind: Literal["tool", "command"]
@@ -210,11 +234,14 @@ class Job:
     secrets_file: str | None
     artifact_root: str
     secret_values: Mapping[str, str] = field(default_factory=dict, repr=False)
+    drop_env: tuple[str, ...] = ()
     on_started: Callable[[Started], Awaitable[None]] | None = field(default=None, repr=False)
     on_partial: Callable[[ToolOutput], Awaitable[None]] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Require finite execution limits and a consistent payload for the job kind."""
+        if type(self.drop_env) is not tuple or any(type(name) is not str for name in self.drop_env):
+            raise ValueError("Job.drop_env: expected a tuple of strings")
         for name, value, positive in (
             ("timeout_s", self.timeout_s, True),
             ("grace_s", self.grace_s, False),

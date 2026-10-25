@@ -10,7 +10,7 @@ import anyio
 import pytest
 from _fakes import pr1_fm as hooks
 
-from swarm_arena import Ref, Swarm
+from swarm_arena import Ref, RunConfig, Swarm
 from swarm_arena._agent import tool_run
 from swarm_arena._journal.writer import JournalWriter
 from tests._engine.test_pr1_fm_outcomes import config, events, plan
@@ -21,9 +21,8 @@ def micro(value: float | None) -> int:
     return int(Decimal(str(value)) * 1_000_000)
 
 
-@pytest.mark.parametrize("phase", ["command", "put_edits"])
-async def test_native_cancel_refunds_undispatched(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+async def _assert_native_cancel_refunds_undispatched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, run_config: RunConfig
 ) -> None:
     hooks.ENTERED.clear()
     hooks.RELEASE.clear()
@@ -66,7 +65,7 @@ async def test_native_cancel_refunds_undispatched(
     )
     p = p.model_copy(update={"teams": [p.teams[0].model_copy(update={"agents": [agent]})]})
     try:
-        result = await Swarm(config(tmp_path)).run(p, run_id="r")
+        result = await Swarm(run_config).run(p, run_id="r")
     finally:
         hooks.RELEASE.set()
     journal = events(tmp_path)
@@ -86,6 +85,13 @@ async def test_native_cancel_refunds_undispatched(
     assert sum(actual.get(r["id"], r["amount"])["tokens"] for r in reserves) == 4
     assert len(hooks.BUDGETS) == 2
     assert micro(hooks.BUDGETS[0]) == micro(hooks.BUDGETS[1])
+
+
+@pytest.mark.parametrize("phase", ["command", "put_edits"])
+async def test_native_cancel_refunds_undispatched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    await _assert_native_cancel_refunds_undispatched(tmp_path, monkeypatch, phase, config(tmp_path))
 
 
 async def test_refund_durability_wait_is_bounded(
@@ -108,7 +114,11 @@ async def test_refund_durability_wait_is_bounded(
             await original(self, seq)
 
     monkeypatch.setattr(JournalWriter, "_wait_for", wait_for)
+    # The never-returning durability wait must exhaust this behavioral budget.
+    bounded_config = config(tmp_path).model_copy(update={"settle_timeout_s": 2.0})
     async with asyncio.timeout(10):
-        await test_native_cancel_refunds_undispatched(tmp_path, monkeypatch, "command")
+        await _assert_native_cancel_refunds_undispatched(
+            tmp_path, monkeypatch, "command", bounded_config
+        )
     assert len(waits) == 1
-    assert waits[0] < config(tmp_path).settle_timeout_s + 1
+    assert waits[0] < bounded_config.settle_timeout_s + 1

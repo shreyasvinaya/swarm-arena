@@ -160,7 +160,7 @@ Every milestone also updates: the `__all__` snapshot test (`tests/test_public_ap
   ```
   Required: `test_ray_cancel.py` (a soft cancel gives a partial output; a force cancel kills grandchildren), `test_ray_dispatch_crash.py` (driver killed after the dispatch intent, then `resume` finds the task by name, and the run is `lost`), `tests/e2e/test_rosenbrock_ray.py`, and `test_gateway_run.py` (key per LLM tool run only, full reservation held, reconcile labels). Manual check only: `uv run pytest -m gateway_live` against a real LiteLLM Proxy.
 - **Dependencies:** M2 (S3 artifacts, lease for reconcile), M3 (`record_call` in the core module `_journal/llm_record.py`, so the gateway client needs no `llm` extra).
-- **Must NOT:** add public names outside `swarm_arena.ray` (the `GatewayConfig` fields are already in R4.8), except two fields: `ToolOutput.llm_calls_file` (the reported-calls file must travel from the executor or Ray worker to the driver, §4.3) and `Job.drop_env` (`build_env` runs on the executor side and must not resolve real provider keys for a keyed run, §7.3 item 2a step 2); change the LLM layer beyond the shared recording path; add container or SSH executors.
+- **Must NOT:** add public names outside `swarm_arena.ray` (the `GatewayConfig` fields are already in R4.8), except three fields: `ToolOutput.llm_calls_file` (+M4: a bounded optional reported-calls artifact must travel from the executor or Ray worker to the driver, §4.3; collection diagnostics remain private), `Job.drop_env` (+M4: executor-side allowlists discard real provider keys before explicit gateway overlays, including after Ray payload transport, §7.3 item 2a step 2) and `Job.Started.ray_job_id` (+M4: recovery binds task and worker evidence to the original driver's Ray job id, §4.8 and §6.5); change the LLM layer beyond the shared recording path; add container or SSH executors.
 
 ### M5 Release 0.1.0
 
@@ -242,7 +242,7 @@ Rules [plan]:
 | `_store/__init__.py` | Empty | M1a | — |
 | `_store/base.py` | `Store` ABC, `Blob`, `open_store` | M1a +M1b +M2 | `tests/_store/test_base.py` |
 | `_store/local.py` | `LocalStore`: `O_EXCL` create, lock file + atomic rename replace | M1a +M1b | `tests/_store/test_local.py` |
-| `_store/artifacts.py` | `ArtifactStore`: content-addressed put, get, fetch | M1a | `tests/_store/test_artifacts.py` |
+| `_store/artifacts.py` | `ArtifactStore`: content-addressed put, get, fetch; bounded nonlocal publication | M1a +M4 | `tests/_store/test_artifacts.py` |
 | `_store/s3.py` | `S3Store` on s3fs with conditional writes | M2 | `tests/_store/test_s3.py` (marker `s3`) |
 | `_tooling/__init__.py` | Empty | M1a | — |
 | `_tooling/tool.py` | `Tool` ABC, `Action`, shared effective tool configuration | M1a +M1b | `tests/_tooling/test_tool.py` |
@@ -256,16 +256,17 @@ Rules [plan]:
 | `_tooling/result_file.py` | Parse and validate `swarm/result.json`; write `swarm/request.json`; `NOTE_PREFIX`, `MAX_DECLARED_FILES`, collection byte-budget context | M1a | `tests/_tooling/test_result_file.py` |
 | `_tooling/llm_calls.py` | Collect `swarm/llm_calls.jsonl`; set `llm_calls_source` | M4 | `tests/_tooling/test_llm_calls.py` |
 | `_exec/__init__.py` | Empty | M1a | — |
-| `_exec/executor.py` | `Executor` ABC, `Job`, `Job.Stage`, `Job.Started` | M1a | `tests/_exec/test_executor.py` |
-| `_exec/supervisor.py` | `ProcessSupervisor`, `RLimits`; `launch_argv` (M4: the launcher argv, shared with the Ray task) | M1a +M4 | `tests/_exec/test_supervisor.py` |
+| `_exec/executor.py` | `Executor` ABC, `Job`, `Job.Stage`, `Job.Started` with original `ray_job_id`; private schedule-timeout scope; `Job.drop_env` excludes node/file values before driver overlays | M1a +M4 | `tests/_exec/test_executor.py` |
+| `_exec/supervisor.py` | `ProcessSupervisor`, `RLimits`; `launch_argv` (shared isolated launcher argv; local group ownership unchanged) | M1a +M4 | `tests/_exec/test_supervisor.py` |
 | `_exec/procinfo.py` | `host_id`, `process_start_time`, `group_has_live_member`, `kill_orphan` | M1a | `tests/_exec/test_procinfo.py` |
-| `_exec/env.py` | Tool environment from `Job.env`, `Job.secret_env` (allowlist resolved from the node and the secrets file), and `Job.secret_values` (values win). Names in `Job.drop_env` are never taken from the node or the secrets file (M4). It does not know the gateway: `_gateway/keys.py` supplies the values | M1a +M4 | `tests/_exec/test_env.py` |
+| `_exec/env.py` | Tool environment from `Job.env`, `Job.secret_env` (allowlist resolved from the node and the secrets file), and `Job.secret_values` (values win). Names in `Job.drop_env` are skipped before reading node/file sources; explicit environment, result-path and secret-value overlays still apply (M4). It does not know the gateway: `_gateway/keys.py` supplies the values | M1a +M4 | `tests/_exec/test_env.py` |
 | `_exec/pool.py` | `ResourcePool`: caps concurrent runs by `Resources` | M1a | `tests/_exec/test_pool.py` |
 | `_exec/threads.py` | `run_sync_daemon` and the daemon-call holder: run blocking user code on a daemon thread that never blocks interpreter exit | M1a | `tests/_exec/test_threads.py` |
-| `_exec/local.py` | `LocalExecutor` | M1a | `tests/_exec/test_local.py` |
-| `_exec/local_stage.py` | Staging, command preparation, effective limits and environment | M1a | `tests/_exec/test_local.py`, `tests/_exec/test_preparation.py` |
+| `_exec/job_steps.py` | Shared staged carrier, preparation, one-shot daemon collection, bounded per-object publication and transported edit restoration | M4 | `tests/_exec/test_job_steps.py`, `tests/_exec/test_local_run.py`, `tests/_exec/test_output_bounds.py` |
+| `_exec/local.py` | `LocalExecutor` | M1a +M4 | `tests/_exec/test_local.py` |
+| `_exec/local_stage.py` | Private aliases for shared job preparation | M1a +M4 | `tests/_exec/test_local.py`, `tests/_exec/test_preparation.py` |
 | `_exec/local_workspace.py` | Workspace creation, ownership checks and cleanup | M1a | `tests/_exec/test_local.py`, `tests/_exec/test_preparation.py` |
-| `_exec/local_run.py` | Supervision, daemon collection, bounded output reads and uploads | M1a | `tests/_exec/test_local.py`, `tests/_exec/test_output_bounds.py` |
+| `_exec/local_run.py` | Private aliases for shared job execution | M1a +M4 | `tests/_exec/test_local.py`, `tests/_exec/test_output_bounds.py` |
 | `_scoring/__init__.py` | Empty | M1a | — |
 | `_scoring/check.py` | `Check` ABC, `CheckContext` | M1a | `tests/_scoring/test_check.py` |
 | `_scoring/judge.py` | `Judge` ABC, `JudgeContext`, identity hashes, score stamping, finite-key rule | M1a | `tests/_scoring/test_judge.py` |
@@ -283,7 +284,7 @@ Rules [plan]:
 | `_journal/writer.py` | `JournalWriter` (one writer task, group commit, unknown results) | M1b | `tests/_journal/test_writer.py` |
 | `_journal/reader.py` | `read_chain` with the chain check | M1b | `tests/_journal/test_reader.py` |
 | `_journal/views.py` | `ViewWriter`, source-head embedding | M1b +M2 | `tests/_journal/test_views.py` |
-| `_journal/replay.py` | `RunState`: pure fold of committed events | M1b +M2 | `tests/_journal/test_replay.py` |
+| `_journal/replay.py` | `RunState`: pure fold of committed events, including dispatch intents and gateway projections | M1b +M2 +M4 | `tests/_journal/test_replay.py` |
 | `_journal/a2a.py` | A2A `Task` and `Artifact` records for tool runs and agent rounds | M1b | `tests/_journal/test_a2a.py` |
 | `_journal/llm_record.py` | `bind_run`, `record_call` (R4.13.19). Core module: no optional import | M3 +M4 | `tests/_journal/test_llm_record.py` |
 | `_budget/__init__.py` | Empty | M1b | — |
@@ -295,7 +296,7 @@ Rules [plan]:
 | `_budget/llm_scope.py` | `LLMScope` context variable seam with `call_ids`, and the call-id seam `requesting_call` (R4.13.7) | M1b | `tests/_budget/test_llm_scope.py` |
 | `_agent/__init__.py` | Empty | M1b | — |
 | `_agent/manager.py` | `Manager` ABC, `LimitReached` | M1b | `tests/_agent/test_manager.py` |
-| `_agent/runtime.py` | `AgentRuntime`, `AgentCounters`, own items | M1b +M2 | `tests/_agent/test_runtime.py` |
+| `_agent/runtime.py` | `AgentRuntime`, `AgentCounters`, own items; shared run-owned gateway (+M4) | M1b +M2 +M4 | `tests/_agent/test_runtime.py` |
 | `_agent/context.py` | `AgentContext` (public actions) | M1b +M2 | `tests/_agent/test_context.py` |
 | `_agent/tool_run.py` | The `run_tool` pipeline | M1b +M2 +M4 | `tests/_agent/test_tool_run.py` |
 | `_agent/repeats.py` | Repeat key and rules (§6.2) | M1b | `tests/_agent/test_repeats.py` |
@@ -314,8 +315,8 @@ Rules [plan]:
 | `_board/frontier.py` | Build frontiers (this run's mark in M1b, every run read in M2). It does not commit: `_engine/round.py` journals them | M1b +M2 | `tests/_board/test_frontier.py` |
 | `_board/digest.py` | Digest builder with the token cap | M1b +M2 +M3 | `tests/_board/test_digest.py` |
 | `_board/curator.py` | `Curator` ABC and the round-end hook | M2 | `tests/_board/test_curator.py` |
-| `_board/arena.py` | `ArenaBoard` | M2 | `tests/_board/test_arena.py` |
-| `_board/cache.py` | SQLite schema, FTS5, queries filtered by frontier | M2 | `tests/_board/test_cache.py` |
+| `_board/arena.py` | `ArenaBoard`, captured gateway projection | M2 +M4 | `tests/_board/test_arena.py` |
+| `_board/cache.py` | SQLite schema, FTS5, queries filtered by frontier, detached gateway projection | M2 +M4 | `tests/_board/test_cache.py` |
 | `_board/ingest.py` | Incremental chain download into the cache | M2 | `tests/_board/test_ingest.py` |
 | `_board/pointers.py` | `runs/<run-id>.json` pointers | M2 | `tests/_board/test_pointers.py` |
 | `_board/human_objects.py` | Review and curation objects and their fixed order | M2 | `tests/_board/test_human_objects.py` |
@@ -324,33 +325,34 @@ Rules [plan]:
 | `_board/leaderboard.py` | `Row` building, `min_improvement` | M2 | `tests/_board/test_leaderboard.py` |
 | `_board/pages.py` | Round pages | M2 | `tests/_board/test_pages.py` |
 | `_board/serve.py` | Board viewer (stdlib HTTP server) | M2 +M3 | `tests/_board/test_serve.py` |
-| `_board/trace.py` | `trace` chain | M2 +M3 | `tests/_board/test_trace.py` |
+| `_board/trace.py` | `trace` chain, committed gateway cap and spend | M2 +M3 +M4 | `tests/_board/test_trace.py` |
 | `_board/reindex.py` | Cache rebuild | M2 | `tests/_board/test_reindex.py` |
 | `_engine/__init__.py` | Empty | M1b | — |
 | `_engine/swarm.py` | `Swarm` facade | M1b | `tests/_engine/test_swarm.py` |
-| `_engine/run.py` | Run level: estimate and approval, goal queue, slots, run clock, stop control, end of run; review export hook (+M2); `bind_run` for `record_call` (+M3) | M1b +M2 +M3 | `tests/_engine/test_run.py` |
-| `_engine/goal.py` | One goal: rounds, barrier, policy, replanner, converge call | M1b +M2 | `tests/_engine/test_goal.py` |
+| `_engine/run.py` | Run level: estimate and approval, goal queue, slots, run clock, stop control, end of run; review export hook (+M2); `bind_run` for `record_call` (+M3); inherited schedule-timeout scope and run-owned gateway construction (+M4) | M1b +M2 +M3 +M4 | `tests/_engine/test_run.py` |
+| `_engine/goal.py` | One goal: rounds, barrier, policy, replanner, converge call; informational gateway reads after round close (+M4) | M1b +M2 +M4 | `tests/_engine/test_goal.py` |
 | `_engine/admission.py` | Run-wide peak-agent reservations and atomic revision publication | M1b | `tests/_engine/test_admission.py` |
-| `_engine/round.py` | One round: frontier commit, snapshot, managers in parallel, round timeout | M1b +M2 | `tests/_engine/test_round.py` |
+| `_engine/round.py` | One round: frontier commit, snapshot, managers in parallel, round timeout; gateway propagation (+M4) | M1b +M2 +M4 | `tests/_engine/test_round.py` |
 | `_engine/stops.py` | Mid-round stop rules (§6.4); `ProviderStops`, the run's one provider-failure registry (M3, R4.13.10) | M1b +M3 | `tests/_engine/test_stops.py` |
 | `_engine/parts.py` | Part assignment, kept best of a part, join, re-join attempts (groups come from `_scoring/ranking.py`) | M1b | `tests/_engine/test_parts.py` |
 | `_engine/converge.py` | Select and team converge, final judge call | M1b | `tests/_engine/test_converge.py` |
 | `_engine/solution.py` | `solution.json` view, `NO_RESULT` | M1b | `tests/_engine/test_solution.py` |
 | `_engine/preflight.py` | Preflight per distinct tool config; storage checks, `check_storage` (+M2, R4.13.13); gateway (+M4) | M1b +M2 +M4 | `tests/_engine/test_preflight.py` |
-| `_engine/manifest.py` | `manifest.json` | M1b | `tests/_engine/test_manifest.py` |
+| `_engine/manifest.py` | `manifest.json`, validated optional gateway evidence | M1b +M4 | `tests/_engine/test_manifest.py` |
 | `_engine/control.py` | Stop files (one pair per epoch, R4.13.13), status report | M1b | `tests/_engine/test_control.py` |
-| `_engine/resume.py` | Takeover, replay, orphans, `lost` runs, `limits_changed` | M1b +M2 +M4 | `tests/_engine/test_resume.py` |
+| `_engine/resume.py` | Takeover, replay, orphans, `lost` runs, `limits_changed`; inherited schedule-timeout scope | M1b +M2 +M4 | `tests/_engine/test_resume.py` |
 | `_cli/__init__.py` | Empty | M1a | — |
-| `_cli/main.py` | `argparse` root, dispatch, `anyio.run(..., backend="asyncio")` | M1a +M1b +M2 | `tests/_cli/test_main.py` |
+| `_cli/main.py` | `argparse` root, dispatch, `anyio.run(..., backend="asyncio")` | M1a +M1b +M2 +M4 | `tests/_cli/test_main.py` |
 | `_cli/run_cmds.py` | `run`, `status`, `stop`, `resume` | M1b +M2 | `tests/_cli/test_run_cmds.py` |
 | `_cli/arena_cmds.py` | `review`, `leaderboard`, `board`, `learnings`, `trace`, `reindex` | M2 | `tests/_cli/test_arena_cmds.py` |
 | `_cli/plan_cmd.py` | `plan`; imports `swarm_arena.llm` only inside the `--llm` and `--together` handlers | M3 | `tests/_cli/test_plan_cmd.py` |
 | `_cli/cluster_cmds.py` | `submit`, `reconcile` | M4 | `tests/_cli/test_cluster_cmds.py` |
 | `_gateway/__init__.py` | Empty | M4 | — |
-| `_gateway/adapter.py` | `GatewayAdapter` protocol, `VirtualKey`, `SpendRow`, `ProfileReport` | M4 | `tests/_gateway/test_adapter.py` |
+| `_gateway/adapter.py` | `GatewayError`, `GatewayAdapter` protocol, `VirtualKey`, validated `SpendRow`, `ProfileReport` | M4 | `tests/_gateway/test_adapter.py` |
 | `_gateway/litellm_proxy.py` | LiteLLM Proxy adapter (stdlib `urllib`), `terminal_accounting = False` | M4 | `tests/_gateway/test_litellm_proxy.py` |
-| `_gateway/profile.py` | Strict-profile preflight | M4 | `tests/_gateway/test_profile.py` |
+| `_gateway/profile.py` | Pure pinned strict-profile check; unavailable settings remain unverified | M4 | `tests/_gateway/test_profile.py` |
 | `_gateway/keys.py` | Key per tool run; the gateway values for the `Job` (base URLs for `Job.env`, the key for `Job.secret_values`, the provider key names to drop from `Job.secret_env` and to set as `Job.drop_env`); spend read-back | M4 | `tests/_gateway/test_keys.py` |
+| `_gateway/reports.py` | Shared reconciliation payloads, gateway key action vocabulary and read-status labels | M4 | `tests/_gateway/test_reports.py` |
 | `_gateway/reconcile.py` | Post-run reconcile | M4 | `tests/_gateway/test_reconcile.py` |
 | `llm/__init__.py` | Facade `swarm_arena.llm`; clear `ImportError` without the extra | M3 | `tests/test_public_api.py` |
 | `llm/_catalog.py` | Capability checks, prices, `build_model` | M3 | `tests/llm/test_catalog.py` |
@@ -370,9 +372,9 @@ Rules [plan]:
 | `llm/_curator.py` | `LLMCurator` | M3 | `tests/llm/test_curator.py` |
 | `llm/_langfuse.py` | Langfuse export | M3 | `tests/llm/test_langfuse.py` |
 | `ray/__init__.py` | Facade `swarm_arena.ray`; clear `ImportError` without the extra | M4 | `tests/test_public_api.py` |
-| `ray/_executor.py` | `RayExecutor` | M4 | `tests/ray/test_executor.py` (marker `ray`) |
-| `ray/_task.py` | Generic remote task | M4 | `tests/ray/test_task.py` (marker `ray`) |
-| `ray/_state.py` | Task lookup by name, `confirm_dead` | M4 | `tests/ray/test_state.py` (marker `ray`) |
+| `ray/_executor.py` | `RayExecutor`: lazy cluster binding, resource feasibility, owned blob publication, bounded cancel/recovery | M4 | `tests/ray/test_executor.py` (cluster cases marked `ray`), `tests/e2e/test_ray_cancel.py` (marker `ray`) |
+| `ray/_task.py` | Framed one-shot task; shared staged/collection/publication owner; worker-group supervisor | M4 | `tests/ray/test_task.py` (cluster cases marked `ray`) |
+| `ray/_state.py` | Explicit-dashboard REST task/job lookup and identity-joined `worker_dead` evidence | M4 | `tests/ray/test_state_unit.py`, `tests/ray/test_state.py` (marker `ray`) |
 | `ray/_files.py` | Object-store file transport with the 256 MiB cap | M4 | `tests/ray/test_files.py` (marker `ray`) |
 | `ray/_submit.py` | `submit` through `JobSubmissionClient` | M4 | `tests/ray/test_submit.py` |
 | `testing/__init__.py` | Facade `swarm_arena.testing` | M1a +M1b +M3 | `tests/test_public_api.py` |
@@ -735,8 +737,35 @@ class ToolOutput(FrozenModel):
     ended_at: datetime | None = None
     failed_provider: str | None = None          # [plan] with status provider_failed: the provider that failed (result.json
         # key "failed_provider"). None → every provider in Tool.providers() counts as failed (§6.4).
-    llm_calls_file: FileRef | None = None       # [plan] M4: swarm/llm_calls.jsonl in artifact_root, set where the tool runs
-        # (a Ray worker too) so it reaches the driver with the output (§4.3, §7.3 item 2b); None if absent
+    llm_calls_file: FileRef | None = None       # +M4: optional swarm/llm_calls.jsonl, set where the tool runs
+        # FileRef.path="llm_calls.jsonl", real SHA-256 and size; <=16 MiB uploaded, >16 MiB..1 GiB
+        # fully hashed but never uploaded/fetched; >1 GiB refused unread with no ref. No fake digest.
+        # Missing is normal; unsafe/changing/unreadable reports warn without losing valid output.
+        # Private _collection_diagnostics code/count pairs are excluded from JSON/repr; see below.
+
+# +M4 private helpers: _tooling/llm_calls.py, _tooling/output.py, _tooling/env_names.py.
+# collect_llm_calls(workspace) -> (FileRef | None, bytes | None, tuple[(code, count), ...]):
+# pinned O_NOFOLLOW/O_NONBLOCK regular-file open and bounded 1 MiB-chunk loop; no publication.
+# hash_regular_file(workspace, rel) -> (full_sha256, fstat_size): <=1 GiB, reject observed changes.
+# _JobRun._finish awaits collection, then each publication separately under its existing owner.
+# detach_tool_output(value) -> ToolOutput preserves bounded private diagnostics through revalidation;
+# malformed carriers produce one fixed warning, preserving valid output. Carrier is excluded from equality.
+# with_collection_diagnostics(output, pairs) restores only registered codes, <=32 pairs, counts 1..10000.
+# Codes: llm_calls_unreadable, llm_calls_symlink, llm_calls_special_file, llm_calls_changed,
+# llm_calls_hash_limit, llm_calls_diagnostics_invalid. FrameDiagnostic(code, count) transports these
+# in the private Ray frame slot. Only tool jobs collect reports; command/check jobs do not.
+# effective_secret_env(tool_or_ref_or_command, *, overrides=None) -> tuple[str, ...]: shared typed,
+# alias/default-aware traversal, effective_tool_ref overrides, no worker command hook invocation.
+# record_reported(rows, *, metadata) uses current trusted owner_epoch and record_call(settle=False,
+# _external_observation=True); no ambient funded LLMScope adoption for no-pending observations.
+# parse_llm_calls -> (single-pass Iterator[LLMCallRow], mutable bounded warnings): consume each row
+# in the supervised worker, then record before advancing; <=16 MiB / 10000 nonempty rows, <=64 KiB/line.
+# Identifier limits: model 256, provider 64, litellm_call_id 128 printable characters; strict numbers.
+# <=20 per-line warnings plus summary/cap. Record admitted call IDs incrementally for cancellation.
+# Tool-origin call IDs use a separate dedup namespace, reconstructed from role=tool/no reservation.
+# Unsupported informational amounts record a fixed error, zero cost and absent usage.usd; never charged.
+# Driver report reads verify exact declared size/digest with bounded local/S3 reads before parsing.
+# Source order: keyed gateway > valid reported rows > may-call unknown > none; never langfuse in v1.
 
 # Private shared codec beside ToolOutput; executor and conformance kit use the same format.
 def format_logs_ref(stdout_sha: str, stderr_sha: str) -> str: ...
@@ -1336,8 +1365,21 @@ class ArenaBoard(Board):
 
 ### R4.7 `swarm_arena.executor`
 
+The private `_gateway.keys.KeyManager(adapter, config, *, cap, journal, settle_timeout_s, run_id)`
+retains the entered writer and explicit run binding. `KeyRecord` stores `run_id`, creation
+`owner_epoch`, and `created_at` before create; resumed reads use the live journal epoch.
+`gateway_call_id(key_id, request_id)` is `"gw:" + sha256_hex(canonical_json([key_id, request_id]))`.
+Gateway rows use the recorder's external-observation path with `settle=False`, never funded scope
+lineage. Query bounds include 15 minutes of clock skew on both sides plus second rounding and
+a one-second lower overlap; canonical identities deduplicate overlapping reads. Invalid model/provider
+labels become `unknown`; ordinary per-row recording errors warn and later rows continue.
+Use one create attempt per candidate_id; open refuses a candidate whose record is already held. First-row polling is separately bounded; it never puts a report timer around durable
+recording. Unknown closure/read outcomes retain estimates. The caller owns stop/deadline
+supervision and post-open cleanup; pre-return compensation is bounded by the original
+open allowance and remaining inherited/writer deadline, with no compensating journal write.
+
 ```python
-# _exec/executor.py — M1a
+# _exec/executor.py — M1a +M4
 @dataclass(frozen=True, kw_only=True)
 class Job:
     class Stage(FrozenModel):                   # what the workspace holds; computed in the driver (R4.13.9)
@@ -1357,6 +1399,7 @@ class Job:
         pgid: int | None = None
         start_time: str | None = None
         task_name: str | None = None
+        ray_job_id: str | None = None           # recovery binds evidence to the original Ray driver job (+M4, §4.8/§6.5)
     id: str                                     # candidate id or a command-job id "x-<run tag>-e<epoch>-<n>" (R4.0)
     kind: Literal["tool", "command"]
     tool: Ref | None = None                     # kind="tool"
@@ -1374,7 +1417,9 @@ class Job:
         # (gateway virtual keys as OPENAI_API_KEY and ANTHROPIC_API_KEY, M4); they win over env and secret_env. Never
         # journaled, logged, or put in Ray runtime_env; sent to Ray only inside the task payload (R4.13.16). On Ray the
         # payload can sit in the object store, which can spill to worker-local disk (documented in M4 item 9).
-    drop_env: tuple[str, ...] = ()              # [plan] M4: names build_env never takes from the node or the secrets file.
+    drop_env: tuple[str, ...] = ()              # [plan] +M4: validated tuple of str; skip these node/file names.
+        # job.env, SWARM_ARENA_RESULT, then job.secret_values still override. The Job dataclass payload carries
+        # this tuple to the Ray worker; LocalExecutor uses the same build_env precedence.
         # gateway_job sets every PROVIDER_KEYS name on a keyed run. With a gateway, every unkeyed tool job gets
         # REPLACED_KEYS. So no tool run gets a real OpenAI or Anthropic key from the node (spec 7.3 item 2a).
     on_started: Callable[["Job.Started"], Awaitable[None]] | None = None   # never serialized; None -> the executor starts
@@ -1406,9 +1451,9 @@ class LocalExecutor(Executor):
     def __init__(self, config: "LocalExecutor.Config | None" = None, /, **fields: Any) -> None: ...
     # preflight() refuses a non-POSIX platform [plan].
     # [plan, M1a] The executor runs with `Job.timeout_s` and `Job.grace_s` and writes them into `Command.timeout_s` and `Command.grace_s`; the driver computes them with `effective_tool_timeout` and `tool_grace` (`_tooling/tool.py`).
-    # [plan, M4] confirm_dead(kind "process") on this host: True if not group_has_live_member(pgid), or if process_start_time(pid)
-    # differs from started.start_time. False if the group is alive with the recorded start time or an unknown one. None on
-    # another host or for kind "dispatch".
+    # [plan, M4] confirm_dead(kind "process") on this host: True if not group_has_live_member(pgid), or if pid == pgid
+    # and both process_start_time(pid) and started.start_time are known and differ. False if the group is alive
+    # with the recorded identity or unknown identity. None on another host or for kind "dispatch".
 ```
 
 ### R4.8 `swarm_arena.config`
@@ -2079,6 +2124,73 @@ def group_has_live_member(pgid: int) -> bool: ...
 def kill_orphan(started: Job.Started) -> bool: ...   # only if host_id and start_time match; else False and nothing is killed
 ```
 
+Shared executor steps (private, M4; `_exec/job_steps.py`):
+
+```python
+@dataclass(frozen=True)
+class _Staged:
+    tool: Tool | None
+    request: ToolRequest | None  # live contents, never transported edit references
+    argv: list[str]
+    cwd: Path
+    env: dict[str, str]
+    fault: str | None
+    timeout_s: float | None  # minimum non-None Job/Command timeout
+    grace_s: float           # minimum Job/Command grace
+
+@dataclass
+class _Preparation:
+    job: Job; workspace: Path; artifacts: ArtifactStore
+    finished: threading.Event  # init=False; set in run's finally
+    def run(self) -> _Staged: ...
+
+def prepare_job(job: Job, workspace: Path, artifacts: ArtifactStore) -> _Staged: ...
+def resolve_argv(command: Command) -> list[str]: ...
+def live_request(request: ToolRequest, artifacts: ArtifactStore) -> ToolRequest: ...
+
+class _JobRun:
+    def __init__(self, job: Job, staged: _Staged, workspace: Path, artifacts: ArtifactStore,
+                 *, max_log_bytes: int, max_output_bytes: int) -> None: ...
+    async def run(self, sup: ProcessSupervisor, rlimits: RLimits | None) -> ToolOutput: ...
+    async def fault_output(self, reason: str) -> ToolOutput: ...
+    collect_finished: threading.Event  # workspace release only when the worker finishes
+    @property
+    def publication_finished(self) -> bool: ...  # includes validation/diagnostic workers
+    def _start_collect(self, run: CompletedRun) -> _DaemonCall[ToolOutput | None]: ...
+    def _collect_owned(self, run: CompletedRun) -> ToolOutput | None: ...
+    def _collect(self, run: CompletedRun) -> ToolOutput | None: ...
+    async def _before_kill(self, provisional: CompletedRun) -> None: ...
+    def _stopped_output(self, status: RunStatus) -> ToolOutput: ...
+    async def _finish(self, output: ToolOutput,
+                      times: tuple[datetime, datetime] | None) -> ToolOutput: ...
+```
+
+Preparation runs in `run_sync_daemon` under the owner, followed by a cancellation
+checkpoint before launch. An unfinished preparation, collection or publication worker
+retains its workspace, including after its original deadline expires. Queued publication
+work is revoked on abandonment; failed collector thread creation releases ownership.
+The existing `_JobRun` owns collection once: normal completion has the original
+`BEFORE_KILL_TIMEOUT_S` deadline; cancellation rejoins that same collect;
+stop collection runs before kill and is never retried. `_collect` sets and resets
+`_OUTPUT_BYTE_LIMIT` in the collecting worker. Valid stop results are partial
+iff `partial or data or files`. Direct LocalExecutor nonstandard propagation is preserved; registered terminal
+collection errors received by the awaiting owner are retained through process cleanup
+and re-raised before publication; abandoned worker outcomes are discarded. Cancellation
+during normal collection wins over every rejoin error and still delivers one partial. Worker callers reuse this state and these operations with their
+own launch/termination mechanics; no worker uses the local process-group launcher.
+
+`_finish` validates the declaration and aggregate output sizes before publication,
+then awaits each file and log separately through the abandonable storage boundary.
+A cancelled local run delivers data-only partial output without new publication.
+Local artifact chunks stream; other backends accumulate one object within the
+remaining byte cap, with a 1 GiB ceiling and one buffer plus the input chunk (and
+allocator overhead on CPython), before using the existing Store byte API. Retrieval
+verifies hashes and the 1 GiB cap without copying immutable byte results. S3 checks
+metadata before a bounded read; byte-only stores can check only after their read.
+Fetch keeps pinned, atomic destination writes on every backend.
+`live_request` is worker-only; it restores only the exact reserved edit reference
+form and reports failed restoration using path/type diagnostics without values.
+
 #### R4.13.9 Files, paths, staging — M1a
 
 ```python
@@ -2143,7 +2255,7 @@ def collect_output_files(workspace: Path, declared: Sequence[str], artifacts: Ar
     # or uploading it, including sparse files, and bound the read if it grows. Validate all declarations before reads.
 ```
 
-#### R4.13.10 Agent runtime and the `run_tool` pipeline — M1b
+#### R4.13.10 Agent runtime and the `run_tool` pipeline — M1b (+M4 gateway)
 
 ```python
 @dataclass
@@ -2180,6 +2292,7 @@ class AgentRuntime:
     private_paths: frozenset[str] = frozenset()      # [plan] every check and judge file path of the revision (R4.13.9)
     stops: ProviderStops                             # [plan] M3: the run's one ProviderStops, shared by every goal round
                                                      # (EngineDeps.provider_stops, R4.13.13)
+    gateway: KeyManager | None = None               # +M4: last field; the run-owned manager from EngineDeps.gateway
 
 class ProviderStops:                                 # _engine/stops.py — M3 [plan]: one per run, shared by every goal round
     def register(self, address: str, providers: frozenset[str], cancel: Callable[[], None]) -> None: ...
@@ -2199,16 +2312,38 @@ async def execute_tool_run(rt: AgentRuntime, inputs: Mapping[str, Any], *, paren
     # validate inputs, edits (validate_edits), and visible parents (including root/protection)
     # → repeat rules and replicate allocation → plan the stage → count the tool run → reserve (durable) → put_edits
     # → Job(on_started = durable start event) → executor.submit (refused when the round's admission is closed:
-    # at Inflight.add and again in on_started; a refused run settles Amount() and raises LimitReached('stop'))
+    # at Inflight.add and again in on_started; an unkeyed refusal settles Amount() and raises LimitReached('stop'))
     # → logs → checks → durable completion event → settle (or keep charged) → board.put_candidate
     # The final request (including the allocated replicate) supplies key, stage.request_json, Job, and Candidate.
     # Pure stage planning completes before count/reserve; artifact writes follow reserve.
     # Logs use goals/<goal-id>/logs/<candidate-id>.{out,err}; board publication uses the completion event's position.
-    # Cancelled preparation with no committed tool_start settles zero and launches no check commands.
-    # Usage above USD_LIMIT retains an ERROR candidate and reported tokens, then settles via settle_overflow
+    # Cancelled unkeyed preparation with no committed tool_start settles zero and launches no check commands.
+    # Unkeyed usage above USD_LIMIT retains an ERROR candidate and reported tokens, then settles via settle_overflow
     # after durable tool_end; live and replayed admission become terminal in all limits modes.
     # Replicate allocation hooks have type-only diagnostics; release uses retained allocation data without hooks.
     # AgentContext.run_tool applies the gate and counts the turn, then calls execute_tool_run, which owns every other check.
+    # With a gateway, needs_key(tool.providers(), effective_secret_env(tool)) controls keying (R5.4 item 18).
+    # Reserve refundable during preparation. Immediately before open, durably promote keep_charged;
+    # reserve action=keep_charged updates the existing reservation without another debit.
+    # Pre-open failures (including zero-USD refusal) refund; attempted creation and later failures retain the charge.
+    # Keyed settlement reports tokens only as actual, estimated=True; self-reported USD stays informational.
+    # Gateway URLs use Job.env; the virtual key uses Job.secret_values. Unkeyed jobs drop REPLACED_KEYS (R4.7).
+    # Open before submit; close after collection. Outer cancellation/fencing uses bounded no-journal revoke.
+    # Cleanup inherits caller/writer limits; an expired owner hands off one bounded external-only block.
+    # Hard process controls, including nested groups containing them, escape without awaited cleanup;
+    # other groups retain revocation, refund, and shared classification.
+    # Keyed spend readback stays registered with round completion, under the existing recorder owner.
+    # read_with_status returns (observations, 'ok' | 'failed' | 'incomplete'); read remains a list-only wrapper.
+    # Failed/unconfirmed closure and failed/incomplete readback retain the result with value-free warnings.
+    # Only gateway rows become keyed LLMCall events; reported JSONL is retained with parse warnings for information.
+    # Candidate source is 'gateway'; its call IDs contain only observations available at that completion.
+    # Boundary HTTP reads have their own bounded allowance before completion; expiry journals read_failed.
+    # Round close reads open keys and keys not successfully boundary-read since closure; run end/resume read all.
+    # Resume preflights final limits, rejects missing/changed gateway URLs for gateway_key history, and
+    # binds/restores once, closing every key without confirmed closed_at even when its candidate finished.
+    # Failure payloads carry key_id/candidate_id with value-free errors; gateway URL comparisons omit userinfo.
+    # Unreplaced-key warnings state that unkeyed runs get the node value and bypass the gateway.
+    # The shared GatewayKeyAction vocabulary is created/closed/read_failed/close_failed; only created/closed restore state.
 
 class Inflight:
     closed: bool
@@ -2393,13 +2528,19 @@ async def run_preflight(plans: Sequence[Plan], config: RunConfig, executor: Exec
     # Admitted later revisions use this same preflight before dispatch. User construction/hooks use run_sync_daemon;
     # failures aggregate reference paths and exception types only.
 def build_manifest(*, run_id: str, config: RunConfig, plans: Sequence[Plan],
-                   capacity: Resources | None) -> dict[str, Any]: ...  # _engine/manifest.py; synchronous callers only
+                   capacity: Resources | None,
+                   llm_gateway: _GatewayManifest | dict[str, Any] | None = None) -> dict[str, Any]: ...  # _engine/manifest.py; synchronous callers only
 async def build_manifest_async(*, run_id: str, config: RunConfig, plans: Sequence[Plan],
-                              capacity: Resources | None) -> dict[str, Any]: ...  # supported async entry point
+                              capacity: Resources | None,
+                              llm_gateway: _GatewayManifest | dict[str, Any] | None = None) -> dict[str, Any]: ...  # supported async entry point
     # Tool identity config validation/serialization uses run_sync_daemon, then bounded host/git work uses to_thread.
     # Async callers must use build_manifest_async; never offload the whole sync builder to an ordinary AnyIO worker.
     # Validated JSON-mode RunManifest dump, with nulls preserved. Hash deterministic UTF-8 config/plan TOML dumps;
     # record GoalKey.files_sha256, base-ref tool identities (catalog settable fields excluded), and bounded git probes.
+    # llm_gateway defaults to null for backward reads. Otherwise: url without userinfo/query/fragment,
+    # cap hard|soft, verified bool, failures list[str], terminal_accounting bool. Cap is hard iff verified;
+    # failures are empty iff verified. Copied model instances are revalidated before serialization.
+    # One validated dump is used for manifest.json and run_started; no credential values.
 class GoalStatus(FrozenModel):
     status: str; round: int; rounds_total: int; candidates: int; best: float | None
     # best is the current main group's best ranking Score.value, or None when absent/non-scalar or unjoined.
@@ -2530,12 +2671,14 @@ remain immutable.
 #### R4.13.15 Gateway — M4
 
 ```python
+class GatewayError(RuntimeError): ...  # method, route and HTTP status or error type; never values
 class ProfileReport(FrozenModel):
-    verified: bool; failures: list[str]; batch_write_interval_s: float | None; request_timeout_s: float | None
+    verified: bool; failures: tuple[str, ...]; batch_write_interval_s: float | None; request_timeout_s: float | None
 class VirtualKey(FrozenModel):
     key_id: str; alias: str                          # the secret key value is never stored or journaled
 class SpendRow(FrozenModel):
-    litellm_call_id: str; model: str; usage: Usage; cost_usd: float; ts: datetime; metadata: dict[str, Any]
+    key_id: str; request_id: str; litellm_call_id: str | None; model: str; usage: Usage
+    cost_usd: float; ts: datetime; metadata: dict[str, Any]
 class GatewayAdapter(Protocol):
     terminal_accounting: bool                        # LiteLLM adapter: False
     async def preflight(self) -> ProfileReport: ...
@@ -2543,22 +2686,163 @@ class GatewayAdapter(Protocol):
                          metadata: Mapping[str, Any], default_estimated_output_tokens: int) -> tuple[VirtualKey, str]: ...  # (key, secret value)
     async def block_key(self, key: VirtualKey) -> None: ...
     async def closed_at(self, key: VirtualKey) -> datetime | None: ...   # closure time T, confirmed by the API
-    async def spend_rows(self, key: VirtualKey) -> list[SpendRow]: ...
+    async def spend_rows(self, key: VirtualKey, *, start: datetime, end: datetime) -> list[SpendRow]: ...
     async def delete_key(self, key: VirtualKey) -> None: ...
+async def gateway_preflight(config: RunConfig, adapter: GatewayAdapter) -> tuple[Literal["hard", "soft"], ProfileReport]: ...
+    # _engine/preflight.py: verified => hard; otherwise hard_cap_required(limits) refuses before key creation.
+    # Pinned LiteLLM is always unverified/soft; max_usd defaults to requiring hard, so needs explicit false.
 async def reconcile_run(config: RunConfig, run_id: str, adapter: GatewayAdapter, executor: Executor) -> ReconcileReport: ...
 ```
+
+Run construction uses `_engine/run.py::_prepare_gateway(config)` before ownership,
+returning `_GatewaySetup(adapter, profile, manifest)` or None; `cap` reads the
+validated manifest. `_bind_gateway(setup, config, journal, run_id)` constructs
+one KeyManager under the entered writer. The runner retains `_gateway` and
+`_key_manager`. Runtime delivery and resume restoration reuse these instances
+and seams; no additional writer, recorder binding, watcher or cleanup timer.
+
+Committed trace projection: `RunState.gateway_keys[(candidate_id, key_id)]`
+retains `gateway_key` action `created` fields `candidate_id`, `key_id`, `alias`,
+`max_budget_usd`, `cap`. `RunState.gateway_reconcile` retains the latest report
+per same identity from `reconcile` payload `{run_id, keys: [...]}`. Each report
+row carries `candidate_id`, `key_id`, `alias`, `reserved_usd`, `observed_usd`,
+`label`, `reasons`, `deleted`; the projection keeps only display fields.
+`observed_usd` is null exactly for `estimated`; other labels are `observed` and
+`observed (completeness unverified)`. Amounts are finite nonnegative numbers.
+A foreign payload run_id is rejected. Cache publication detaches both maps at
+the captured frontier; ArenaBoard retains them by producing run and passes
+only that candidate's run to trace. Renderers do not scan events or refresh.
+
+All gateway models use the safe frozen base. `ProfileReport.failures` is an
+immutable tuple (a JSON array on the wire); `verified` must equal `not failures`,
+and verification requires a known `request_timeout_s`. Costs and timings are
+finite and nonnegative; metadata is finite JSON. `VirtualKey.key_id`,
+`VirtualKey.alias` and `SpendRow.key_id` are strict nonblank strings of 1-256
+characters; identities are preserved without trimming. `SpendRow.request_id` is
+required and nonblank, and `litellm_call_id` is nullable and not globally unique.
+`SpendRow.key_id` comes from the row's own `api_key` hash; the adapter rejects a
+mismatch with the queried key through GatewayError, never substituting the query
+identity or returning a partial total. `usage` is strictly revalidated without
+serialization warnings, including copied/constructed instances. Token counts
+cannot be bools, strings or floats. `cost_usd` is the sole authoritative cost;
+`usage.usd` is either None or exactly equal and is never added separately. `ts`
+accepts only aware datetimes or timezone-aware ISO strings and normalizes to UTC;
+Unix numbers and numeric strings are rejected. The HTTP adapter extracts cache
+counts from `metadata.additional_usage_values`, never top-level spend fields.
+Spend queries require both aware UTC bounds for one fixed inclusive window
+across all pages.
+
+`block_key` and `delete_key` are idempotent: None means success, including an
+already blocked/deleted/missing key. Deleting a blocked but existing key still
+performs deletion. Transient transport/server or malformed responses raise
+GatewayError rather than being interpreted as successful closure/deletion.
+`closed_at` returns an aware UTC confirmation time for blocked/deleted keys,
+including archived HTTP 200 `info.status="deleted"` and definitive key-info 404;
+use the observation time when no reliable closure timestamp exists, never an
+earlier invented time. None means open/unconfirmed; failed inspection raises
+GatewayError. Consumers do not parse error messages for idempotency.
+
+```python
+# _gateway/profile.py (LiteLLM Proxy 1.107.0rc2)
+BUDGET_RESERVATIONS: Final[str | None] = "disable_budget_reservation"
+FAIL_CLOSED: Final[str | None] = "fail_closed_budget_enforcement"
+MAX_REQUEST_DURATION: Final[str | None] = None
+BATCH_WRITE_INTERVAL: Final[str | None] = "proxy_batch_write_at"
+VIRTUAL_KEYS_REQUIRED: Final[str | None] = None
+PASS_THROUGH: Final[str | None] = "pass_through_endpoints"
+MAX_TOKENS_BOUND: Final[str | None] = None
+RESERVED_ROUTES_ONLY: Final[str | None] = "allowed_routes"
+def check_profile(settings: Mapping[str, Any] | None, models: Sequence[object], *,
+                  request_timeout_s: float) -> ProfileReport: ...
+```
+
+The three absent guarantees always fail in requirement order: per-key output
+bound, total request duration, virtual-key-only access. `settings=None` retains
+those and per-model failures, then appends `gateway settings introspection
+unavailable`; both reported timings are None and unreadable switches get no
+invented state. Complete settings honor the inverted reservation switch,
+literal-True fail-closed enforcement, explicit route allowlists and explicit
+empty custom pass-through lists. Only `/chat/completions` and
+`/v1/chat/completions` plus the adapter's management/health routes are accepted;
+unknown routes, non-chat modes and known zero-cost models cannot establish
+reservation coverage. Prices and advertised output limits have independent
+model failures. Non-mapping model entries receive both model failures under
+`<unknown>`, without rendering their values. Unknown batch timing is None without an additional failure.
+The pinned profile cannot verify hard caps, even with complete fixture settings;
+`default_estimated_output_tokens` remains an estimate. A capable test stub is
+separate from this LiteLLM path.
 
 #### R4.13.16 Ray internals — M4
 
 ```python
-def job_payload(job: Job) -> bytes: ...              # Job without on_started; Ref, not instances; holds secret_values,
-                                                     # so the payload is never logged, journaled, or put in runtime_env
+# ray/_task.py
+class TaskSettings(FrozenModel):
+    poll_s: float = 0.2
+    cap_bytes: int | None = None                    # whole MiB, 1..1024; None uses the shared artifact backend
+    import_roots: tuple[str, ...] = ()
+def job_payload(job: Job, settings: TaskSettings, *, blobs: Mapping[str, bytes] | None = None) -> bytes: ...
+    # No on_started/on_partial; refs, never connector instances. Holds driver-created secret_values only;
+    # never logged, journaled, or put in runtime_env. Node/file secrets are resolved during worker preparation.
+def read_payload(payload: bytes) -> tuple[Job, TaskSettings, dict[str, bytes]]: ...
+def driver_import_roots(job: Job) -> tuple[str, ...]: ...  # supervise tool construction/import on the driver
+
+def run_in_worker(job: Job, workspace: Path, artifacts: ArtifactStore, *, poll_s: float,
+                  import_roots: Sequence[str] = ()) -> ToolOutput: ...
+    # Sync entry with a private asyncio loop. Shared _Staged/_JobRun preserve effective Command limits,
+    # daemon preparation, bounded once-only collection and per-object publication. The direct child stays
+    # in the Ray worker group; Ray owns descendants when its max_calls=1 worker exits.
+    # Main-thread SIGINT is owned through loop shutdown and its previous handler is restored.
+    # Timeout and cancel stop sequences are shielded; soft cancel returns data only, with no new uploads.
+    # A completed result survives a late interrupt. The caller retains workspace ownership;
+    # run_job removes a fully released workspace immediately, or a retained workspace at worker exit.
 @ray.remote(max_retries=0, max_calls=1)
-def run_job(payload: bytes) -> bytes: ...            # materialize, command(), Popen in the worker's group, poll, collect; → ToolOutput JSON
-def find_task(task_name: str) -> TaskInfo | None: ...    # ray.util.state
-def worker_dead(task_name: str) -> bool | None: ...
+def run_job(payload: bytes) -> bytes: ...
+    # Frame(ToolOutput JSON, newly-created blobs, registered FrameDiagnostic entries); incremental output
+    # cap refusal returns ERROR/no blobs. Input edits are restored before command and both collect paths.
+    # Partial data after publication abandonment has no file/log/report refs and starts no later uploads.
+# ray/_state.py
+PENDING_STATES: Final[frozenset[str]]  # pending, submitted and getting/pinning-args states
+TERMINAL_STATES: Final[frozenset[str]] # FINISHED, FAILED; no CANCELLED state
+class TaskInfo(FrozenModel):
+    job_id: str
+    task_id: str
+    attempt_number: int              # nonnegative, never inferred from row order
+    name: str
+    state: str
+    worker_id: str | None
+    node_id: str | None
+def find_task(task_name: str, *, dashboard_url: str | None = None,
+              expected_job_id: str | None = None, deadline: float | None = None,
+              expected: TaskInfo | None = None) -> TaskInfo | None: ...
+def worker_dead(task_name: str, *, dashboard_url: str | None = None,
+                expected_job_id: str | None = None, deadline: float | None = None,
+                expected: TaskInfo | None = None) -> bool | None: ...
+    # Task 7 stores dashboard_url from its ray.init RayContext and passes it on every lookup.
+    # Tasks 7/8 record the dispatching driver job_id with intent; recovery passes it as expected_job_id.
+    # No dashboard means unknown: recovery confirmation needs the dashboard/State API.
+    # Blocking read-only urllib GETs; deadline is absolute time.monotonic(), default now + 5 s.
+    # One caller deadline bounds the whole join. Each HTTP exchange is capped at 5 s with
+    # shrinking connect/read timeouts, a 1 MiB response cap, no redirects/proxies/retry sleeps,
+    # no SDK address discovery, no environment/local-cluster fallback or internal-KV changes.
+    # Timed-out sockets are closed. OS DNS may linger in a daemon but cannot start later I/O.
+    # Exact-name/job, single-attempt JSON normalization; missing/malformed/truncated/partial,
+    # ambiguous/stale/unavailable/timed-out evidence -> None. SDK-compatible limit=2/detail filters.
+    # expected pins job/task/attempt and known worker/node; state cannot regress.
+    # Nonterminal without worker -> False; known worker must be read: live -> False, dead/missing -> None.
+    # Terminal + matched live worker -> False; matched dead worker + fresh matching terminal -> True.
+    # Missing worker/node never proves never-started work. Names must be unique per dispatch.
+    # Tasks 8/16: dropped status events invalidate evidence. A job filter scopes the drop count;
+    # without it, unrelated job drops can prevent confirmation forever. Preserve unknown and
+    # orphan/reservation handling; never convert missing/degraded evidence into death permission.
+    # Async callers still use run_sync_daemon under their lifecycle supervision; an abandoned
+    # result never authorizes action. Polling and cancellation remain caller responsibilities.
+def driver_entrypoint(files: Sequence[str]) -> str: ...  # ray/_submit.py; shlex.join of swarm-arena run --yes -- and files
+def submit_runtime_env(*, working_dir: str | None, pip: Sequence[str]) -> dict[str, Any] | None: ...
+    # ray/_submit.py; only nonempty working_dir/pip, never env_vars; None when both are empty
 def submit_driver(address: str | None, entrypoint: str, *, runtime_env: Mapping[str, Any] | None) -> str: ...
-    # address None → Ray reads RAY_ADDRESS, as `swarm-arena submit` does without --address
+    # ray/_submit.py; JobSubmissionClient(address).submit_job with client-generated swarm-arena-<uuid4 hex> id
+    # address None → Ray's RAY_API_SERVER_ADDRESS/RAY_ADDRESS fallback; explicit conflicts are refused
+    # one abandonable 300-second wait covers construction and submission; timeout/interrupt reports id + status command
 ```
 
 #### R4.13.17 LLM internals — M3
@@ -2636,6 +2920,8 @@ M3 metering and control bridge extension:
   the actual writer cause. The core never imports the optional SDK.
 
 #### R4.13.18 CLI — M1a (root) and later
+
+[plan] Run-state commands (`status`, `stop`, `resume`, `reconcile`) take `RUN_DIR` (`<run_root>/<run-id>`) and, with no `--config`, use the run's own `run.toml`. Arena commands (M2: `review`, `leaderboard`, `board`, `learnings`, `trace`) take a run id or a namespace plus `--config PATH` (default `./run.toml`).
 
 ```python
 def main(argv: Sequence[str] | None = None) -> int: ...   # _cli/main.py; argparse [plan]; exit codes 0 ok, 1 error, 2 usage
@@ -2805,7 +3091,7 @@ attributes and keeps the original base_dir. A standalone `run_started` sets
 
 At startup, `run_config` precedes `run_started` so ledger replay initializes from the original limits. Both, all final slices, and every goal's r0/`goal_queued` are committed before any goal starts.
 
-`EventType` [plan]: `run_started` (payload: the worst-case estimate and its warnings, §5 step 2, `manifest`, and `final_slices`, goal → `Amount`), `run_config`, `limits_changed` (`Ledger.replay` applies it at its position), `takeover`, `stop_requested`, `goal_queued`, `goal_started` (payload `pool`: an `Amount` dump, only when resume re-opens a continued goal), `goal_finished` (payload `reason`; `stop`, `stop --now`, `run_timeout_s`, `run budget`, `goal budget`, and `reserve_exhausted` mean stopped, R4.13.4), `plan_revision` (payload: plan, origin, planner call ids from `LLMScope.call_ids`, `first_round`, optional `join_retry`, and `base_dir` for r0; from M3, r0 also holds `planning_session` and that session's `planner_call_ids`, R4.1; `RunRunner` journals every goal's r0 at run start, queued goals included), `plan_rejected` (a revision admission rejection or failed planner proposal; failed calls carry only `planner error: <Type>` and create no revision; payload `{"errors": [...], "origin": ..., "first_round": ...}`, optional `join_retry`), `frontier`, `round_started`, `agent_status`, `agent_counters` (ordinary; payload `{turns, board_reads}`), `notes_saved`, `reserve`, `settle`, `tool_dispatch` (Ray intent, M4), `tool_start`, `tool_end` (payload: candidate, repeat_key, a2a, fingerprint: str | null; the producing effective tool computes the fingerprint, hook failures record only their type in candidate warnings and null; unusable error/lost outputs use null; null is always distinct), `command_start` (payload `{job_id, started, candidate_id, component}`), `command_end` (payload `{job_id, status}`), `run_lost`, `score`, `judge_error`, `learning`, `decision`, `no_result`, `part_kept`, `join_failed`, `reserve_exhausted`, `provider_failed` (M3), `watchdog`, `round_closed`, `converge_started` (payload `select_only`, optional `reason`: the pending lifecycle termination reason, retained through takeover; absent/null means a natural end), `final_order` (payload `candidate_ids`, `parts`, optional `reason`: the termination reason at committed selection, used by finish-only recovery; absent/null means a natural end), `solution_written`, `llm_call` (M3), `gateway_key` (M4), `reconcile` (M4), `curated` (M2), `review_imported` (M2). Write-through types: `reserve`, `settle`, `tool_dispatch`, `tool_start`, `tool_end`, `command_start`, `frontier`, `round_closed`.
+`EventType` [plan]: `run_started` (payload: the worst-case estimate and its warnings, §5 step 2, `manifest`, and `final_slices`, goal → `Amount`), `run_config`, `limits_changed` (`Ledger.replay` applies it at its position), `takeover`, `stop_requested`, `goal_queued`, `goal_started` (payload `pool`: an `Amount` dump, only when resume re-opens a continued goal), `goal_finished` (payload `reason`; `stop`, `stop --now`, `run_timeout_s`, `run budget`, `goal budget`, and `reserve_exhausted` mean stopped, R4.13.4), `plan_revision` (payload: plan, origin, planner call ids from `LLMScope.call_ids`, `first_round`, optional `join_retry`, and `base_dir` for r0; from M3, r0 also holds `planning_session` and that session's `planner_call_ids`, R4.1; `RunRunner` journals every goal's r0 at run start, queued goals included), `plan_rejected` (a revision admission rejection or failed planner proposal; failed calls carry only `planner error: <Type>` and create no revision; payload `{"errors": [...], "origin": ..., "first_round": ...}`, optional `join_retry`), `frontier`, `round_started`, `agent_status`, `agent_counters` (ordinary; payload `{turns, board_reads}`), `notes_saved`, `reserve`, `settle`, `tool_dispatch` (durable Ray intent before submission; payload `{candidate_id, reservation_id, started}`, where the `Job.Started` dump has `kind="dispatch"`, `job_id`, `task_name`, and the dispatching driver's `ray_job_id`; replay retains it until `tool_end` or `run_lost`), `tool_start`, `tool_end` (payload: candidate, repeat_key, a2a, fingerprint: str | null; the producing effective tool computes the fingerprint, hook failures record only their type in candidate warnings and null; unusable error/lost outputs use null; null is always distinct), `command_start` (payload `{job_id, started, candidate_id, component}`), `command_end` (payload `{job_id, status}`), `run_lost` (payload `{candidate_id, reservation_id}`; dispatch losses also carry `kind="dispatch"`, `task_name`, `confirmed_dead`, the affirmative result of one bounded orphan call; unknown or timeout is false and the reservation remains charged), `score`, `judge_error`, `learning`, `decision`, `no_result`, `part_kept`, `join_failed`, `reserve_exhausted`, `provider_failed` (M3), `watchdog`, `round_closed`, `converge_started` (payload `select_only`, optional `reason`: the pending lifecycle termination reason, retained through takeover; absent/null means a natural end), `final_order` (payload `candidate_ids`, `parts`, optional `reason`: the termination reason at committed selection, used by finish-only recovery; absent/null means a natural end), `solution_written`, `llm_call` (M3), `gateway_key` (M4), `reconcile` (M4), `curated` (M2), `review_imported` (M2). Write-through types: `reserve`, `settle`, `tool_dispatch`, `tool_start`, `tool_end`, `command_start`, `frontier`, `round_closed`.
 
 M2 payloads remain plain dictionaries at journal v1. Engine-run events may also
 carry `run_elapsed_s`; standalone human review does not start an engine clock.
@@ -2823,7 +3109,7 @@ The current committed producer keys used by M2 readers are:
 
 ### R4.15 Stored formats and `schema_version`
 
-All start at `schema_version = 1`: journal `Event` and the segment link line, `OwnerDoc`, `RunConfig` (`run.toml`), `Plan` (`plan.rN.toml`), `manifest.json`, `solution.json`, `Candidate`, `Learning`, `LLMCall`, `Frontier`, `Job.Started`, `RunPointer`, `HumanObject`, `swarm/request.json` [plan], `candidate/request.json` and `candidate/output.json` [plan]. User-written `swarm/result.json` and `swarm/llm_calls.jsonl` may omit it (default 1). Older versions load through `_model/migrate.py`; newer versions fail with a clear `ValueError`.
+All start at `schema_version = 1`: journal `Event` and the segment link line, `OwnerDoc`, `RunConfig` (`run.toml`), `Plan` (`plan.rN.toml`), `manifest.json`, `solution.json`, `Candidate`, `Learning`, `LLMCall`, `Frontier`, `Job.Started`, `RunPointer`, `HumanObject`, `swarm/request.json` [plan], `candidate/request.json` and `candidate/output.json` [plan]. User-written `swarm/result.json` and `swarm/llm_calls.jsonl` may omit it (default 1). +M4: each report row is the private `LLMCallRow(StoredModel)`, registered as `llm_call_row: 1`, with unknown fields ignored; finite JSON payloads, nonnegative usage/cost/latency, and newer-version refusal before recording. Older versions load through `_model/migrate.py`; newer versions fail with a clear `ValueError`.
 
 `solution.json` is the canonical JSON serialization of the private
 `_engine.solution.SolutionDocument(StoredModel)`, kind `solution`, with a validated
@@ -2948,7 +3234,7 @@ Other fixed values: `Learning.title` ≤ 120 characters, `Learning.text` ≤ 1,5
 1. Public modules are pure facades; all code is in private modules (R0). Errors visible to users are `ValueError` or `RuntimeError` subclasses, so §9's lists stay exact (R4.0).
 2. `Store` is a sync ABC with conditional `create` and `replace` only and no unconditional put; async callers use `anyio.to_thread` (R4.13.2). The `Board` ABC is sync too.
 3. The core journals every item, then calls `Board.put_*(item, *, epoch, seq)` with the event's position; `put_*` only indexes, and `ArenaBoard` needs no journal handle (R4.6). **Deviation from §4.9 and §7.2** ("`ArenaBoard.put_*` appends to the run's own journal"): the same events go to the same journal, but the core appends them, not the board. Snapshot membership follows R4.6: `RunBoard` filters by position and is rebuilt from `RunState` on resume; `ArenaBoard` indexes its own run from committed chain segments only.
-4. New fields: `Candidate.part`, `Candidate.warnings`, `Candidate.tool_identity`, `Score.value`, `ToolRequest.round`, `ToolOutput.failed_provider`, `Job.secret_values`, `LLMCall.litellm_call_id`, `Limits.max_notes_bytes`, `OwnerDoc.version`, and in M4 `ToolOutput.llm_calls_file` and `Job.drop_env` (R4.2, R4.7). New read-only properties (M3): `Plan.planning_session`, `Plan.planner_call_ids` (R4.1). New parameters: `Swarm.run(..., approve=...)`, `make_candidate(..., tool=...)`, `CheckContext(..., on_started=...)` and `JudgeContext(..., on_started=...)` (R4.3), and in M3 `check_judge(..., config=...)` (R4.12). Changed type: `RunConfig.cache` is `CachePolicy | None` (§4.2: `CachePolicy`), `None` meaning no response cache. New optional methods: `Tool.get_input_model`, `Tool.get_description`, `Judge.rubric_hash`/`panel_hash`/`anchor_count`/`providers`/`models`, `Manager.models`, `Planner.models`, `Planner.origin`, `Board.open`/`close`/`scores`, `Executor.confirm_dead`/`kill_orphan`.
+4. New fields: `Candidate.part`, `Candidate.warnings`, `Candidate.tool_identity`, `Score.value`, `ToolRequest.round`, `ToolOutput.failed_provider`, `Job.secret_values`, `LLMCall.litellm_call_id`, `Limits.max_notes_bytes`, `OwnerDoc.version`, and in M4 `ToolOutput.llm_calls_file` (optional report transport with real digest/size and bounded collection, +M4), `Job.drop_env` (executor-side provider-name exclusion before driver overlays, preserved by Ray transport; R4.2, R4.7) and `Job.Started.ray_job_id` (recovery binds task and worker evidence to the original driver's Ray job id; §4.8, §6.5, R4.7). New read-only properties (M3): `Plan.planning_session`, `Plan.planner_call_ids` (R4.1). New parameters: `Swarm.run(..., approve=...)`, `make_candidate(..., tool=...)`, `CheckContext(..., on_started=...)` and `JudgeContext(..., on_started=...)` (R4.3), and in M3 `check_judge(..., config=...)` (R4.12). Changed type: `RunConfig.cache` is `CachePolicy | None` (§4.2: `CachePolicy`), `None` meaning no response cache. New optional methods: `Tool.get_input_model`, `Tool.get_description`, `Judge.rubric_hash`/`panel_hash`/`anchor_count`/`providers`/`models`, `Manager.models`, `Planner.models`, `Planner.origin`, `Board.open`/`close`/`scores`, `Executor.confirm_dead`/`kill_orphan`.
 5. Built-in LLM accounting reaches LLM code through an `LLMScope` context variable (R4.13.7), so `Planner.plan` and `Curator.curate` keep the spec's signatures.
 6. `FakeModel` is an Agents SDK `Model` that feeds the same core `record_call` (`_journal/llm_record.py`, R4.13.19) as the LiteLLM logger, the gateway read-back, and `llm_calls.jsonl` collection (R4.12).
 7. JSON-schema subset compiler instead of a `jsonschema` dependency; a deterministic TOML writer instead of `tomli-w` (R4.13.0).
@@ -2962,7 +3248,7 @@ Other fixed values: `Learning.title` ≤ 120 characters, `Learning.text` ≤ 1,5
 15. **Part-goal files of non-human revisions [plan]:** they resolve against the main goal's snapshotted manifest, never from disk (R4.1, R4.13.12 `admit_revision`).
 16. **Judge reservations [plan]:** `Amount()` for `ProgramJudge`, for LLM judges (non-empty `models()`; their calls reserve through the `<goal>/:judges` or `<goal>/:final` tranche), and for judges without `providers()`; `n × default_run_reservation`, settled `estimated`, for judges with `providers()`. `judge_amount` (R4.13.6) holds the rule, and its `llm=True` form prices LLM judges for estimates and final slices.
 17. **Deviation from §4.9** ("the run's current `rubric_hash` and `panel_hash`"): with no score of its own yet, a run's `best`/`leaderboard` judge identity is the newest identity for that judge name in the namespace, because `ArenaBoard` sees identities only through scores (M2).
-18. **Deviation from §7.3 item 2a step 1 (gateway keying) [plan, M4]:** keying uses only the allowlist that the driver can read before dispatch (a `ScriptTool` `Config.env`). A `Command.env` allowlist that `Tool.command()` builds on the executor does not count, and with a gateway such a tool never gets `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. A tool that calls an LLM declares `providers()`. Reason: `command()` runs on the executor with the workspace.
+18. **Deviation from §7.3 item 2a step 1 (gateway keying) [plan, M4]:** keying uses the shared `effective_secret_env` traversal of validated effective configuration (+M4), including `ScriptTool` and `FunctionTool` env allowlists, nested typed defaults/aliases and driver-known `Command.env`. A `Command.env` allowlist that `Tool.command()` builds on the executor does not count, and with a gateway such a tool never gets `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. A tool that calls an LLM declares `providers()`. Reason: `command()` runs on the executor with the workspace.
 
 19. **Deviation from §4.2 (A2A parent links):** `Task` has no `reference_task_ids` field in A2A v1.0.1. A tool-run task records its parent candidate ids on one request `Message.reference_task_ids` in `Task.history`. Tool-run and agent-round records take an explicit aware `at` timestamp from the output or event; their JSON uses proto camelCase field names and UTC millisecond timestamps.
 

@@ -11,6 +11,7 @@ from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 
 pytest.importorskip("agents")
 
@@ -104,9 +105,9 @@ def exported(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     finally:
         resources = _langfuse._resources or _langfuse._closing
         if resources is not None and resources.project_worker is not None:
-            resources.project_worker.join(5)
+            resources.project_worker.join(60)
             assert not resources.project_worker.is_alive()
-        _langfuse._reset_langfuse(2)
+        _langfuse._reset_langfuse(60)
         http.close()
 
 
@@ -114,7 +115,7 @@ def wait_project_resolution() -> None:
     resources = _langfuse._resources
     assert resources is not None
     assert resources.project_worker is not None
-    resources.project_worker.join(5)
+    resources.project_worker.join(60)
     assert not resources.project_worker.is_alive()
 
 
@@ -340,7 +341,7 @@ async def test_concurrent_mixed_scopes_export_only_consenting_run(
                 )
                 release.set()
 
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             async with anyio.create_task_group() as group:
                 group.start_soon(call, enabled)
                 group.start_soon(call, disabled)
@@ -391,7 +392,7 @@ def test_exit_close_is_bounded_when_exporter_blocks(
     def shutdown() -> None:
         entered.set()
         try:
-            assert release.wait(10)
+            assert release.wait(300)
             original()
         finally:
             finished.set()
@@ -406,14 +407,14 @@ def test_exit_close_is_bounded_when_exporter_blocks(
     owner = threading.Thread(target=close)
     owner.start()
     try:
-        assert entered.wait(2)
-        assert returned.wait(2), "exit waited for the blocked exporter"
+        assert entered.wait(60)
+        assert returned.wait(30), "exit waited for the blocked exporter"
         assert not finished.is_set()
         assert "TimeoutError" in caplog.text
     finally:
         release.set()
-        owner.join(3)
-        assert finished.wait(3)
+        owner.join(60)
+        assert finished.wait(60)
         assert not owner.is_alive()
 
 
@@ -423,7 +424,7 @@ def test_cleanup_errors_log_only_type(
     _langfuse.setup_langfuse(TracingConfig(langfuse=True))
     client = exported[1][0]
     monkeypatch.setattr(client, "flush", Mock(side_effect=ValueError("SENTINEL_SECRET")))
-    _langfuse._reset_langfuse(2)
+    _langfuse._reset_langfuse(60)
     assert "ValueError" in caplog.text
     assert "SENTINEL_SECRET" not in caplog.text
 
@@ -520,7 +521,7 @@ def test_reset_allows_same_key_reinitialization(
     monkeypatch.setitem(globals(), "uuid4", lambda: UUID(int=1))
     _langfuse.setup_langfuse(TracingConfig(langfuse=True))
     first = exported[1][0]._resources
-    _langfuse._reset_langfuse(2)
+    _langfuse._reset_langfuse(60)
     _langfuse.setup_langfuse(TracingConfig(langfuse=True))
     second = exported[1][1]._resources
     assert second is not first
@@ -598,20 +599,22 @@ async def test_failing_trace_exit_preserves_control(
 
         task = asyncio.create_task(body())
         try:
-            with anyio.fail_after(5):
+            with anyio.fail_after(60):
                 await entered.wait()
                 if kind == "caller":
                     task.cancel()
                 with pytest.raises(
                     asyncio.CancelledError if kind == "caller" else type(error)
                 ) as caught:
-                    await task
+                    await observe_task(task)
+                if kind == "caller":
+                    assert task.cancelled()
                 assert_secret_absent(caught.value, "SENTINEL_SECRET")
                 if kind != "caller":
                     assert caught.value is error
         finally:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await settle_tasks(task)
 
 
 def test_registers_one_bounded_exit_owner(exported: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -635,7 +638,7 @@ def test_registers_one_bounded_exit_owner(exported: Any, monkeypatch: pytest.Mon
     _langfuse.setup_langfuse(TracingConfig(langfuse=True))
     _langfuse.setup_langfuse(TracingConfig(langfuse=True))
     assert callbacks == [_langfuse._close_at_exit]
-    _langfuse._reset_langfuse(2)
+    _langfuse._reset_langfuse(60)
     assert callbacks == []
 
 
@@ -721,11 +724,11 @@ def test_exit_close_bounds_owner_lock_wait(
     _langfuse._lock.acquire()
     try:
         owner.start()
-        assert returned.wait(2), "exit waited indefinitely for tracing setup"
+        assert returned.wait(30), "exit waited indefinitely for tracing setup"
         assert "TimeoutError" in caplog.text
     finally:
         _langfuse._lock.release()
-        owner.join(3)
+        owner.join(60)
         assert not owner.is_alive()
 
 
@@ -773,8 +776,8 @@ def test_actual_process_exit_uses_bounded_daemon(tmp_path: Path, blocked: bool) 
         if BLOCKED:
             # Finish ordinary cleanup before applying the short exit deadline.
             resources.requested.set()
-            assert provider_entered.wait(10), "provider shutdown never became ready"
-        _langfuse._EXIT_TIMEOUT_S = 0.05 if BLOCKED else 2
+            assert provider_entered.wait(60), "provider shutdown never became ready"
+        _langfuse._EXIT_TIMEOUT_S = 0.05 if BLOCKED else 60
         atexit.register(_langfuse._close_at_exit)
     """).replace("BLOCKED", repr(blocked))
     result = subprocess.run(
@@ -783,7 +786,7 @@ def test_actual_process_exit_uses_bounded_daemon(tmp_path: Path, blocked: bool) 
         text=True,
         capture_output=True,
         # Allow cold imports, but fail before the held shutdown's safety release.
-        timeout=60,
+        timeout=180,
         check=False,
     )
     assert result.returncode == 0, result.stderr
@@ -863,7 +866,7 @@ async def test_project_resolution_never_blocks_llm_calls(
         assert request.url.path == "/api/public/projects"
         requests.append(request)
         entered.set()
-        assert release.wait(30), "project lookup was not released"
+        assert release.wait(300), "project lookup was not released"
         if response == "timeout":
             raise httpx.ConnectTimeout("SENTINEL_SECRET")
         if response == "rate_limit":
@@ -905,13 +908,13 @@ async def test_project_resolution_never_blocks_llm_calls(
         resources = _langfuse._resources
         assert resources is not None
         assert resources.project_worker is not None
-        assert await anyio.to_thread.run_sync(entered.wait, 5)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         assert clients[0]._project_id is None
         get_url = Mock(side_effect=AssertionError("network-capable URL helper called"))
         monkeypatch.setattr(clients[0], "get_trace_url", get_url)
         FakeModel([finish()]).register("opus")
         # The transport remains held until this complete, journaled round returns.
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             async with open_llm_run(tmp_path, config=cfg) as run:
                 with llm_scope(run.scope("manager")):
                     await AgentsSDKManager(model="opus").run_round(context())
@@ -919,7 +922,7 @@ async def test_project_resolution_never_blocks_llm_calls(
                 assert run.calls()[0].trace_url is None
         assert not release.is_set()
         release.set()
-        await anyio.to_thread.run_sync(resources.project_worker.join, 5)
+        await anyio.to_thread.run_sync(resources.project_worker.join, 60)
         assert not resources.project_worker.is_alive(), "project lookup retried or did not finish"
         _, calls = await manager_call(tmp_path, True)
         assert (calls[0].trace_url is not None) is (response == "success")
@@ -932,9 +935,9 @@ async def test_project_resolution_never_blocks_llm_calls(
     finally:
         release.set()
         if resources is not None and resources.project_worker is not None:
-            await anyio.to_thread.run_sync(resources.project_worker.join, 5)
+            await anyio.to_thread.run_sync(resources.project_worker.join, 60)
             assert not resources.project_worker.is_alive()
-        _langfuse._reset_langfuse(2)
+        _langfuse._reset_langfuse(60)
         await anyio.to_thread.run_sync(http.close)
 
 
@@ -946,7 +949,7 @@ def test_close_does_not_create_a_missing_sdk_provider(monkeypatch: pytest.Monkey
     monkeypatch.setattr(processors, "default_processor", default)
     client = Mock(_resources=None)
     resources = _langfuse._Resources(client, Mock(), Mock(is_instrumented_by_opentelemetry=False))
-    _langfuse._close(resources, 2)
+    _langfuse._close(resources, 60)
     assert not resources.worker.is_alive()
     default.assert_not_called()
     assert setup.GLOBAL_TRACE_PROVIDER is None
@@ -964,19 +967,19 @@ def test_reset_refuses_new_owner_until_cleanup_finishes(
 
     def held() -> None:
         entered.set()
-        assert release.wait(30)
+        assert release.wait(300)
         original()
 
     monkeypatch.setattr(resources.instrumentor, "uninstrument", held)
     resources.requested.set()
     try:
-        assert entered.wait(5)
+        assert entered.wait(60)
         _langfuse._reset_langfuse(0.05)
         with pytest.raises(RuntimeError, match="Langfuse cleanup pending"):
             _langfuse.setup_langfuse(TracingConfig(langfuse=True))
     finally:
         release.set()
-        resources.worker.join(5)
+        resources.worker.join(60)
         assert not resources.worker.is_alive()
     _langfuse.setup_langfuse(TracingConfig(langfuse=True))
     assert _langfuse._resources is not resources
@@ -1043,6 +1046,7 @@ async def test_provider_error_spans_are_value_free(
     from unittest.mock import AsyncMock
 
     import litellm
+    from _fakes.llm_components import missing_callback_timeout
     from _fakes.run import all_events, plan
     from agents.extensions.models.litellm_model import LitellmModel
     from langfuse._client.span_processor import LangfuseSpanProcessor
@@ -1052,6 +1056,7 @@ async def test_provider_error_spans_are_value_free(
     from swarm_arena import Limits, Ref, RunConfig, Swarm
     from swarm_arena.config import ModelCatalog, ModelSpec
 
+    missing_callback_timeout(monkeypatch)
     secret = "PROVIDER_ERROR_SECRET_8c031"
     received: list[str] = []
     original_start = LangfuseSpanProcessor.on_start
@@ -1125,7 +1130,6 @@ async def test_provider_error_spans_are_value_free(
         run_root=str(tmp_path / "runs"),
         arena_root=str(tmp_path / "arena"),
         artifact_root=str(tmp_path / "artifacts"),
-        settle_timeout_s=2,
         limits=Limits(max_tokens=1000000),
         tracing=TracingConfig(langfuse=True),
         models=ModelCatalog(

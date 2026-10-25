@@ -276,7 +276,7 @@ def test_two_caches_share_one_file_concurrently(tmp_path: Path) -> None:
     path = tmp_path / "fresh" / "toy.sqlite"
 
     def worker(reverse: bool) -> None:
-        barrier.wait(timeout=10)
+        barrier.wait(timeout=60)
         cache = ArenaCache(path)
         try:
             for run in runs[::-1] if reverse else runs:
@@ -514,7 +514,7 @@ def test_one_cache_serializes_whole_transactions(tmp_path: Path) -> None:
 
     def index(event: JournalEvent, state: RunState, pending: list[str]) -> None:
         entered.set()
-        assert release.wait(timeout=5)
+        assert release.wait(timeout=300)
         original(event, state, pending)
 
     def read() -> list[str]:
@@ -525,14 +525,14 @@ def test_one_cache_serializes_whole_transactions(tmp_path: Path) -> None:
         patch.setattr(cache, "_index", index)
         writer = pool.submit(ingest_run, cache, run.store, "r1", run.run_root, head)
         try:
-            assert entered.wait(timeout=5)
+            assert entered.wait(timeout=60)
             reader = pool.submit(read)
-            assert reader_started.wait(timeout=5)
+            assert reader_started.wait(timeout=60)
             assert not reader.done()
         finally:
             release.set()
-        assert writer.result(timeout=5) == 2
-        assert reader.result(timeout=5) == ["c"]
+        assert writer.result(timeout=60) == 2
+        assert reader.result(timeout=60) == ["c"]
     cache.close()
 
 
@@ -1209,14 +1209,14 @@ def test_human_objects_concurrent_connections_apply_each_line_once(tmp_path: Pat
     ]
 
     def apply(cache: ArenaCache) -> None:
-        barrier.wait(timeout=5)
+        barrier.wait(timeout=60)
         cache.apply_human_objects([PIN_NAME] * len(operations), operations)
 
     try:
         with ThreadPoolExecutor(2) as pool:
             futures = [pool.submit(apply, cache) for cache in caches]
             for future in futures:
-                future.result(timeout=10)
+                future.result(timeout=60)
         assert caches[0].flags(build_frontier([], [], [PIN_NAME])) == {learning.id: (False, True)}
         assert caches[0]._conn.execute("SELECT count(*) FROM curation_ops").fetchone() == (2,)
         assert caches[0]._conn.execute("SELECT count(*) FROM learning_tags").fetchone() == (1,)
@@ -1845,7 +1845,7 @@ def test_one_cache_shared_by_threads(tmp_path: Path) -> None:
     done = [ThreadEvent(), ThreadEvent()]
 
     def write(run: FakeRun, finished: ThreadEvent) -> None:
-        barrier.wait(timeout=10)
+        barrier.wait(timeout=60)
         for i in range(20):
             drafts = [run.candidate(f"c-{run.run_id}-{i}-{j}") for j in range(10)]
             drafts.append(
@@ -1860,8 +1860,8 @@ def test_one_cache_shared_by_threads(tmp_path: Path) -> None:
         finished.set()
 
     def read() -> None:
-        barrier.wait(timeout=10)
-        deadline = monotonic() + 30
+        barrier.wait(timeout=60)
+        deadline = monotonic() + 60
         while not all(finished.is_set() for finished in done):
             assert monotonic() < deadline
             assert len(cache.candidates(fixed)) == 2
@@ -2613,5 +2613,32 @@ def test_cache_has_no_unused_projection_or_legacy_read_methods(tmp_path: Path) -
                 "run_root",
             )
         )
+    finally:
+        cache.close()
+
+
+def test_committed_gateway_projection_is_detached(tmp_path: Path) -> None:
+    from _fakes.gateway_events import gateway_key, reconcile
+    from _fakes.journals import FakeRun
+
+    from swarm_arena._board.ingest import ingest_run
+    from swarm_arena._model.board_types import Frontier
+
+    run = FakeRun(str(tmp_path / "runs"), "r1")
+    head = run.commit(run.plan(), gateway_key(), reconcile())
+    cache = ArenaCache(tmp_path / "gateway.sqlite")
+    try:
+        ingest_run(cache, run.store, "r1", run.run_root, head)
+        mark = Frontier.Mark(run_id="r1", run_root=run.run_root, **head.model_dump())
+        old = cache._committed_state(mark)
+        head2 = run.commit(reconcile(observed=0.25, label="observed"))
+        ingest_run(cache, run.store, "r1", run.run_root, head2)
+        new = cache._committed_state(mark.model_copy(update=head2.model_dump()))
+        key = ("c-1", "hash-1")
+        assert old.gateway_reconcile[key].observed_usd is None
+        assert new.gateway_reconcile[key].observed_usd == 0.25
+        new.gateway_keys.clear()
+        assert old.gateway_keys[key].cap == "soft"
+        assert cache._committed_state(mark).gateway_reconcile[key].observed_usd is None
     finally:
         cache.close()

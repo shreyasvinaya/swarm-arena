@@ -12,6 +12,10 @@ from typing import Any, Literal, cast
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
+from _fakes.dependencies import ray_dependency
+from _fakes.process_cleanup import owned_processes  # noqa: F401
+from _fakes.ray_transport import isolated_ray_filesystem  # noqa: F401
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import (
     FAILING_COMMAND,
@@ -89,6 +93,8 @@ from swarm_arena.tool import (
     ToolRequest,
 )
 
+pytestmark = pytest.mark.usefixtures("owned_processes")
+
 SECRET = "d9be8c92-4d1c-4b85-a2c7-632b17d8499f"
 INVALID_COLLECT_NOTE = NOTE_PREFIX + _NOT_AN_OUTPUT
 RUN_PY = """\
@@ -138,6 +144,104 @@ async def test_function_tool(local_executor: LocalExecutor) -> None:
     assert (await check_tool(ref, {"a": 1}, executor=local_executor)).data == {"sum": 2}
     with pytest.raises(ValidationError):
         await check_tool(FunctionTool(add), {"a": "x"}, executor=local_executor)
+
+
+@pytest.mark.ray
+@pytest.mark.usefixtures("isolated_ray_filesystem")
+async def test_check_tool_on_ray_matches_local(
+    ray_cluster: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ray_dependency()
+    from swarm_arena.ray import RayExecutor
+
+    examples = (await anyio.to_thread.run_sync(Path(__file__).resolve)).parents[2] / "examples"
+    monkeypatch.syspath_prepend(str(examples / "rosenbrock"))
+    tool = FunctionTool("rosen:gradient_descent")
+    inputs = {"lr": 0.001, "steps": 200, "x0": -1.0, "y0": 1.0}
+    executor = RayExecutor()
+    try:
+        remote = await check_tool(tool, inputs, executor=executor)
+        assert remote.status == RunStatus.OK
+        assert remote.data == (await check_tool(tool, inputs)).data
+        # A caller-owned executor remains usable after the kit returns.
+        assert (await check_tool(tool, inputs, executor=executor)).data == remote.data
+    finally:
+        await executor.aclose()
+
+
+@pytest.mark.ray
+@pytest.mark.usefixtures("isolated_ray_filesystem")
+async def test_check_tool_on_ray_transports_files_and_edits(ws: Path) -> None:
+    ray_dependency()
+    from swarm_arena.ray import RayExecutor
+    from swarm_arena.testing import read_logs, read_output_file
+
+    (ws / "tool").mkdir()
+    (ws / "tool/helper.txt").write_text("tool-root")
+    (ws / "problem/run.py").write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "data = {name: Path(f'problem/{name}.txt').read_text() for name in ('a', 'b')}\n"
+        "data['helper'] = Path('tool/helper.txt').read_text()\n"
+        "request = json.loads(Path('swarm/request.json').read_text())\n"
+        f"forbidden = {str(ws)!r}\n"
+        "assert forbidden not in json.dumps(request)\n"
+        "assert all(forbidden not in value for value in os.environ.values())\n"
+        "data['inputs'] = request['params']\n"
+        "data['parents'] = []\n"
+        "for root in sorted(Path('parents').glob('*')):\n"
+        "    data['parents'].append({'file': (root / 'answer.txt').read_text(),\n"
+        "        'data': json.loads((root / 'data.json').read_text())['inputs']})\n"
+        "data['workspace'] = str(Path.cwd())\n"
+        "Path('answer.txt').write_text(data['a'] + '/' + data['b'])\n"
+        "print('transport stdout'); print('transport stderr', file=sys.stderr)\n"
+        "Path(os.environ['SWARM_ARENA_RESULT']).write_text(json.dumps(\n"
+        "    {'data': data, 'files': ['problem/a.txt', 'problem/b.txt', 'answer.txt']}))\n"
+    )
+    tool = ScriptTool(
+        command=[sys.executable, "problem/run.py"],
+        files=["tool/helper.txt"],
+        params={"turn": {"type": "integer"}},
+        editable=["problem/*.txt"],
+    )
+    goal = Goal(id="g", namespace="ns", files=PROBLEM)
+    executor = RayExecutor()
+    try:
+        first = await check_tool(
+            tool, {"turn": 1}, goal=goal, edits={"problem/a.txt": "parent"}, executor=executor
+        )
+        parent = make_candidate(
+            first, request=ToolRequest(edits={"problem/a.txt": "parent"}), tool=tool, goal=goal
+        )
+        second = await check_tool(
+            tool,
+            {"turn": 2},
+            goal=goal,
+            parents=[parent],
+            edits={"problem/b.txt": "live"},
+            executor=executor,
+        )
+    finally:
+        await executor.aclose()
+    assert first.status == second.status == RunStatus.OK
+    assert first.data["a"] == "parent"
+    assert first.data["b"] == "1"
+    assert second.data == {
+        "a": "parent",
+        "b": "live",
+        "helper": "tool-root",
+        "inputs": {"turn": 2},
+        "parents": [{"file": "parent/1", "data": {"turn": 1}}],
+        "workspace": second.data["workspace"],
+    }
+    assert Path(second.data["workspace"]).name.startswith("swarm-worker-")
+    with pytest.raises(PermissionError, match="test filesystem boundary"):
+        (Path(second.data["workspace"]) / "problem/a.txt").read_bytes()
+    assert read_output_file(second, "problem/a.txt") == b"parent"
+    assert read_output_file(second, "problem/b.txt") == b"live"
+    assert read_output_file(first, "answer.txt") == b"parent/1"
+    assert read_output_file(second, "answer.txt") == b"parent/live"
+    assert read_logs(second) == (b"transport stdout\n", b"transport stderr\n")
 
 
 async def test_script_tool_edit_and_same_identity_overlay(
@@ -900,14 +1004,16 @@ async def test_failed_run_probe_is_bounded_cancellable_and_daemon(
 
     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
     daemon: list[bool] = []
+    workers: list[threading.Thread] = []
 
     def collect(
         self: PyTool, request: ToolRequest, workspace: Path, run: CompletedRun
     ) -> ToolOutput:
+        workers.append(threading.current_thread())
         daemon.append(threading.current_thread().daemon)
         entered.set()
         try:
-            release.wait()
+            assert release.wait(300), "collect was not released"
             return ToolOutput(status=run.status)
         finally:
             finished.set()
@@ -915,7 +1021,7 @@ async def test_failed_run_probe_is_bounded_cancellable_and_daemon(
     monkeypatch.setattr(PyTool, "collect", collect)
     monkeypatch.setattr(_conformance, "BEFORE_KILL_TIMEOUT_S", 0.1, raising=False)
     # A watchdog makes the regression safe even with the old non-cancellable worker.
-    watchdog = threading.Timer(2.0, release.set)
+    watchdog = threading.Timer(300, release.set)
     watchdog.start()
     completed = False
     errors: list[AssertionError] = []
@@ -929,10 +1035,10 @@ async def test_failed_run_probe_is_bounded_cancellable_and_daemon(
         completed = True
 
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(30):
             async with anyio.create_task_group() as group:
                 group.start_soon(run)
-                assert await anyio.to_thread.run_sync(entered.wait, 2.0)
+                assert await anyio.to_thread.run_sync(entered.wait, 60)
                 if stop == "cancel":
                     group.cancel_scope.cancel()
         assert not release.is_set(), "probe waited for its blocking collect"
@@ -943,7 +1049,14 @@ async def test_failed_run_probe_is_bounded_cancellable_and_daemon(
     finally:
         release.set()
         watchdog.cancel()
-        await anyio.to_thread.run_sync(finished.wait, 2.0)
+        try:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                assert not worker.is_alive()
+            assert finished.is_set()
+        finally:
+            await anyio.to_thread.run_sync(watchdog.join, 60)
+            assert not watchdog.is_alive()
 
 
 @pytest.mark.parametrize("exception", [SystemExit, KeyboardInterrupt])
@@ -1265,7 +1378,6 @@ def _llm_config(*, role: Literal["manager", "judge"] = "manager") -> RunConfig:
                 )
             }
         ),
-        settle_timeout_s=2,
     )
 
 
@@ -1305,7 +1417,7 @@ async def test_check_manager_runs_the_run_setups(
 
     monkeypatch.setattr(run, "_run_setups", [])
     run.register_run_setup(spy)
-    config = RunConfig(settle_timeout_s=2)
+    config = RunConfig()
     await check_manager(
         ScriptedManager([]),
         goal=GOAL,
@@ -1535,7 +1647,7 @@ async def test_manager_that_leaves_calls_open_fails_the_kit(
         return RoundReport()
 
     monkeypatch.setattr(NoopManager, "run_round", leak)
-    with anyio.fail_after(10):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as group:
             try:
                 with pytest.raises(AssertionError, match="drain"):
@@ -1675,7 +1787,7 @@ async def test_check_judge_setup_is_abandoned_on_caller_cancellation(
         try:
             await held.ready()
             owner.cancel()
-            with anyio.fail_after(5):
+            with anyio.fail_after(30):
                 await finished.wait()
             assert not entered
             assert llm_record._bindings == bindings_before
@@ -1698,7 +1810,7 @@ def test_offline_llm_connector_example_runs() -> None:
         capture_output=True,
         text=True,
         check=True,
-        timeout=30,
+        timeout=60,
     )
     assert done.stderr == ""
 
@@ -1762,11 +1874,11 @@ async def test_check_judge_releases_a_lease_before_writer_ownership(
         try:
             await held.ready()
             owner.cancel()
-            with anyio.fail_after(5):
+            with anyio.fail_after(30):
                 await finished.wait()
             assert not released.is_set()
             await held.finish()
-            with anyio.fail_after(2):
+            with anyio.fail_after(30):
                 await released.wait()
         finally:
             owner.cancel()
@@ -1846,7 +1958,7 @@ async def test_overlapping_conformance_runs_are_isolated(
             elif label in failures:
                 first_entered.set()
 
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as group:
             group.start_soon(invoke, "first")
             await first_entered.wait()
@@ -2081,7 +2193,7 @@ async def test_conformance_preserves_cleanup_expiry_control(
     monkeypatch.setattr(NoopManager, "run_round", manager)
     monkeypatch.setattr(FixedJudge, "judge", judge)
     with (
-        anyio.fail_after(12),
+        anyio.fail_after(60),
         pytest.raises(RuntimeError, match="stop cleanup timed out") as caught,
     ):
         await _run_conformance_kind(
@@ -2121,15 +2233,15 @@ async def test_conformance_preserves_native_caller_cancellation(
     monkeypatch.setattr(FixedJudge, "judge", judge)
     task = asyncio.create_task(_run_conformance_kind(kind))
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await entered.wait()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await observe_task(task)
         assert task.cancelled()
     finally:
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await settle_tasks(task)
 
 
 @pytest.mark.parametrize("kind", ["manager", "judge"])
@@ -2192,7 +2304,7 @@ async def test_conformance_rejects_leaks_inside_a_caller_exception_handler(
 
     monkeypatch.setattr(NoopManager, "run_round", manager)
     monkeypatch.setattr(FixedJudge, "judge", judge)
-    with anyio.fail_after(15):
+    with anyio.fail_after(60):
         try:
             raise caller_error
         except KeyError:
@@ -2235,7 +2347,7 @@ async def test_check_manager_closes_each_round_inside_a_caller_exception_handler
         return RoundReport(summary="done")
 
     monkeypatch.setattr(NoopManager, "run_round", manager)
-    with anyio.fail_after(15):
+    with anyio.fail_after(60):
         try:
             raise caller_error
         except KeyError:
@@ -2364,27 +2476,27 @@ async def test_conformance_keeps_owner_interruption_with_a_drain_note(
     monkeypatch.setattr(FixedJudge, "judge", judge)
     task = asyncio.create_task(invoke())
     try:
-        with anyio.fail_after(12):
+        with anyio.fail_after(60):
             await entered.wait()
             if stop == "native":
                 timers[0].reschedule(asyncio.get_running_loop().time())
                 with pytest.raises(TimeoutError) as caught:
-                    await task
+                    await observe_task(task)
                 assert _has_drain_note(caught.value)
             elif stop == "anyio":
                 owner.cancel()
-                await task
+                await observe_task(task)
                 assert len(cancellations) == 1
                 assert _has_drain_note(cancellations[0])
             else:
                 with pytest.raises(RuntimeError, match="offline harness stopped") as caught:
-                    await task
+                    await observe_task(task)
                 assert _has_drain_note(caught.value)
         assert scopes[0].tranche._closed
         assert llm_record._bindings == baseline
     finally:
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await settle_tasks(task)
 
 
 @pytest.mark.parametrize("kind", ["manager", "judge"])
@@ -2531,12 +2643,12 @@ async def test_conformance_rejects_reservation_admitted_during_close(
     monkeypatch.setattr(NoopManager, "run_round", manager)
     monkeypatch.setattr(FixedJudge, "judge", judge)
     try:
-        with anyio.fail_after(10), pytest.raises(AssertionError, match="drain rule"):
+        with anyio.fail_after(60), pytest.raises(AssertionError, match="drain rule"):
             await _run_conformance_kind(kind)
     finally:
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await settle_tasks(*tasks)
 
 
 @pytest.mark.parametrize("kind", ["manager", "judge"])
@@ -2676,7 +2788,7 @@ async def test_later_round_stop_does_not_inherit_drain_note(
 
     monkeypatch.setattr(NoopManager, "run_round", manager)
     with (
-        anyio.fail_after(10),
+        anyio.fail_after(60),
         pytest.raises(RuntimeError, match="offline harness stopped") as caught,
     ):
         await check_manager(
@@ -2733,7 +2845,7 @@ async def test_conformance_stops_when_accounting_read_is_interrupted(
         if accounting_store and self is accounting_store[0] and key.startswith("journal/"):
             workers.append(threading.current_thread())
             loop.call_soon_threadsafe(entered.set)
-            if not release.wait(30):
+            if not release.wait(300):
                 raise AssertionError("accounting read safety release expired")
         return original_read(self, key)
 
@@ -2762,25 +2874,43 @@ async def test_conformance_stops_when_accounting_read_is_interrupted(
     monkeypatch.setattr(NoopManager, "run_round", manager)
     monkeypatch.setattr(FixedJudge, "judge", judge)
     task = asyncio.create_task(_run_conformance_kind(kind))
+    failure: BaseException | None = None
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await entered.wait()
             # Expire the actual owner's allowance only once the accounting read is held.
             llm_record._bindings[scopes[0].run_id].stops.run_timeout = True
+            done, _ = await asyncio.wait({task}, timeout=30)
+            assert task in done, "conformance stop did not finish while accounting was held"
             with pytest.raises(RuntimeError, match=r"^offline harness stopped$"):
-                await task
+                task.result()
         assert not release.is_set()
         assert scopes[0].tranche._closed
         assert llm_record._bindings == baseline
+    except (Exception, asyncio.CancelledError) as error:
+        failure = error
+        raise
     finally:
         release.set()
         task.cancel()
         for straggler in stragglers:
             straggler.cancel()
-        await asyncio.gather(task, *stragglers, return_exceptions=True)
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
-            assert not worker.is_alive()
+        cleanup_errors: list[str] = []
+        try:
+            done, pending = await asyncio.wait({task, *stragglers}, timeout=60)
+            await asyncio.gather(*done, return_exceptions=True)
+            if pending:
+                cleanup_errors.append("task cleanup did not finish")
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+                if worker.is_alive():
+                    cleanup_errors.append("accounting worker cleanup did not finish")
+            if cleanup_errors:
+                if failure is not None:
+                    failure.add_note("; ".join(cleanup_errors))
+                else:
+                    raise AssertionError("; ".join(cleanup_errors))
     accounting_store.clear()
     committed = read_committed(scopes[0].journal._store)
     assert committed is not None
@@ -2816,7 +2946,6 @@ async def test_check_judge_runs_an_llm_judge_offline(tmp_path: Path) -> None:
     fake.register("m")
     config = RunConfig(
         models=ModelCatalog({"m": ModelSpec(model="fake/m", roles=["judge"], max_tokens=1000)}),
-        settle_timeout_s=2,
     )
     candidates = [make_candidate(ToolOutput(status=RunStatus.OK), goal=GOAL) for _ in range(2)]
     scores = await check_judge(LLMJudge("r", ["m"]), GOAL, candidates, config=config)

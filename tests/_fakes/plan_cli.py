@@ -41,7 +41,6 @@ def planning_files(root: Path) -> PlanningFiles:
         run_root=str(root / "runs"),
         artifact_root=str(root / "artifacts"),
         arena_root=str(root / "arena"),
-        settle_timeout_s=2,
         limits=Limits(max_tokens=1_000_000, default_run_reservation=Estimate(tokens=0, usd=0.0)),
         models=ModelCatalog(
             {

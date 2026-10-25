@@ -6,6 +6,7 @@ from typing import ClassVar
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.run import all_events, events, plan
 from _fakes.secrecy import assert_secret_absent
 
@@ -81,12 +82,14 @@ async def test_runtime_manager_failure_is_type_only_and_peer_finishes(
         task = asyncio.create_task(swarm.run(_plan()))
         try:
             assert FailingRuntimeManager.entered is not None
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await FailingRuntimeManager.entered.wait()
         finally:
             task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            try:
+                await settle_tasks(task)
+            finally:
+                assert task.cancelled()
         assert not events(run_config, "goal_finished")
         monkeypatch.setattr(FailingRuntimeManager, "armed", True)
         HealthyManager.calls.clear()

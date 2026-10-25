@@ -7,6 +7,7 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.run import plan
 from _fakes.secrecy import assert_secret_absent
 
@@ -68,7 +69,7 @@ async def test_completion_export_observes_remaining_run_time(
         if key.startswith("review/"):
             workers.append(threading.current_thread())
             entered.set()
-            assert release.wait(30)
+            assert release.wait(180)
         return original(store, key, data)
 
     config = run_config.model_copy(update={"settle_timeout_s": 2.0})
@@ -76,19 +77,20 @@ async def test_completion_export_observes_remaining_run_time(
     monkeypatch.setattr(run_module, "anyio", Backend())
     task = asyncio.create_task(Swarm(config).run(plan(rounds=1), run_id="r"))
     try:
-        with anyio.fail_after(15):
-            assert await anyio.to_thread.run_sync(entered.wait, 12)
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
         deadline.set()
-        done, _ = await asyncio.wait([task], timeout=3)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "completion export ignored the run deadline"
     finally:
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
     assert len(workers) == 1, "abandoned export started another file"
 
@@ -113,7 +115,7 @@ async def test_driver_signal_abandons_journal_publication(
         if key.startswith("journal/") and b'"type":"goal_started"' in data:
             workers.append(threading.current_thread())
             entered.set()
-            assert release.wait(60)
+            assert release.wait(180)
         return original(store, key, data)
 
     async def expire(runner: run_module.RunRunner, deps: EngineDeps) -> None:
@@ -128,14 +130,14 @@ async def test_driver_signal_abandons_journal_publication(
     task = asyncio.create_task(Swarm(config).run(plan(rounds=1), run_id="r"))
     store = LocalStore(Path(config.run_root) / "r")
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 15)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         before = read_owner(store)
         assert before is not None
         if signal == "stop":
             assert await request_stop(config.run_root, "r", now=False) == 1
         else:
             deadline.set()
-        done, _ = await asyncio.wait([task], timeout=3)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "journal publication ignored its owner's stop/deadline"
         error = task.exception()
         assert isinstance(error, RuntimeError)
@@ -145,10 +147,11 @@ async def test_driver_signal_abandons_journal_publication(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(20):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
     owner = read_owner(store)
     assert owner is not None
@@ -172,7 +175,7 @@ async def test_graceful_stop_abandons_goal_solution_storage(
         if key == "goals/g/solution.json":
             workers.append(threading.current_thread())
             entered.set()
-            assert release.wait(60)
+            assert release.wait(180)
         return original(store, key, data)
 
     monkeypatch.setattr(LocalStore, "create", create)
@@ -181,9 +184,9 @@ async def test_graceful_stop_abandons_goal_solution_storage(
     )
     task = asyncio.create_task(Swarm(config).run(plan(rounds=1), run_id="r"))
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 20)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         await request_stop(config.run_root, "r", now=False)
-        done, _ = await asyncio.wait([task], timeout=3)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "graceful stop did not bound retained goal storage"
         error = task.exception()
         while isinstance(error, BaseExceptionGroup) and len(error.exceptions) == 1:
@@ -194,9 +197,10 @@ async def test_graceful_stop_abandons_goal_solution_storage(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(20):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
     assert not LocalStore(Path(config.run_root) / "r").exists("review")

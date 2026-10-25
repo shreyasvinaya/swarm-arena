@@ -409,7 +409,7 @@ def test_collection_storage_errors_suppress_secret_exception_chains(
     secret = "798a57fe4ea9ea05ca6e0a4d26c6990d"
     (tmp_path / "a.txt").write_text(secret)
 
-    def fail(data: bytes) -> Never:
+    def fail(data: bytes, *, max_bytes: int) -> Never:
         raise ValueError(secret)
 
     monkeypatch.setattr(artifacts, "_put_chunks", fail)

@@ -42,20 +42,38 @@ FIELD_SETS = {
     ("candidate_output", 1): "71060b6a928593fec41a4c0c5b316e670225549db0f650d324f6c8cf22de4e39",
     ("check_result", 1): "ab48eb85724967a6c6862ddc3ae3e09da29dd534ed83de29811007dba709443f",
     ("judge_result", 1): "655351cea722865ef47b488b51a1adfde5446c0dd3548d9aea8d22c6ff454770",
-    ("manifest", 1): "1d2a6841f6bef3f68d79b19eba61c50bce6f00f834a7d5b58291a2a6be64fd95",
+    ("manifest", 1): "937d60c769ad19cdceb6cd56f0a4dcd1339ef21391823bf253428c5c989f5689",
     ("solution", 1): "a325bf2c0a9df566ae25ad655f29491c59ec671bead59f34048deb4808a1d449",
     ("owner", 1): "84cf8f7b6d0352d6a9dabbb2b5c6d692b9992d8ca6dc367ce61c973f22904faf",
     ("frontier", 1): "42d1364c8cbcf941ba14fc9266d59903ec337f527db13f0fd491893738056dee",
     ("event", 1): "113ce06fe87ea705e6772c41d333ac3166115b8211ef70f14936f234bcaff4b5",
+    ("reconcile", 1): "86872e6e25f773384cce91e00dba0b2a66cdaec3fa2086205813e0d336d9dab0",
     ("segment", 1): "24a9c075f402a838718212851482617251b3bab08bafa51018f9e4e6d0426f09",
-    ("candidate", 1): "5cd32e071d3d68671ff5389518f120123539420ec264eca3e27c8f81ecadbc25",
+    ("candidate", 1): "c9f2c8fc941f5450e39e72dae59f69f9c14481e30c88230971ff030fff6caf09",
     ("learning", 1): "c5e234505180affe880f7822eb49708b48bd501ff90903528fc4eb0b7bb478b1",
     ("llm_call", 1): "a1173597b9e95c35e761ccdf608c93809cb0d8164767effc5dba90e58c297c3f",
     ("plan", 1): "72cf827e6a89feaed4f75dd19867c98dbecf9b57ba87cb45abeee78f53e39f89",
     ("run_config", 1): "4e8be36b4a984eb29c94074399a9415d8a0015c236c8493ecaab34b0b79fcc52",
-    ("job_started", 1): "9014b7001623ba750fd0c7bd48434c3cb80ff11fbdb669a627d8188ec3257a80",
+    ("job_started", 1): "237fdb12287452b9309f010994d452813755353410e771cac98d04ad65f79fe9",
     ("tool_result", 1): "b0f03da03916731b82f5d6e1a2c6d7e844a1cb0e207c8b29d89bc34dea07841f",
 }
+
+
+def test_reconcile_event_payload_fields_are_pinned() -> None:
+    from swarm_arena._gateway.reports import ReconcileReport
+
+    # Event.payload is generic JSON; its envelope hash cannot pin this payload.
+    schema = ReconcileReport.model_json_schema()
+    fields = {"root": sorted(schema["properties"])}
+    fields.update(
+        {
+            name: sorted(node["properties"])
+            for name, node in schema.get("$defs", {}).items()
+            if "properties" in node
+        }
+    )
+    digest = hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
+    assert digest == FIELD_SETS[("reconcile", 1)]
 
 
 @pytest.mark.parametrize(

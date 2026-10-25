@@ -1,8 +1,12 @@
+import asyncio
 import json
+import threading
 from pathlib import Path
 from typing import Any, cast
 
+import anyio
 import pytest
+from _fakes.cleanup import observe_task
 from _fakes.engine import EngineEnv
 
 from swarm_arena import (
@@ -1182,7 +1186,6 @@ async def _curation_checkpoint(env: EngineEnv) -> GoalRunner:
     env.deps.config = env.deps.config.model_copy(
         update={
             "curator": Ref(path="_fakes.curators:MergeAll"),
-            "settle_timeout_s": 2.0,
         }
     )
     env.deps.journal.append(r0_revision_draft(plan, plan.base_dir))
@@ -1216,6 +1219,28 @@ async def _curation_checkpoint(env: EngineEnv) -> GoalRunner:
     return GoalRunner(env.deps, goal_id="g", plan=plan, replanner=None, journal_r0=False)
 
 
+async def _finish_held_hook_probe(
+    task: asyncio.Task[Any], release: threading.Event, workers: list[threading.Thread]
+) -> list[str]:
+    issues: list[str] = []
+    with anyio.CancelScope(shield=True):
+        release.set()
+        if not task.done():
+            task.cancel()
+        done, _ = await asyncio.wait([task], timeout=60)
+        if not done:
+            issues.append("hook owner did not join within cleanup watchdog")
+        elif not task.cancelled():
+            task.exception()
+        for worker in workers:
+            with anyio.move_on_after(60) as joining:
+                await anyio.to_thread.run_sync(worker.join, 60, abandon_on_cancel=True)
+            if joining.cancel_called or worker.is_alive():
+                issues.append("hook worker did not join within cleanup watchdog")
+    # Callers assert these only after finally, preserving an escaping test failure.
+    return issues
+
+
 @pytest.mark.parametrize("stage", ["constructor", "models", "invoke", "serialize", "traverse"])
 @pytest.mark.parametrize("stop", ["stop", "deadline"])
 async def test_curator_blocking_hooks_are_abandoned_before_ids(
@@ -1233,16 +1258,21 @@ async def test_curator_blocking_hooks_are_abandoned_before_ids(
     from swarm_arena.board import Learning
 
     runner = await _curation_checkpoint(env)
+    # This probe holds the invocation through its stop/cancellation allowance.
+    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
+
     entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
     finished = anyio.Event()
     before = env.deps.ids.counters()
     original_init = MergeAll.__init__
     original_curate = MergeAll.curate
 
     def block() -> None:
+        workers.append(threading.current_thread())
         entered.set()
         try:
-            assert release.wait(5)
+            assert release.wait(300)
         finally:
             exited.set()
 
@@ -1294,33 +1324,37 @@ async def test_curator_blocking_hooks_are_abandoned_before_ids(
         finally:
             finished.set()
 
+    task = asyncio.create_task(work())
     try:
-        with anyio.fail_after(4):
-            async with anyio.create_task_group() as group:
-                group.start_soon(work)
-                assert await anyio.to_thread.run_sync(entered.wait, 2)
-                if stop == "stop":
-                    env.deps.stops.stop = True
-                else:
-                    env.deps.config = env.deps.config.model_copy(
-                        update={
-                            "limits": env.deps.config.limits.model_copy(
-                                update={"run_timeout_s": 0.001}
-                            )
-                        }
-                    )
-                await finished.wait()
-                assert env.deps.ids.counters() == before
-                assert env.events("curated") == []
-                release.set()
-                assert await anyio.to_thread.run_sync(exited.wait, 1)
-                # A subsequent healthy core operation proves the abandoned daemon
-                # cannot publish into its former goal after returning.
-                await runner._refresh()
-                assert len(env.events("learning")) == 1
-                assert env.deps.ids.counters() == before
+        with anyio.fail_after(60):
+            while not entered.is_set():  # noqa: ASYNC110 - curator hook entry signal
+                await anyio.sleep(0.01)
+        if stop == "stop":
+            env.deps.stops.stop = True
+        else:
+            env.deps.config = env.deps.config.model_copy(
+                update={
+                    "limits": env.deps.config.limits.model_copy(update={"run_timeout_s": 0.001})
+                }
+            )
+        with anyio.fail_after(30):
+            await finished.wait()
+            await observe_task(task)
+        assert env.deps.ids.counters() == before
+        assert env.events("curated") == []
+        if stage != "invoke":
+            assert not exited.is_set()
+            assert workers
+            assert all(worker.is_alive() for worker in workers)
     finally:
-        release.set()
+        cleanup_issues = await _finish_held_hook_probe(task, release, workers)
+    assert not cleanup_issues, "; ".join(cleanup_issues)
+    assert exited.is_set()
+    # Healthy work has its own watchdog after the held worker has joined.
+    with anyio.fail_after(60):
+        await runner._refresh()
+    assert len(env.events("learning")) == 1
+    assert env.deps.ids.counters() == before
 
 
 @pytest.mark.parametrize("stage", ["constructor", "models", "curate", "empty", "malformed"])
@@ -1564,6 +1598,10 @@ async def test_curator_cancellation_retains_settlement_finality(
     from swarm_arena._model.ids import IdGen
 
     runner = await _curation_checkpoint(env)
+    if phase == "pending_call":
+        # A deliberately missing report must finish its bounded stop experiment.
+        env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
+
     original_wait = JournalWriter._wait_for
     admitted: list[int] = []
     dispatched: list[str] = []
@@ -2012,7 +2050,7 @@ async def test_peer_page_with_earlier_source_is_preserved(
                 [sys.executable, "-c", command, str(root), target],
                 input=peer,
                 check=True,
-                timeout=5,
+                timeout=60,
                 capture_output=True,
             )
         return not absent
@@ -2035,8 +2073,10 @@ async def test_live_page_read_abandons_hook_without_late_publication(
 
     from swarm_arena._board.arena import ArenaView
 
+    # Keep the abandonment budget short; event watchdogs allow slow CI startup.
     env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 2.0})
     entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
     loop_thread = threading.get_ident()
     target = env.deps.board if site == "snapshot" else ArenaView
     method = "snapshot" if site == "snapshot" else "count_learnings"
@@ -2046,17 +2086,20 @@ async def test_live_page_read_abandons_hook_without_late_publication(
         result = original(*args, **kwargs)
         if not env.events("round_closed"):
             return result
+        workers.append(threading.current_thread())
         entered.set()
         assert threading.get_ident() != loop_thread
-        release.wait()
-        returned.set()
+        try:
+            assert release.wait(300)
+        finally:
+            returned.set()
         return result
 
     monkeypatch.setattr(target, method, blocked)
     runner = GoalRunner(env.deps, goal_id="g", plan=_plan(rounds=1), replanner=None)
     task = asyncio.create_task(runner.run())
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             while not entered.is_set():  # noqa: ASYNC110 - page read entry signal
                 await anyio.sleep(0.01)
         if signal == "fence":
@@ -2065,16 +2108,14 @@ async def test_live_page_read_abandons_hook_without_late_publication(
             monkeypatch.setattr(env.deps.clock, "left", lambda timeout: 0)
         else:
             env.deps.stops.stop_now = True
-        done, _ = await asyncio.wait([task], timeout=7)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "page read retained the goal after supervision stopped it"
         assert not returned.is_set()
         assert not env.store.exists("goals/g/rounds/round-01.md")
     finally:
-        release.set()
-        await asyncio.gather(task, return_exceptions=True)
-    with anyio.fail_after(5):
-        while not returned.is_set():  # noqa: ASYNC110 - late hook completion signal
-            await anyio.sleep(0.01)
+        cleanup_issues = await _finish_held_hook_probe(task, release, workers)
+    assert not cleanup_issues, "; ".join(cleanup_issues)
+    assert returned.is_set()
     assert not env.store.exists("goals/g/rounds/round-01.md")
 
 
@@ -2636,7 +2677,6 @@ async def test_llm_judge_usage_overflow_finishes_run(
             run_root=str(tmp_path / "runs"),
             arena_root=str(tmp_path / "arena"),
             artifact_root=str(tmp_path / "artifacts"),
-            settle_timeout_s=2,
             limits=Limits(max_tokens=10_000_000, max_usd=1000),
         ),
         workspace_root=str(tmp_path / "ws"),
@@ -2765,7 +2805,7 @@ async def test_graceful_stop_judging_outlives_settlement_window(
     task.add_done_callback(finished)
     try:
         for index, event in enumerate(entered):
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await event.wait()
             if task.done():
                 await task
@@ -2776,14 +2816,17 @@ async def test_graceful_stop_judging_outlives_settlement_window(
                 with anyio.move_on_after(config.settle_timeout_s + 0.5):
                     await anyio.Event().wait()
             release[index].set()
-        with anyio.fail_after(10):
-            result = await task
+        with anyio.fail_after(60):
+            result = await observe_task(task)
     finally:
         for event in release:
             event.set()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
+    assert not pending_cleanup, "judging owner did not finish cleanup"
     events = all_events(config)
     assert calls == (["1", "0", "0"] if retry else ["1", "0"])
     assert result["g"]
@@ -2796,10 +2839,13 @@ async def test_graceful_stop_judging_outlives_settlement_window(
 
 
 @pytest.mark.parametrize("recovery", ["healthy", "provider", "ordinary"])
-async def test_ranking_provider_is_retried_once_at_converge(tmp_path: Path, recovery: str) -> None:
+async def test_ranking_provider_is_retried_once_at_converge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recovery: str
+) -> None:
     pytest.importorskip("agents")
     import litellm  # noqa: TID251 - exercise the real adapter classification
     from _fakes.engine import with_executor
+    from _fakes.llm_components import missing_callback_timeout
     from _fakes.run import all_events
 
     from swarm_arena import Limits, Swarm
@@ -2807,6 +2853,7 @@ async def test_ranking_provider_is_retried_once_at_converge(tmp_path: Path, reco
     from swarm_arena.llm import LLMJudge
     from swarm_arena.testing import FakeModel, FakeTurn
 
+    missing_callback_timeout(monkeypatch)
     calls: list[str] = []
 
     class Scorer(FakeModel):
@@ -2851,7 +2898,6 @@ async def test_ranking_provider_is_retried_once_at_converge(tmp_path: Path, reco
             run_root=str(tmp_path / "runs"),
             arena_root=str(tmp_path / "arena"),
             artifact_root=str(tmp_path / "artifacts"),
-            settle_timeout_s=2,
             limits=Limits(max_tokens=10_000_000, max_usd=1000),
         ),
         workspace_root=str(tmp_path / "ws"),
@@ -2904,6 +2950,7 @@ async def test_real_provider_adapter_and_accounting_failure_at_engine_boundary(
     pytest.importorskip("agents")
     import litellm  # noqa: TID251 - exercise the real adapter classification
     from _fakes.engine import with_executor
+    from _fakes.llm_components import missing_callback_timeout
     from _fakes.run import all_events
 
     from swarm_arena import Limits, Swarm
@@ -2912,6 +2959,7 @@ async def test_real_provider_adapter_and_accounting_failure_at_engine_boundary(
     from swarm_arena.llm import LLMCurator, LLMJudge, LLMPlanner, _invocation
     from swarm_arena.testing import FakeModel, FakeTurn
 
+    missing_callback_timeout(monkeypatch)
     calls: list[str] = []
     fired: list[str] = []
     role = "judge" if component == "final" else component
@@ -2956,7 +3004,6 @@ async def test_real_provider_adapter_and_accounting_failure_at_engine_boundary(
             run_root=str(tmp_path / "runs"),
             arena_root=str(tmp_path / "arena"),
             artifact_root=str(tmp_path / "artifacts"),
-            settle_timeout_s=2,
             limits=Limits(max_tokens=10_000_000, max_usd=1000, max_agents_per_fingerprint=4),
             curator=Ref.of(LLMCurator(model="down")) if component == "curator" else None,
         ),
@@ -3182,7 +3229,7 @@ async def test_curator_report_wait_only_counts_recorded_calls_once(
         settle_timeout_s=env.deps.config.settle_timeout_s,
     )
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             await runner._curate_round(1)
     finally:
         recorder.unbind_run(env.deps.run_id)
@@ -3215,6 +3262,7 @@ async def test_curator_report_wait_observes_owner_interruptions(
     )
     from swarm_arena._journal import llm_record as recorder
 
+    env.deps.config = env.deps.config.model_copy(update={"settle_timeout_s": 300})
     runner = await _curation_checkpoint(env)
     entered = anyio.Event()
 
@@ -3263,7 +3311,7 @@ async def test_curator_report_wait_observes_owner_interruptions(
     writer_check = env.deps.journal._raise_if_fenced
     task = asyncio.create_task(runner._curate_round(1))
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             await entered.wait()
         if interruption == "stop_now":
             env.deps.stops.stop_now = env.deps.stops.stop = True
@@ -3277,8 +3325,8 @@ async def test_curator_report_wait_observes_owner_interruptions(
                 raise _stop_cleanup_error()
 
             monkeypatch.setattr(env.deps.journal, "_raise_if_fenced", failed_writer)
-        # A report is optional: interruption must shorten its 60 s allowance.
-        with anyio.fail_after(5):
+        # The report remains held beyond the 30 s observation window.
+        with anyio.fail_after(30):
             if interruption in {"lease_loss", "writer_failure"}:
                 with pytest.raises(
                     Fenced if interruption == "lease_loss" else RuntimeError
@@ -3303,6 +3351,60 @@ async def test_curator_report_wait_observes_owner_interruptions(
             assert env.events("settle")[-1].payload["actual"]["usd"] == 0.01
     finally:
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
         recorder.unbind_run(env.deps.run_id)
         monkeypatch.setattr(env.deps.journal, "_raise_if_fenced", writer_check)
+    assert not pending_cleanup, "curator report owner did not finish cleanup"
+
+
+async def test_round_close_reads_late_rows(
+    run_config: RunConfig, fake_gateway: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.run import events
+    from _fakes.tools import gateway_plan
+
+    from swarm_arena import Swarm
+    from swarm_arena._gateway.keys import KeyManager, gateway_call_id
+    from swarm_arena.config import GatewayConfig
+    from swarm_arena.tool import Estimate
+
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    config = run_config.model_copy(
+        update={
+            "llm_gateway": GatewayConfig(url=fake_gateway.url, require_hard_cap=False),
+            "limits": run_config.limits.model_copy(
+                update={"default_run_reservation": Estimate(usd=1)}
+            ),
+        }
+    )
+    original = KeyManager.read_with_status
+    first: list[str] = []
+
+    async def reveal_after_first(self: KeyManager, records: Any, *, wait_first: bool) -> Any:
+        result = await original(self, records, wait_first=wait_first)
+        if wait_first:
+            first.extend(call.id for call in result[0])
+            fake_gateway.add_spend(
+                records[0].key_id,
+                model="openai/chat-model",
+                cost_usd=0.02,
+                tokens=(1, 1),
+                call_id="late",
+            )
+        return result
+
+    monkeypatch.setattr(KeyManager, "read_with_status", reveal_after_first)
+    await Swarm(config).run(gateway_plan())
+    calls = events(config, "llm_call")
+    assert len(first) == 1
+    assert len(calls) == 2
+    closed = events(config, "round_closed")[0]
+    assert calls[0].seq < closed.seq < calls[1].seq
+    (key_id,) = fake_gateway.keys
+    late = fake_gateway._spend[-1][1]
+    assert calls[1].payload["call"]["litellm_call_id"] == gateway_call_id(
+        key_id, late["request_id"]
+    )
+    assert calls[1].payload["call"]["cost_usd"] == 0.02

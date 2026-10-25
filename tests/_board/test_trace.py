@@ -1,12 +1,12 @@
 from collections import Counter
 from collections.abc import Generator, Iterable, Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Event as ThreadEvent
 from typing import Any
 
 import pytest
+from _fakes.cleanup import BoundedThreadPoolExecutor
 from _fakes.finished import FinishedRun
 from _fakes.journals import START, FakeRun, add_pointer
 
@@ -473,23 +473,24 @@ def test_trace_does_not_hold_board_lock_during_cache_reads(
 
     def blocked(frontier: Frontier, candidate_id: str) -> list[str]:
         entered.set()
-        assert release.wait(5)
+        assert release.wait(300)
         return query(frontier, candidate_id)
 
     monkeypatch.setattr(cache, "_citing_learning_ids", blocked)
     try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
+        with BoundedThreadPoolExecutor(max_workers=1) as pool:
             result = pool.submit(trace, board, "target")
             acquired = False
             try:
-                assert entered.wait(5)
-                acquired = board._lock.acquire(timeout=1)
+                assert entered.wait(60)
+                acquired = board._lock.acquire(timeout=30)
                 assert acquired
+                assert not release.is_set()
             finally:
                 if acquired:
                     board._lock.release()
                 release.set()
-            assert "learning citing Target citation" in result.result(timeout=5)
+            assert "learning citing Target citation" in result.result(timeout=60)
     finally:
         board.close()
 
@@ -607,7 +608,7 @@ def test_trace_uses_one_generation_while_refresh_is_blocked(
 
     def blocked(frontier: Frontier) -> Any:
         entered.set()
-        assert release.wait(5)
+        assert release.wait(300)
         return prepare(frontier)
 
     def counted_capture() -> Any:
@@ -622,19 +623,20 @@ def test_trace_uses_one_generation_while_refresh_is_blocked(
         expected = trace(board, "target")
         monkeypatch.setattr(board, "_prepare_published", blocked)
         monkeypatch.setattr(board, "_pin_state", counted_capture)
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with BoundedThreadPoolExecutor(max_workers=2) as pool:
             refreshed = pool.submit(board.frontier)
             try:
-                assert entered.wait(5)
+                assert entered.wait(60)
                 with monkeypatch.context() as fixed:
                     fixed.setattr(board, "_cache", forbidden)
                     fixed.setattr(board, "_read_cache", forbidden)
                     result = pool.submit(trace, board, "target")
-                    assert result.result(timeout=1) == expected
+                    assert result.result(timeout=30) == expected
                     assert captures == 1
+                    assert not release.is_set()
             finally:
                 release.set()
-            refreshed.result(timeout=5)
+            refreshed.result(timeout=60)
     finally:
         board.close()
 
@@ -650,18 +652,20 @@ def test_trace_pins_its_generation_against_concurrent_close(tmp_path: Path) -> N
 
     def paused(self: ArenaCache, *args: Any, **kwargs: Any) -> Any:
         entered.set()
-        assert release.wait(5)
+        assert release.wait(300)
         return candidates(self, *args, **kwargs)
 
-    with pytest.MonkeyPatch.context() as patched, ThreadPoolExecutor(max_workers=2) as pool:
+    with pytest.MonkeyPatch.context() as patched, BoundedThreadPoolExecutor(max_workers=2) as pool:
         patched.setattr(ArenaCache, "candidates", paused)
         result = pool.submit(trace, board, "c-1")
-        assert entered.wait(5)
-        closed = pool.submit(board.close)
-        assert not closed.done()
-        release.set()
-        assert result.result(timeout=5) == expected
-        closed.result(timeout=5)
+        try:
+            assert entered.wait(60)
+            closed = pool.submit(board.close)
+            assert not closed.done()
+        finally:
+            release.set()
+        assert result.result(timeout=60) == expected
+        closed.result(timeout=60)
     with pytest.raises(RuntimeError, match="arena board is closed"):
         trace(board, "c-1")
 
@@ -908,12 +912,12 @@ def test_trace_cli_core_only_uses_producer_root(
     wrong.commit(_record(_call(wrong, "wrong-session", "planner")))
     path = tmp_path / "run.toml"
     path.write_text(config.dumps())
-    with ThreadPoolExecutor(max_workers=1) as executor:
+    with BoundedThreadPoolExecutor(max_workers=1) as executor:
         code = executor.submit(
             Context().run,
             main,
             ["trace", "queued-candidate", "--namespace", "toy", "--config", str(path)],
-        ).result(timeout=10)
+        ).result(timeout=60)
     assert code == 0
     output = capsys.readouterr().out
     assert "right-session" in output
@@ -1287,5 +1291,117 @@ def test_session_read_error_is_retried_at_unchanged_producing_mark(
         assert reads == [1, 1]
         board.frontier()
         assert reads == [1, 1]
+    finally:
+        board.close()
+
+
+@pytest.mark.parametrize(
+    ("observed", "label", "expected"),
+    [
+        (None, "estimated", "1.00 USD (estimated)"),
+        (
+            0.012345,
+            "observed (completeness unverified)",
+            "0.0123 USD (observed (completeness unverified))",
+        ),
+        (0.012345, "observed", "0.0123 USD (observed)"),
+    ],
+)
+def test_trace_shows_gateway_cap(
+    tmp_path: Path,
+    observed: float | None,
+    label: str,
+    expected: str,
+) -> None:
+    from _fakes.gateway_events import gateway_key, reconcile
+
+    run = _seed(tmp_path)
+    run.commit(gateway_key())
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open("", "", ["toy"])
+    try:
+        board.frontier()
+        with board._read_namespace() as old:
+            before = old.trace(["toy"], "c-1")
+            assert "gateway key cand-c-1: max_budget 1.00 USD, cap soft" in before
+            assert not any(line.startswith("gateway spend") for line in before)
+            run.commit(reconcile(observed=observed, label=label))
+            assert trace(board, "c-1") == before
+            board.frontier()
+            assert old.trace(["toy"], "c-1") == before
+            after = trace(board, "c-1")
+            assert f"gateway spend {expected}" in after
+    finally:
+        board.close()
+
+
+def test_gateway_trace_filters_candidate_key_and_producing_run(tmp_path: Path) -> None:
+    from _fakes.gateway_events import gateway_key, reconcile
+
+    run = _seed(tmp_path)
+    run.commit(gateway_key(), reconcile(key_id="foreign-hash", observed=99, label="observed"))
+    other = FakeRun(str(tmp_path / "runs"), "r2")
+    key = gateway_key(cap="hard")
+    key.payload["run_id"] = "r2"
+    other.commit(
+        _plan(other), _candidate(other), key, reconcile(observed=99, label="observed", run_id="r2")
+    )
+    add_pointer(str(tmp_path / "arena"), other)
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open("", "", ["toy"])
+    try:
+        board.frontier()
+        lines = trace(board, "c-1")
+        assert lines[0].startswith("plan     r1 ")
+        assert "gateway key cand-c-1: max_budget 1.00 USD, cap soft" in lines
+        assert not any(line.startswith("gateway spend") for line in lines)
+    finally:
+        board.close()
+
+
+def test_gateway_trace_uses_only_published_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes.gateway_events import gateway_key, reconcile
+
+    run = _seed(tmp_path)
+    run.commit(gateway_key(), reconcile())
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    board.open("", "", ["toy"])
+    try:
+        board.frontier()
+
+        def forbidden(*args: Any, **kwargs: Any) -> Any:
+            pytest.fail("gateway trace performed preparation")
+
+        monkeypatch.setattr(board, "frontier", forbidden)
+        monkeypatch.setattr(ArenaCache, "_committed_state", forbidden)
+        monkeypatch.setattr(RunState, "from_events", forbidden)
+        monkeypatch.setattr("swarm_arena._board.arena.read_owner", forbidden)
+        assert "gateway spend 1.00 USD (estimated)" in trace(board, "c-1")
+    finally:
+        board.close()
+
+
+def test_gateway_trace_does_not_merge_equal_run_ids_across_namespaces(tmp_path: Path) -> None:
+    from _fakes.gateway_events import gateway_key, reconcile
+
+    board = ArenaBoard(arena_root=str(tmp_path / "arena"), cache_dir=str(tmp_path / "cache"))
+    for namespace, cap in (("public", "hard"), ("private", "soft")):
+        run = FakeRun(str(tmp_path / namespace), "same-run", namespace=namespace)
+        created = gateway_key(cap=cap)
+        created.payload["run_id"] = "same-run"
+        run.commit(run.plan(), run.candidate("c-1"), created, reconcile(run_id="same-run"))
+        add_pointer(str(tmp_path / "arena"), run)
+    board.open("", "", ["public", "private"])
+    try:
+        board.frontier()
+        with board._read_namespace() as reader:
+            with pytest.raises(KeyError):
+                reader.trace(["public"], "c-1")
+            assert "gateway key cand-c-1: max_budget 1.00 USD, cap soft" in reader.trace(
+                ["private"], "c-1"
+            )
     finally:
         board.close()

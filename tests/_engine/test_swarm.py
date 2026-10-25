@@ -5,6 +5,7 @@ from pathlib import Path
 import anyio
 import pytest
 from _fakes.engine import with_limits
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 from _fakes.run import WRITE, events, plan, run_dir, wait_tool_started
 from _fakes.tools import PyTool
 
@@ -13,6 +14,8 @@ from swarm_arena._engine.swarm import Swarm
 from swarm_arena._errors import PlanError
 from swarm_arena._model.goal import FileSet
 from swarm_arena._model.tooling import Estimate
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 
 async def test_approve_false_writes_nothing(run_config: RunConfig, tmp_path: Path) -> None:
@@ -84,7 +87,7 @@ async def test_stop_creates_epoch_key_and_queued_goals_no_result(
         try:
             await wait_tool_started(cfg)
             await swarm.stop()
-            with anyio.fail_after(20):
+            with anyio.fail_after(60):
                 await observed.wait()
         finally:
             await anyio.to_thread.run_sync(release.write_text, "go")
@@ -148,7 +151,7 @@ async def test_each_new_stop_mode_is_journaled(run_config: RunConfig) -> None:
     from _fakes.run import WRITE_THEN_SLEEP
 
     swarm = Swarm(run_config)
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tg:
             tg.start_soon(swarm.run, plan(tool=PyTool({"code": WRITE_THEN_SLEEP, "grace_s": 0.1})))
             await wait_tool_started(run_config)

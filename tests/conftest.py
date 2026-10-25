@@ -13,6 +13,7 @@ from uuid import uuid4
 import anyio
 import pytest
 from _fakes.finished import FinishedRun, run_again
+from _fakes.gateway import FakeGateway
 
 from swarm_arena._exec.local import LocalExecutor
 from swarm_arena._model.run_config import RunConfig
@@ -212,3 +213,21 @@ def no_cwd_disk_cache() -> Iterator[None]:
     assert existed or not cache.exists(), (
         "LiteLLM disk cache in cwd: set CachePolicy.disk_dir under tmp_path"
     )
+
+
+@pytest.fixture(scope="session")
+def ray_cluster() -> Iterator[str]:
+    """Start a two-CPU head only when a selected Ray test requests it."""
+    if _missing("ray"):
+        pytest.skip("Ray cluster tests require the ray extra")
+    from _fakes.ray_cluster import local_ray_cluster
+
+    with local_ray_cluster() as address:
+        yield address
+
+
+@pytest.fixture
+def fake_gateway() -> Iterator[FakeGateway]:
+    """Serve the pinned gateway wire protocol without external access."""
+    with FakeGateway() as gateway:
+        yield gateway

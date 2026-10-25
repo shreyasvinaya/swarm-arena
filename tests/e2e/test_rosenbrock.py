@@ -13,6 +13,7 @@ from types import ModuleType
 from typing import Any
 
 import pytest
+from _fakes.journals import committed_events
 
 from swarm_arena import Goal, Plan, RunConfig, Swarm
 from swarm_arena.board import Candidate
@@ -41,14 +42,7 @@ def _only_run(config: RunConfig) -> str:
 def _events(config: RunConfig) -> list[dict[str, Any]]:
     # Journal internals are used only to assert committed policy/final-score evidence.
     root = Path(config.run_root) / _only_run(config)
-    head = json.loads((root / "control/owner.json").read_text())["head"]
-    segments: list[list[dict[str, Any]]] = []
-    key = head["segment"]
-    while key is not None:
-        rows = [json.loads(line) for line in (root / key).read_text().splitlines()]
-        key = rows[0]["link"]
-        segments.append(rows[1:])
-    return [event for segment in reversed(segments) for event in segment]
+    return committed_events(root)
 
 
 def _decision_events(config: RunConfig) -> list[dict[str, Any]]:

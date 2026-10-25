@@ -281,7 +281,11 @@ class Ledger:
                         {h: Amount.model_validate(a) for h, a in payload["shares"].items()},
                     )
             case EventType.RESERVE:
-                self._book(Reservation.model_validate(payload["reservation"]))
+                reservation = Reservation.model_validate(payload["reservation"])
+                if payload.get("action") == "keep_charged":
+                    self._promote(reservation)
+                else:
+                    self._book(reservation)
             case EventType.SETTLE:
                 entry = self._entries[payload["id"]]
                 if not entry.settled and self._overflow_reservation is None:
@@ -667,6 +671,35 @@ class Ledger:
         )
         return reservation
 
+    def _promote(self, reservation: Reservation) -> None:
+        """Retain one existing booking while making its charge nonrefundable."""
+        entry = self._entries[reservation.id]
+        if entry.settled or reservation != entry.reservation.model_copy(
+            update={"keep_charged": True}
+        ):
+            raise _core_error(ValueError, "invalid reservation promotion")
+        entry.reservation = reservation
+
+    async def _keep_charged(
+        self, reservation_id: str, *, on_admit: Callable[[Reservation], None] | None = None
+    ) -> Reservation:
+        """Durably retain the full charge immediately before external key creation."""
+        entry = self._entries[reservation_id]
+        if entry.reservation.keep_charged:
+            return entry.reservation
+        reservation = entry.reservation.model_copy(update={"keep_charged": True})
+        self._promote(reservation)
+        if on_admit is not None:
+            on_admit(reservation)
+        await self._journal.append_durable(
+            EventDraft(
+                type=EventType.RESERVE,
+                goal_id=reservation.goal_id,
+                payload={"action": "keep_charged", "reservation": reservation.model_dump()},
+            )
+        )
+        return reservation
+
     def _book(self, reservation: Reservation) -> None:
         """Debit recorded funding without live admission checks during replay."""
         if reservation.id in self._entries:
@@ -806,6 +839,8 @@ class Ledger:
                 payload={
                     "id": reservation_id,
                     "actual": actual.model_dump(),
+                    "charged": target.model_dump(),
+                    "keep_charged": entry.reservation.keep_charged,
                     "estimated": estimated,
                     "overspend": overspend.model_dump() if overspend != Amount() else None,
                 },

@@ -1060,3 +1060,131 @@ def test_replay_refuses_invalid_planner_provenance(key: str, value: Any) -> None
     with pytest.raises(ValueError, match="invalid journal replay payload") as caught:
         RunState.from_events([_ev(1, "plan_revision", payload, goal_id="g")])
     assert_secret_absent(caught.value, "secret-sentinel")
+
+
+DISPATCH = {
+    "candidate_id": "c-a-e1-0001",
+    "reservation_id": "r-1",
+    "started": {
+        "kind": "dispatch",
+        "job_id": "c-a-e1-0001",
+        "task_name": "c-a-e1-0001",
+        "ray_job_id": "driver-1",
+    },
+}
+
+
+def test_replay_dispatch_without_end_is_started() -> None:
+    state = RunState.from_events([*_PRE, _reserve(3, "r-1"), _ev(4, "tool_dispatch", DISPATCH)])
+    started = state.started["c-a-e1-0001"]
+    assert started.kind == "dispatch"
+    assert started.task_name == "c-a-e1-0001"
+    assert started.ray_job_id == "driver-1"
+    assert state.reservations["r-1"].state == "open"
+
+
+@pytest.mark.parametrize("end", ["tool_end", "run_lost"])
+def test_replay_dispatch_with_end_is_not_started(end: str) -> None:
+    terminal = (
+        _end(5, "c-a-e1-0001")
+        if end == "tool_end"
+        else _ev(5, "run_lost", {"candidate_id": "c-a-e1-0001", "reservation_id": "r-1"})
+    )
+    state = RunState.from_events(
+        [*_PRE, _reserve(3, "r-1"), _ev(4, "tool_dispatch", DISPATCH), terminal]
+    )
+    assert "c-a-e1-0001" not in state.started
+    if end == "run_lost":
+        assert "c-a-e1-0001" in state.lost
+        assert "c-a-e1-0001" not in state.candidates
+        assert state.reservations["r-1"].state == "open"
+
+
+def test_gateway_projection_keeps_latest_report_and_detaches_input() -> None:
+    from _fakes.gateway_events import gateway_key, reconcile
+
+    created, first, last = gateway_key(), reconcile(), reconcile(observed=0.25, label="observed")
+    for draft in (created, first, last):
+        draft.payload["run_id"] = "r"
+    events = [
+        _ev(i, draft.type.value, draft.payload) for i, draft in enumerate((created, first, last), 1)
+    ]
+    state = RunState.from_events(events)
+    key = ("c-1", "hash-1")
+    assert state.gateway_keys[key].cap == "soft"
+    assert state.gateway_reconcile[key].observed_usd == 0.25
+    events[-1].payload["keys"][0]["observed_usd"] = 99
+    assert state.gateway_reconcile[key].observed_usd == 0.25
+    assert state.gateway_keys[key].max_budget_usd == 1
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"observed_usd": -1},
+        {"label": "SECRET"},
+        {"observed_usd": 0.2, "label": "estimated"},
+        {"observed_usd": None, "label": "observed"},
+        {"reserved_usd": True},
+    ],
+)
+def test_gateway_projection_rejects_invalid_report_safely(patch: dict[str, Any]) -> None:
+    from _fakes.gateway_events import reconcile
+    from _fakes.secrecy import assert_secret_absent
+
+    draft = reconcile(run_id="r")
+    draft.payload["keys"][0].update(patch)
+    with pytest.raises(ValueError, match="invalid journal replay payload") as caught:
+        RunState.from_events([_ev(1, draft.type.value, draft.payload)])
+    assert_secret_absent(caught.value, "SECRET")
+
+
+@pytest.mark.parametrize("label", ["estimated", "observed", "observed (completeness unverified)"])
+def test_gateway_shared_report_round_trips_every_label(label: str) -> None:
+    from _fakes.gateway_events import reconcile
+
+    from swarm_arena._gateway.reports import KeyReport, ReconcileReport
+
+    draft = reconcile(run_id="r", label=label, observed=None if label == "estimated" else 0.25)
+    report = ReconcileReport.model_validate(draft.payload)
+    assert isinstance(report.keys[0], KeyReport)
+    payload = report.model_dump(mode="json")
+    state = RunState.from_events([_ev(1, "reconcile", payload)])
+    projection = state.gateway_reconcile[("c-1", "hash-1")]
+    assert projection.label == label
+    assert projection.observed_usd == report.keys[0].observed_usd
+    assert projection == report.keys[0]
+    assert report.spend_usd() == (1.0 if label == "estimated" else 0.25)
+
+
+@pytest.mark.parametrize("settled", [False, True])
+def test_reservation_promotion_preserves_identity_and_state(settled: bool) -> None:
+    initial = _reserve(3, "r-1")
+    promotion = _ev(
+        5,
+        "reserve",
+        {
+            "action": "keep_charged",
+            "reservation": {**initial.payload["reservation"], "keep_charged": True},
+        },
+    )
+    prior = [*_PRE, initial, *([_settle(4, "r-1")] if settled else [])]
+    if settled:
+        with pytest.raises(ValueError, match="invalid journal replay payload"):
+            RunState.from_events([*prior, promotion])
+    else:
+        state = RunState.from_events([*prior, promotion])
+        assert state.reservations["r-1"].state == "open"
+        assert state.reservations["r-1"].reservation["keep_charged"] is True
+        assert len(state.reservations) == 1
+    for field, value in (("holder", "other"), ("amount", {"tokens": 0, "usd": 2.0})):
+        corrupt = promotion.model_copy(
+            update={
+                "payload": {
+                    "action": "keep_charged",
+                    "reservation": {**promotion.payload["reservation"], field: value},
+                }
+            }
+        )
+        with pytest.raises(ValueError, match="invalid journal replay payload"):
+            RunState.from_events([*prior, corrupt])

@@ -21,7 +21,9 @@
 Full offline swarm runs, scripted managers, pruning, convergence, and resumable
 run journals work today, alongside tools, checks, judges, `LocalExecutor`, and the
 `swarm_arena.testing` conformance kit. Model-driven managers and judge panels are
-available with the `llm` extra.
+available with the `llm` extra. The `ray` extra adds cluster execution and Ray Job
+submission; an optional LiteLLM gateway records tool-internal calls and supports
+post-run spend reconciliation. See [Running on Ray](docs/running-on-ray.md).
 
 ## Quickstart
 
@@ -76,6 +78,29 @@ uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"
 uv add "swarm-arena[cache] @ git+https://github.com/shreyasvinaya/swarm-arena"
 uv add "swarm-arena[langfuse] @ git+https://github.com/shreyasvinaya/swarm-arena"
 ```
+
+## Run on a Ray cluster
+
+Install the current development source and select the executor in `run.toml`:
+
+```sh
+uv add 'swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena'
+# run.toml: executor = { path = "swarm_arena.ray:RayExecutor" }
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+# In another terminal: ssh -N -L 8265:127.0.0.1:8265 <head>
+uv run swarm-arena submit --address http://127.0.0.1:8265 --working-dir . --yes run.toml plan.toml
+```
+
+Provision workers, module paths and authentication as described in
+[Running on Ray](docs/running-on-ray.md), including the dashboard requirement for recovery.
+
+An optional LiteLLM Proxy gateway gives each LLM-calling tool run its own virtual
+key and records tool-internal calls, while plain tools stay unkeyed. The pinned
+LiteLLM version supports **soft caps and estimated spend only**; keyed runs keep
+their full USD reservation charged. Declare the tool's providers, accept soft
+caps explicitly when using `max_usd`, and use `swarm-arena reconcile` for later
+reports. See [The LLM gateway on the cluster](docs/running-on-ray.md#the-llm-gateway-on-the-cluster)
+for setup, secret transport and worker network rules.
 
 ## Test one connector
 

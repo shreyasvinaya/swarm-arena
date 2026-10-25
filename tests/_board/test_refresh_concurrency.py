@@ -1,5 +1,6 @@
 """Fixed views remain usable while another goal refreshes shared journal state."""
 
+import asyncio
 from pathlib import Path
 from threading import Event as ThreadEvent
 from threading import Timer
@@ -8,6 +9,7 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.journals import FakeRun
 
 from swarm_arena import Goal
@@ -53,7 +55,7 @@ async def test_fixed_view_reads_do_not_wait_for_refresh(
     def pause() -> None:
         if not entered.is_set():
             entered.set()
-            assert release.wait(5), "test failed to release storage"
+            assert release.wait(180), "test failed to release storage"
 
     def read(self: LocalStore, key: str) -> Any:
         if phase == "journal" and self.url.endswith("/slow") and key == head.segment:
@@ -85,15 +87,14 @@ async def test_fixed_view_reads_do_not_wait_for_refresh(
                 beats_reached.set()
             await anyio.sleep(0.01)
 
-    timer = Timer(5, release.set)
+    timer = Timer(30, release.set)
+    refresh_task = asyncio.create_task(refresh())
     try:
         async with anyio.create_task_group() as group:
             group.start_soon(heartbeat)
-            group.start_soon(refresh)
-            assert await anyio.to_thread.run_sync(entered.wait, 5)
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
             timer.start()  # Escape even if the regression blocks the loop itself.
             try:
-                start = perf_counter()
                 assert view.best(view.goal, 1, judge="j")[0].id == "fast-c"
                 assert view.scores("fast-c")[0].value == 1
                 assert view.lineage("fast-c").root == "fast-c"
@@ -103,21 +104,29 @@ async def test_fixed_view_reads_do_not_wait_for_refresh(
                 assert view.learnings("toy")[0].id == "fast-learning"
                 assert view.search_learnings("toy", "viscosity")[0].id == "fast-learning"
                 assert view.count_learnings("toy") == 1
-                assert perf_counter() - start < 1.0
+                assert not release.is_set(), "read waited for the held refresh"
+                timer.cancel()
                 before = len(ticks)
                 # The loop keeps running while the refresh is held: wait for heartbeats, bounded.
                 beat_target.append(before + 3)
-                with anyio.fail_after(2):
+                with anyio.fail_after(60):
                     await beats_reached.wait()
                 assert not completed.is_set()
             finally:
                 release.set()
-                await completed.wait()
-                group.cancel_scope.cancel()
+                try:
+                    await observe_task(refresh_task)
+                finally:
+                    group.cancel_scope.cancel()
     finally:
         release.set()
-        timer.cancel()
-        board.close()
+        try:
+            await settle_tasks(refresh_task)
+        finally:
+            timer.cancel()
+            if timer.ident is not None:
+                timer.join(60)
+            board.close()
 
 
 @pytest.mark.parametrize("phase", ["pointers", "journal", "ingest"])
@@ -192,7 +201,7 @@ async def test_public_board_reads_use_published_state_during_refresh(
 
     def pause() -> None:
         entered.set()
-        assert release.wait(5), "test failed to release refresh"
+        assert release.wait(180), "test failed to release refresh"
 
     def pointers(*args: Any, **kwargs: Any) -> Any:
         if phase == "pointers":
@@ -229,33 +238,40 @@ async def test_public_board_reads_use_published_state_during_refresh(
                 beats_reached.set()
             await anyio.sleep(0.01)
 
-    timer = Timer(5, release.set)
+    timer = Timer(30, release.set)
+    refresh_task = asyncio.create_task(refresh())
     try:
         async with anyio.create_task_group() as group:
-            group.start_soon(refresh)
             group.start_soon(heartbeat)
-            assert await anyio.to_thread.run_sync(entered.wait, 5)
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
             timer.start()
             try:
-                started = perf_counter()
                 result = read()
-                assert perf_counter() - started < 1.0
+                assert not release.is_set(), "read waited for the held refresh"
+                timer.cancel()
                 assert result == expected
                 before = len(ticks)
                 # The loop keeps running while the refresh is held: wait for heartbeats, bounded.
                 beat_target.append(before + 3)
-                with anyio.fail_after(2):
+                with anyio.fail_after(60):
                     await beats_reached.wait()
                 assert not finished.is_set()
             finally:
                 release.set()
-                await finished.wait()
-                group.cancel_scope.cancel()
+                try:
+                    await observe_task(refresh_task)
+                finally:
+                    group.cancel_scope.cancel()
         assert board.best(key, 1, judge="j")[0].id == "new"
     finally:
         release.set()
-        timer.cancel()
-        board.close()
+        try:
+            await settle_tasks(refresh_task)
+        finally:
+            timer.cancel()
+            if timer.ident is not None:
+                timer.join(60)
+            board.close()
 
 
 @pytest.mark.parametrize("published", [False, True])

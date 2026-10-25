@@ -216,7 +216,6 @@ async def test_concurrent_recursive_panels_keep_independent_accounting(
 
         patch.setattr(fake, "get_response", respond)
         config = RunConfig(
-            settle_timeout_s=2,
             models=ModelCatalog(
                 {
                     "j": ModelSpec(
@@ -272,7 +271,7 @@ async def test_concurrent_recursive_panels_keep_independent_accounting(
 
 
 async def test_late_manager_callback_cannot_change_completed_run(tmp_path: Path) -> None:
-    from _fakes.llm_components import LateFakeModel
+    from _fakes.llm_components import LateFakeModel, missing_callback_timeout
     from _fakes.llm_run import record_kwargs
 
     from swarm_arena._journal.llm_record import record_call
@@ -297,6 +296,7 @@ async def test_late_manager_callback_cannot_change_completed_run(tmp_path: Path)
     )
     fake = LateFakeModel(_manager_turns(), delay_s=None)
     with pytest.MonkeyPatch.context() as patch:
+        missing_callback_timeout(patch)
         patch.setattr(_catalog, "_FAKE_MODELS", {**_catalog._FAKE_MODELS, "opus": fake})
         try:
             assert (await Swarm(config).run(plan))[plan.goal.id]

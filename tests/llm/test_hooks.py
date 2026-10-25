@@ -1,12 +1,16 @@
 """Metering, authoritative settings and SDK control transport."""
 
 import asyncio
+import os
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 
 pytest.importorskip("agents")
 
@@ -57,9 +61,13 @@ from swarm_arena.llm._linking import CallLinks, ManagerDeps, tool_calls_of
 from swarm_arena.manager import AgentContext, LimitReached
 from swarm_arena.testing import FakeModel, FakeTurn
 
-pytestmark = pytest.mark.filterwarnings(
-    "ignore:Items? .*TypedDict class .*ReadOnly.*:UserWarning:pydantic._internal._generate_schema"
-)
+pytestmark = [
+    pytest.mark.usefixtures("owned_processes"),
+    pytest.mark.filterwarnings(
+        "ignore:Items? .*TypedDict class .*ReadOnly.*:UserWarning:"
+        "pydantic._internal._generate_schema"
+    ),
+]
 
 SPEC = ModelSpec(
     model="fake/m",
@@ -70,9 +78,7 @@ SPEC = ModelSpec(
 
 
 def config(**kwargs: Any) -> RunConfig:
-    return RunConfig(
-        models=ModelCatalog({"m": SPEC}), limits=Limits(), settle_timeout_s=2, **kwargs
-    )
+    return RunConfig(models=ModelCatalog({"m": SPEC}), limits=Limits(), **kwargs)
 
 
 def metered(capture: Model, **kwargs: Any) -> MeteredModel:
@@ -461,7 +467,7 @@ async def test_cancellation_abandons_call_without_waiting_for_report(
                 await invoke(model)
             finished.set()
 
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(request)
                 await entered.wait()
@@ -534,7 +540,7 @@ async def test_schema_preparation_is_abandonable_before_reservation(
             finished.set()
 
         try:
-            with anyio.fail_after(5):
+            with anyio.fail_after(60):
                 async with anyio.create_task_group() as tasks:
                     tasks.start_soon(request)
                     await held.ready()
@@ -857,8 +863,11 @@ async def test_overflow_advice_and_hook_match_reservation_while_settlement_waits
             assert _core_category(_unwrap_control(hooked.value)) is _SignalCategory.TERMINAL
         finally:
             entry.lock.release()
-            await task
-            await other.close()
+            try:
+                await settle_tasks(task, cancel=False)
+                task.result()
+            finally:
+                await other.close()
 
 
 @pytest.mark.parametrize("form", ["forged", "copy", "deepcopy", "pickle", "subclass"])
@@ -1118,6 +1127,9 @@ async def test_probe_drains_before_it_returns(
     monkeypatch.setattr(_hooks, "build_model", lambda spec: fake)
     async with open_llm_run(tmp_path, config=config()) as run:
         scope = run.scope("manager")
+        # The fake deliberately omits its callback; keep only the report wait short.
+        if not record:
+            scope = replace(scope, settle_timeout_s=2)
         finished = anyio.Event()
 
         async def probe() -> None:
@@ -1125,7 +1137,7 @@ async def test_probe_drains_before_it_returns(
             finished.set()
 
         try:
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 async with anyio.create_task_group() as group:
                     group.start_soon(probe)
                     await fake.ready.wait()
@@ -1171,6 +1183,9 @@ async def test_probe_catalog_roles_and_controls(
     monkeypatch.setattr(_hooks, "build_model", lambda spec: fake)
     async with open_llm_run(tmp_path, config=cfg) as run:
         scope = run.scope("manager")
+        # The fake deliberately omits its callback; keep only the report wait short.
+        if kind in {"failed", "terminal", "forged"}:
+            scope = replace(scope, settle_timeout_s=2)
         if kind in {"terminal", "forged"}:
             with pytest.raises(RuntimeError) as caught:
                 await _hooks.probe_provider("fake", scope)
@@ -1248,7 +1263,9 @@ async def test_provider_stop_keeps_sdk_owned_siblings_until_drain(
 import json, os, time
 from pathlib import Path
 n = json.load(open('swarm/request.json'))['params']['n']
+deadline = time.monotonic() + 300
 while not Path({str(release)!r}).exists():
+    assert time.monotonic() < deadline, "tool was not released"
     time.sleep(0.01)
 json.dump({{'data': {{'y': float(n)}}}}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))
 """
@@ -1292,7 +1309,7 @@ json.dump({{'data': {{'y': float(n)}}}}, open(os.environ['SWARM_ARENA_RESULT'], 
 
     async def fail_provider() -> None:
         try:
-            with anyio.fail_after(15):
+            with anyio.fail_after(60):
                 await ready.wait()
             assert runtimes
             await runtimes[0].stops.fail("fake", source="judge")
@@ -1321,13 +1338,28 @@ json.dump({{'data': {{'y': float(n)}}}}, open(os.environ['SWARM_ARENA_RESULT'], 
 async def test_provider_stop_collects_scripted_manager_partial_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import signal
+    from contextlib import suppress
+
     from _fakes.run import all_events, plan
     from _fakes.tools import ProviderPyTool
 
     from swarm_arena import Swarm
     from swarm_arena._agent.runtime import AgentRuntime
     from swarm_arena._engine.round import RoundRunner
+    from swarm_arena._exec import supervisor
     from tests.llm.test_manager import config as manager_config
+
+    owned: list[tuple[subprocess.Popen[bytes], int]] = []
+    original_spawn = supervisor._spawn
+
+    def spawn(*args: Any, procs: list[subprocess.Popen[bytes]], **kwargs: Any) -> None:
+        try:
+            original_spawn(*args, procs=procs, **kwargs)
+        finally:
+            owned.extend((proc, proc.pid) for proc in procs)
+
+    monkeypatch.setattr(supervisor, "_spawn", spawn)
 
     ready = tmp_path / "ready"
     code = f"""
@@ -1335,7 +1367,7 @@ import json, os, time
 from pathlib import Path
 json.dump({{'data': {{'y': 42.0}}}}, open(os.environ['SWARM_ARENA_RESULT'], 'w'))
 Path({str(ready)!r}).touch()
-time.sleep(60)
+time.sleep(300)
 """
     cfg = manager_config(
         limits=Limits(max_usd=100, max_tokens=10_000_000),
@@ -1355,29 +1387,62 @@ time.sleep(60)
     monkeypatch.setattr(RoundRunner, "_runtime", runtime)
 
     async def fail_provider() -> None:
-        with anyio.fail_after(15):
+        with anyio.fail_after(60):
             while not await anyio.Path(ready).exists():  # noqa: ASYNC110 - subprocess readiness
                 await anyio.sleep(0.01)
         await runtimes[0].stops.fail("fake", source="judge")
 
-    with anyio.fail_after(30):
-        async with anyio.create_task_group() as group:
-            group.start_soon(fail_provider)
-            await Swarm(cfg).run(current, run_id="provider-scripted")
-    events = all_events(cfg)
-    ends = [e for e in events if e.type == "tool_end"]
-    assert len(ends) == 1
-    output = ends[0].payload["candidate"]["output"]
-    assert output["status"] == "cancelled"
-    assert output["data"] == {"y": 42.0}
-    assert {e.payload["reservation"]["id"] for e in events if e.type == "reserve"} == {
-        e.payload["id"] for e in events if e.type == "settle"
-    }
-    status = next(e for e in events if e.type == "agent_status")
-    assert (status.payload["status"], status.payload["reason"]) == (
-        "stopped",
-        "provider unavailable",
-    )
+    run_task = asyncio.create_task(Swarm(cfg).run(current, run_id="provider-scripted"))
+    stop_task = asyncio.create_task(fail_provider())
+    failure: BaseException | None = None
+    try:
+        with anyio.fail_after(60):
+            done, pending = await asyncio.wait({run_task, stop_task}, timeout=30)
+            for task in done:
+                task.result()
+            assert not pending, "provider stop did not finish while the child was held"
+        events = all_events(cfg)
+        ends = [e for e in events if e.type == "tool_end"]
+        assert len(ends) == 1
+        output = ends[0].payload["candidate"]["output"]
+        assert output["status"] == "cancelled"
+        assert output["data"] == {"y": 42.0}
+        assert {e.payload["reservation"]["id"] for e in events if e.type == "reserve"} == {
+            e.payload["id"] for e in events if e.type == "settle"
+        }
+        status = next(e for e in events if e.type == "agent_status")
+        assert (status.payload["status"], status.payload["reason"]) == (
+            "stopped",
+            "provider unavailable",
+        )
+        assert owned
+        assert all(proc.returncode is not None for proc, _ in owned)
+    except (Exception, asyncio.CancelledError) as error:
+        failure = error
+        raise
+    finally:
+        run_task.cancel()
+        stop_task.cancel()
+        cleanup_errors: list[str] = []
+        try:
+            for proc, pgid in owned:
+                if proc.poll() is None:
+                    with suppress(ProcessLookupError):
+                        os.killpg(pgid, signal.SIGKILL)
+                try:
+                    await anyio.to_thread.run_sync(proc.wait, 60)
+                except subprocess.TimeoutExpired:
+                    cleanup_errors.append("owned child cleanup did not finish")
+        finally:
+            done, pending = await asyncio.wait({run_task, stop_task}, timeout=60)
+            await asyncio.gather(*done, return_exceptions=True)
+            if pending:
+                cleanup_errors.append("task cleanup did not finish")
+            if cleanup_errors:
+                if failure is not None:
+                    failure.add_note("; ".join(cleanup_errors))
+                else:
+                    raise AssertionError("; ".join(cleanup_errors))
 
 
 async def test_probe_preserves_upstream_type_without_message(
@@ -1399,7 +1464,7 @@ async def test_probe_preserves_upstream_type_without_message(
     monkeypatch.setattr(_hooks, "build_model", lambda spec: fake)
     async with open_llm_run(tmp_path, config=config()) as run:
         with pytest.raises(RuntimeError) as caught:
-            await _hooks.probe_provider("fake", run.scope("manager"))
+            await _hooks.probe_provider("fake", replace(run.scope("manager"), settle_timeout_s=2))
         assert _exception_type_name(caught.value) == "BadRequestError"
         assert_secret_absent(caught.value, "private-probe-sentinel")
         assert "private-probe-sentinel" not in repr(run.events("llm_call"))

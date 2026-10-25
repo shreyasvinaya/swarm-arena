@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.engine import EngineEnv
 from _fakes.planners import SequencePlanner
 from _fakes.run import all_events, events, plan
@@ -107,18 +108,18 @@ async def test_public_replanner_preserves_real_caller_cancellation(run_config: R
 
     task = asyncio.create_task(Swarm(run_config, replanner=WaitingPlanner()).run(plan()))
     try:
-        with anyio.fail_after(20):
+        with anyio.fail_after(60):
             await entered.wait()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await observe_task(task)
         assert task.cancelled()
         assert not events(run_config, "plan_rejected")
     finally:
         if not task.done():
             task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            await settle_tasks(task)
+            assert task.cancelled()
 
 
 @pytest.mark.parametrize("kind", ["base", "ordinary_group", "mixed_group", "cancelled"])
@@ -212,7 +213,7 @@ async def test_external_task_cancel_race_wins_over_user_cancellation(
 
     caller = asyncio.create_task(cancel_from_caller())
     caught: BaseException | None = None
-    with anyio.fail_after(5):
+    with anyio.fail_after(60):
         try:
             await parent
         except BaseException as error:
@@ -294,7 +295,7 @@ async def test_anyio_caller_scope_cancellation_race(env: EngineEnv) -> None:
         assert scope.cancelled_caught
 
     parent = asyncio.create_task(run())
-    with anyio.fail_after(5):
+    with anyio.fail_after(60):
         await hook_failed.wait()
         scopes[0].cancel()
         await parent

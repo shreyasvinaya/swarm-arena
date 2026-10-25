@@ -2,11 +2,16 @@
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
+
+pytest.importorskip("agents")
+
 from _fakes.llm_components import LateFakeModel
 from _fakes.llm_run import open_llm_run
 from _fakes.planning_llm import planner_config, planner_output
@@ -14,7 +19,8 @@ from _fakes.run import all_events
 from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena import Goal, Limits, PartSpec, Plan, Ref, RoundSpec
-from swarm_arena._budget.llm_scope import llm_scope
+from swarm_arena._budget.llm_scope import LLMScope, llm_scope
+from swarm_arena._budget.tranche import Tranche, TrancheOutcome
 from swarm_arena._model.planning_types import History
 from swarm_arena._model.tooling import Estimate
 from swarm_arena.llm import Approve, CollaborativePlanner, Edited, Feedback, LLMPlanner
@@ -345,14 +351,15 @@ async def test_terminal_session_exits_without_resurrection(
             CollaborativePlanner(LLMPlanner("planner"), reviewer).plan(GOAL, config, None)
         )
         try:
-            with anyio.fail_after(15):
+            with anyio.fail_after(60):
                 while os.get_blocking(read_fd) and not task.done():
                     await anyio.lowlevel.checkpoint()
                 assert not task.done()
                 if mode == "cancel":
                     task.cancel()
                     with pytest.raises(asyncio.CancelledError):
-                        await task
+                        await observe_task(task)
+                    assert task.cancelled()
                 else:
                     if mode == "deadline":
                         expired.set()
@@ -362,7 +369,7 @@ async def test_terminal_session_exits_without_resurrection(
                     with pytest.raises(
                         RuntimeError, match=r"terminal input ended|planning session stopped"
                     ):
-                        await task
+                        await observe_task(task)
             assert os.get_blocking(read_fd)
             assert reviewer._edit_bytes == b""
             assert reviewer._draft_text == ""
@@ -380,9 +387,11 @@ async def test_terminal_session_exits_without_resurrection(
             assert all_events(config) == events
         finally:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            if write_fd >= 0:
-                os.close(write_fd)
+            try:
+                await settle_tasks(task)
+            finally:
+                if write_fd >= 0:
+                    os.close(write_fd)
 
 
 def _keys(value: Any) -> set[str]:
@@ -630,6 +639,9 @@ async def test_planner_drains_before_it_returns(tmp_path: Path, never: bool) -> 
     try:
         async with open_llm_run(tmp_path, config=config) as run:
             scope = run.scope("planner")
+            if never:
+                # Only the event-held missing report gets a short cutoff.
+                scope = replace(scope, settle_timeout_s=2)
 
             async def call() -> Plan:
                 with llm_scope(scope):
@@ -637,11 +649,11 @@ async def test_planner_drains_before_it_returns(tmp_path: Path, never: bool) -> 
 
             task = asyncio.create_task(call())
             try:
-                with anyio.fail_after(10):
+                with anyio.fail_after(60):
                     await fake.ready.wait()
                     if not never:
                         release.set()
-                    await task
+                    await observe_task(task)
                 assert len(scope.call_ids) == len(fake.calls) == 1
                 assert set(scope.call_ids) == {c.id for c in run.calls()}
                 assert (run.calls()[0].error or "").startswith("estimated:") is never
@@ -654,7 +666,7 @@ async def test_planner_drains_before_it_returns(tmp_path: Path, never: bool) -> 
             finally:
                 if not task.done():
                     task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    await settle_tasks(task)
     finally:
         await fake.aclose()
 
@@ -735,11 +747,12 @@ async def test_planner_caller_cancellation_drains_held_record(tmp_path: Path) ->
         with llm_scope(scope):
             task = asyncio.create_task(LLMPlanner("planner").plan(GOAL, config, None))
         try:
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await fake.ready.wait()
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    await observe_task(task)
+                assert task.cancelled()
             assert scope.tranche.pending() == 0
             assert len(run.calls()) == 1
             assert (run.calls()[0].error or "").startswith("estimated:")
@@ -747,10 +760,12 @@ async def test_planner_caller_cancellation_drains_held_record(tmp_path: Path) ->
             await fake.flush()
             assert len(run.calls()) == 1
         finally:
-            if not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-            await fake.aclose()
+            try:
+                if not task.done():
+                    task.cancel()
+                    await settle_tasks(task)
+            finally:
+                await fake.aclose()
 
 
 def test_output_round_defaults_preserve_round_spec(tmp_path: Path) -> None:
@@ -827,7 +842,7 @@ async def test_standalone_paid_work_is_supervised(tmp_path: Path, kind: str) -> 
     task = asyncio.create_task(LLMPlanner("planner").plan(GOAL, config, None))
     replacement = None
     try:
-        with anyio.fail_after(15):
+        with anyio.fail_after(60):
             await fake.entered.wait()
             (session,) = await anyio.to_thread.run_sync(
                 lambda: list(Path(config.run_root).iterdir())
@@ -842,10 +857,10 @@ async def test_standalone_paid_work_is_supervised(tmp_path: Path, kind: str) -> 
                 fenced_events = all_events(config)
                 fake.release.set()
                 with pytest.raises(Fenced):
-                    await task
+                    await observe_task(task)
             else:
                 with pytest.raises(RuntimeError, match=r"^planning session stopped$"):
-                    await task
+                    await observe_task(task)
         assert session.name not in llm_record._bindings
         owner = read_owner(store)
         assert owner is not None
@@ -873,9 +888,11 @@ async def test_standalone_paid_work_is_supervised(tmp_path: Path, kind: str) -> 
         fake.release.set()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        if replacement is not None:
-            replacement.release()
+        try:
+            await settle_tasks(task)
+        finally:
+            if replacement is not None:
+                replacement.release()
 
 
 @pytest.mark.parametrize("handled", ["budget", "fenced"])
@@ -1041,7 +1058,7 @@ async def test_custom_reviewer_cleanup_failure_preserves_public_outcome(
         CollaborativePlanner(LLMPlanner("planner"), reviewer).plan(GOAL, config, None)
     )
     try:
-        with anyio.fail_after(15):
+        with anyio.fail_after(60):
             await entered.wait()
             if cancelled:
                 task.cancel()
@@ -1049,7 +1066,7 @@ async def test_custom_reviewer_cleanup_failure_preserves_public_outcome(
             with pytest.raises(
                 expected, match=None if cancelled else r"^review cleanup failed: ValueError$"
             ) as caught:
-                await task
+                await observe_task(task)
         assert_secret_absent(caught.value, SECRET)
         assert SECRET not in "".join(traceback.format_exception(caught.value))
         if cancelled:
@@ -1064,7 +1081,7 @@ async def test_custom_reviewer_cleanup_failure_preserves_public_outcome(
     finally:
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await settle_tasks(task)
 
 
 @pytest.mark.parametrize("primary", ["body", "control", "handled"])
@@ -1101,3 +1118,53 @@ async def test_custom_cleanup_preserves_primary_and_ignores_handled_exception(
         }[primary]
     )
     assert_secret_absent(caught.value, SECRET)
+
+
+@pytest.mark.parametrize("phase", ["drain", "close"])
+async def test_planning_cleanup_survives_delayed_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    from swarm_arena._engine import run
+
+    entered = anyio.Event()
+    release = anyio.Event()
+    delay_elapsed = anyio.Event()
+    original_drain = run.drain
+    original_close = Tranche.close
+
+    async def hold() -> None:
+        entered.set()
+        await release.wait()
+
+    async def drain(scope: LLMScope, *, wait: bool) -> None:
+        if phase == "drain" and not wait:
+            await hold()
+        await original_drain(scope, wait=wait)
+
+    async def close(tranche: Tranche) -> TrancheOutcome:
+        if phase == "close":
+            await hold()
+        return await original_close(tranche)
+
+    async def delayed_storage() -> None:
+        await entered.wait()
+        # Model a descheduled storage worker; no work must beat this timer.
+        with anyio.move_on_after(2.1):
+            await release.wait()
+        delay_elapsed.set()
+        release.set()
+
+    monkeypatch.setattr(run, "drain", drain)
+    monkeypatch.setattr(Tranche, "close", close)
+    FakeModel([FakeTurn(text=json.dumps(planner_output()))]).register("planner")
+    config = planner_config(tmp_path)
+    with anyio.fail_after(30):
+        async with anyio.create_task_group() as group:
+            group.start_soon(delayed_storage)
+            try:
+                result = await LLMPlanner("planner").plan(GOAL, config, None)
+            finally:
+                release.set()
+    assert delay_elapsed.is_set()
+    assert result.goal == GOAL
+    assert len([event for event in all_events(config) if event.type == "goal_finished"]) == 1

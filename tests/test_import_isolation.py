@@ -1,7 +1,10 @@
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
+
+_RAY_HINT = 'uv add "swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena"'
 
 # The module list of test_public_api.PUBLIC, repeated so this test stands alone.
 PUBLIC = (
@@ -17,6 +20,17 @@ PUBLIC = (
     "swarm_arena.testing",
 )
 OPTIONAL = ("agents", "litellm", "ray", "s3fs", "langfuse", "a2a")
+
+
+def test_core_import_does_not_load_gateway_transport() -> None:
+    code = """
+import sys
+import swarm_arena
+assert 'swarm_arena._gateway.litellm_proxy' not in sys.modules
+"""
+    subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=30
+    )
 
 
 @pytest.mark.parametrize("missing", ["openai-agents", "litellm"])
@@ -125,3 +139,109 @@ assert dir(testing) == sorted(set(dir(testing)))
     subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=30
     )
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BLOCK_RAY = "import sys; sys.modules['ray'] = None\n"
+FAKE_RAY_DIST = """
+import importlib.metadata
+_original_version = importlib.metadata.version
+def version(name):
+    return '2.59.0' if name == 'ray' else _original_version(name)
+importlib.metadata.version = version
+"""
+HIDE_RAY_DIST = (
+    FAKE_RAY_DIST
+    + """
+def version(name):
+    if name == 'ray':
+        raise importlib.metadata.PackageNotFoundError('ray-secret-sentinel')
+    return _original_version(name)
+importlib.metadata.version = version
+"""
+)
+BOOM_FINDER = """
+import sys
+class Finder:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'ray':
+            raise ImportError('boom inside ray')
+sys.meta_path.insert(0, Finder())
+"""
+MISSING_SUB_FINDER = BOOM_FINDER.replace(
+    "ImportError('boom inside ray')",
+    """ModuleNotFoundError("No module named 'ray._private'", name='ray._private')""",
+)
+
+
+def test_ray_facade_error_without_extra() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", FAKE_RAY_DIST + BLOCK_RAY + "import swarm_arena.ray"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode != 0
+    assert _RAY_HINT in result.stderr
+
+
+def test_ray_facade_error_with_tests_dir_on_path() -> None:
+    code = HIDE_RAY_DIST + "import sys; sys.path.insert(0, 'tests'); import swarm_arena.ray"
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        timeout=30,
+    )
+    assert result.returncode != 0
+    assert _RAY_HINT in result.stderr
+    assert "ModuleNotFoundError" in result.stderr
+    assert "ray-secret-sentinel" not in result.stderr
+
+
+def test_ray_facade_keeps_other_import_errors() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", FAKE_RAY_DIST + BOOM_FINDER + "import swarm_arena.ray"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode != 0
+    assert "boom inside ray" in result.stderr
+    assert "pip install" not in result.stderr
+
+
+def test_ray_facade_keeps_missing_vendor_submodule() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", FAKE_RAY_DIST + MISSING_SUB_FINDER + "import swarm_arena.ray"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode != 0
+    assert "No module named 'ray._private'" in result.stderr
+    assert "swarm-arena[" not in result.stderr
+
+
+def test_ray_facade_refuses_namespace_package_with_distribution() -> None:
+    code = (
+        FAKE_RAY_DIST
+        + """
+import importlib.machinery, sys
+class NamespaceFinder:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'ray':
+            spec = importlib.machinery.ModuleSpec('ray', loader=None, is_package=True)
+            spec.submodule_search_locations = ['tests/ray']
+            return spec
+sys.meta_path.insert(0, NamespaceFinder())
+sys.path.insert(0, 'tests')
+import swarm_arena.ray
+"""
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, cwd=REPO_ROOT, timeout=30
+    )
+    assert result.returncode != 0
+    assert _RAY_HINT in result.stderr

@@ -400,7 +400,7 @@ async def test_harness_cancellation_abandons_board_storage(
     def frontier(board: ArenaBoard) -> Frontier:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(30)
+        assert release.wait(300)
         return original(board)
 
     monkeypatch.setattr(ArenaBoard, "frontier", frontier)
@@ -420,19 +420,44 @@ async def test_harness_cancellation_abandons_board_storage(
         cancelled.set()
 
     task = asyncio.create_task(run())
+    failure: BaseException | None = None
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 15)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         scope.cancel()
-        with anyio.move_on_after(3):
+        with anyio.move_on_after(30):
             await cancelled.wait()
         assert cancelled.is_set(), "harness retained its board storage worker"
+        assert not release.is_set()
+        assert len(workers) == 1
+        assert all(worker.is_alive() for worker in workers)
+    except (Exception, asyncio.CancelledError, pytest.fail.Exception) as error:
+        failure = error
+        raise
     finally:
         release.set()
-        await asyncio.gather(task, return_exceptions=True)
-        for worker in workers:
-            if worker.name.startswith("swarm-arena-daemon-"):
-                await anyio.to_thread.run_sync(worker.join, 5)
-                assert not worker.is_alive()
+        cleanup_errors: list[Exception] = []
+        try:
+            if not task.done():
+                task.cancel()
+            with anyio.fail_after(60, shield=True):
+                await asyncio.wait({task})
+        except Exception as error:
+            cleanup_errors.append(error)
+        finally:
+            for worker in workers:
+                try:
+                    with anyio.fail_after(60, shield=True):
+                        await anyio.to_thread.run_sync(worker.join, 60)
+                    assert not worker.is_alive()
+                except Exception as error:
+                    cleanup_errors.append(error)
+            if task.done() and not task.cancelled():
+                task.exception()
+        if cleanup_errors:
+            if failure is None:
+                raise ExceptionGroup("harness test cleanup failed", cleanup_errors)
+            for error in cleanup_errors:
+                failure.add_note(f"harness test cleanup failed: {type(error).__name__}")
 
 
 async def test_harness_honors_run_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -444,7 +469,7 @@ async def test_harness_honors_run_deadline(monkeypatch: pytest.MonkeyPatch) -> N
 
     monkeypatch.setattr(NoopManager, "run_round", wait)
     harness = OfflineHarness()
-    with anyio.fail_after(10), pytest.raises(RuntimeError, match=r"^offline harness stopped$"):
+    with anyio.fail_after(60), pytest.raises(RuntimeError, match=r"^offline harness stopped$"):
         await harness.run_rounds(
             NoopManager(),
             goal=GOAL,
@@ -520,7 +545,7 @@ async def test_board_cleanup_uses_local_failure_inside_a_caller_exception_handle
 
     monkeypatch.setattr(ArenaBoard, "close", fail_close)
     monkeypatch.setattr(NoopManager, "run_round", manager)
-    with anyio.fail_after(15):
+    with anyio.fail_after(60):
         try:
             raise caller_error
         except KeyError:

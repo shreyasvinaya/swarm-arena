@@ -490,6 +490,40 @@ async def test_keep_charged_settlement_survives_replay(env: LedgerEnv) -> None:
     assert await env.charged("g1/t/a") == Amount(usd=10)
 
 
+async def test_keep_charged_settle_charges_full(env: LedgerEnv) -> None:
+    await _setup(env)
+    before = env.ledger.remaining("g1/t/a")
+    reservation = await env.ledger.reserve(
+        "g1/t/a", Amount(usd=1), kind="tool", goal_id="g1", keep_charged=True
+    )
+    await env.ledger.settle(reservation.id, Amount(usd=0.1))
+    assert env.ledger.remaining("g1/t/a") == before - Amount(usd=1)
+    settle = next(e.payload for e in reversed(await env.committed()) if e.type == "settle")
+    assert settle["actual"] == {"tokens": 0, "usd": 0.1}
+    assert settle["charged"] == {"tokens": 0, "usd": 1.0}
+    assert settle["keep_charged"] is True
+
+
+async def test_keep_charged_not_returned_at_end_goal(env: LedgerEnv) -> None:
+    await _setup(env)
+    before = env.ledger.remaining(":run")
+    work = sum((Amount.from_estimate(env.ledger.goal_remaining(g)) for g in ("g1", "g2")), Amount())
+    free = env.ledger.free()
+    reservation = await env.ledger.reserve(
+        "g1/t/a", Amount(usd=1), kind="tool", goal_id="g1", keep_charged=True
+    )
+    await env.ledger.settle(reservation.id, Amount(usd=0.1))
+    await env.end("g1")
+    await env.end("g2")
+    assert env.ledger.remaining(":run") == before
+    assert env.ledger.free() == free + work - Amount(usd=1)
+    assert env.ledger._charges[reservation.id] == Amount(usd=1)
+    replayed = Ledger.replay(
+        RunState.from_events(await env.committed()), journal=env.journal, ids=env.ids
+    )
+    assert _balances(replayed) == _balances(env.ledger)
+
+
 async def test_failed_reserve_keeps_debit(env: LedgerEnv, monkeypatch: pytest.MonkeyPatch) -> None:
     await _setup(env)
 
@@ -1129,3 +1163,23 @@ async def test_native_cancelled_settlement_is_final_at_admission(
     await settle()
     assert env.journal._next_seq == before
     assert await env.count("settle") == 1
+
+
+async def test_promote_keep_charged_preserves_one_booking_and_replay(env: LedgerEnv) -> None:
+    await _setup(env)
+    res = await env.ledger.reserve("g1/t/a", Amount(usd=1), kind="tool", goal_id="g1")
+    before = _balances(env.ledger)
+    promoted = await env.ledger._keep_charged(res.id)
+    assert promoted.keep_charged
+    assert _balances(env.ledger) == before
+    assert await env.ledger._keep_charged(res.id) == promoted
+    state = RunState.from_events(await env.committed())
+    assert state.reservations[res.id].reservation["keep_charged"] is True
+    replayed = Ledger.replay(state, journal=env.journal, ids=env.ids)
+    assert _balances(replayed) == before
+    await env.ledger.settle(res.id, Amount())
+    assert _balances(env.ledger) == before
+    replayed = Ledger.replay(
+        RunState.from_events(await env.committed()), journal=env.journal, ids=env.ids
+    )
+    assert _balances(replayed) == before

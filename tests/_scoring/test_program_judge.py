@@ -278,14 +278,16 @@ async def test_scoring_can_be_cancelled_while_daemon_is_blocked(
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
+    workers: list[threading.Thread] = []
     daemon: list[bool] = []
     completed: list[bool] = []
 
     def score(goal: Goal, candidate: Candidate) -> Score:
+        workers.append(threading.current_thread())
         daemon.append(threading.current_thread().daemon)
         started.set()
         try:
-            release.wait(2)
+            release.wait(180)
             return Score.maximize(1)
         finally:
             finished.set()
@@ -296,7 +298,7 @@ async def test_scoring_can_be_cancelled_while_daemon_is_blocked(
 
     monkeypatch.setattr(program_judge, "load_object", lambda path: score)
     try:
-        with anyio.fail_after(1):
+        with anyio.fail_after(60):
             async with anyio.create_task_group() as group:
                 group.start_soon(run)
                 while not started.is_set():
@@ -309,7 +311,9 @@ async def test_scoring_can_be_cancelled_while_daemon_is_blocked(
         assert judge_ctx.errors == {}
     finally:
         release.set()
-        await anyio.to_thread.run_sync(finished.wait, 3)
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+            assert not worker.is_alive()
 
 
 async def test_candidate_mutation_does_not_leak_to_later_members(

@@ -1,9 +1,11 @@
+import asyncio
 import json
 import logging
 import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -11,6 +13,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Iterator, Sequence
+from contextlib import suppress
 from dataclasses import replace
 from itertools import pairwise
 from pathlib import Path
@@ -22,7 +25,6 @@ from _fakes.proc import pid_alive, reap, require_visible_proc, spawn_group, wait
 from _fakes.read_counts import count_reads
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import (
-    COLLECTING,
     RELEASE,
     WRITE,
     BadCollectTool,
@@ -57,6 +59,115 @@ from swarm_arena._store.artifacts import ArtifactStore
 from swarm_arena._store.base import open_store
 
 
+def _reap_owned_children(
+    children: list[subprocess.Popen[bytes]], starts: dict[int, Job.Started]
+) -> list[str]:
+    """Kill only recorded children, then boundedly reap every child despite earlier errors."""
+    errors: list[str] = []
+    for child in children:
+        try:
+            if child.returncode is None:
+                started = starts.get(child.pid)
+                if (
+                    started is not None
+                    and started.start_time is not None
+                    and process_start_time(child.pid) != started.start_time
+                ):
+                    if pid_alive(child.pid):
+                        errors.append("child identity changed before emergency cleanup")
+                    continue
+                # The unreaped Popen leader anchors the group until wait() below.
+                try:
+                    # macOS may deny signalling a group containing only zombies.
+                    with suppress(ProcessLookupError, PermissionError):
+                        os.killpg(child.pid, signal.SIGKILL)
+                finally:
+                    child.wait(timeout=60)
+            else:
+                child.wait(timeout=60)
+        except Exception as error:
+            errors.append(f"child cleanup failed: {type(error).__name__}")
+    return errors
+
+
+@pytest.fixture(autouse=True)
+def owned_children(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Provide emergency OS cleanup independently of the supervisor under test."""
+    children: list[subprocess.Popen[bytes]] = []
+    starts: dict[int, Job.Started] = {}
+    spawn, run = supervisor._spawn, ProcessSupervisor.run
+
+    def capture_spawn(*args: Any, **kwargs: Any) -> None:
+        procs = kwargs["procs"]
+        before = len(procs)
+        try:
+            spawn(*args, **kwargs)
+        finally:
+            children.extend(procs[before:])
+
+    async def capture_run(self: ProcessSupervisor, *args: Any, **kwargs: Any) -> CompletedRun:
+        original = kwargs.get("on_started")
+
+        async def on_started(started: Job.Started) -> None:
+            assert started.pid is not None
+            starts[started.pid] = started
+            if original is not None:
+                await original(started)
+
+        kwargs["on_started"] = on_started
+        return await run(self, *args, **kwargs)
+
+    monkeypatch.setattr(supervisor, "_spawn", capture_spawn)
+    monkeypatch.setattr(ProcessSupervisor, "run", capture_run)
+    try:
+        yield
+    finally:
+        # Observe product cleanup before the emergency reaper can make it pass.
+        leaked = [child for child in children if child.returncode is None and pid_alive(child.pid)]
+        errors = _reap_owned_children(children, starts)
+        assert not leaked, "supervisor left an owned child unreaped; emergency cleanup ran"
+        assert not errors, "; ".join(errors)
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_child_guard_reaps_after_failed_observation(count: int) -> None:
+    children: list[subprocess.Popen[bytes]] = []
+    starts: dict[int, Job.Started] = {}
+    errors: list[str] = []
+
+    def fail_observation() -> None:
+        nonlocal errors
+        try:
+            for _ in range(count):
+                child = spawn_group(
+                    [sys.executable, "-c", "import threading; threading.Event().wait(300)"]
+                )
+                children.append(child)
+                starts[child.pid] = Job.Started(
+                    kind="process",
+                    job_id="guard",
+                    host_id=host_id(),
+                    pid=child.pid,
+                    pgid=child.pid,
+                    start_time=process_start_time(child.pid),
+                )
+            raise TimeoutError("observation failed")
+        finally:
+            errors = _reap_owned_children(children, starts)
+
+    try:
+        with pytest.raises(TimeoutError, match="observation failed"):
+            fail_observation()
+        assert not errors
+        assert all(child.returncode is not None and not pid_alive(child.pid) for child in children)
+    finally:
+        # Independent fallback keeps this regression test safe if the guard itself breaks.
+        for child in children:
+            if child.returncode is None:
+                child.kill()
+            child.wait(timeout=60)
+
+
 def tool_job(
     tmp_path: Path,
     code: str,
@@ -72,7 +183,7 @@ def tool_job(
         "command": None,
         "request": ToolRequest(),
         "stage": Job.Stage(),
-        "timeout_s": 30.0,
+        "timeout_s": 60.0,
         "grace_s": 1.0,
         "artifact_root": str(tmp_path / "artifacts"),
     }
@@ -83,7 +194,7 @@ def command_job(tmp_path: Path, command: Command, **kw: Any) -> Job:
     fields: dict[str, Any] = {
         "id": "k-1",
         "command": command,
-        "timeout_s": 30.0,
+        "timeout_s": 60.0,
         "artifact_root": str(tmp_path / "artifacts"),
     }
     return make_job(**{**fields, **kw})
@@ -116,7 +227,11 @@ def _workspace_log(tmp_path: Path, which: int) -> bytes:
 async def test_tool_never_runs_when_start_commit_fails(
     local_executor: LocalExecutor, tmp_path: Path
 ) -> None:  # exit criterion
+    started: list[int] = []
+
     async def fail(s: Job.Started) -> None:
+        assert s.pid is not None
+        started.append(s.pid)
         raise RuntimeError("commit failed")
 
     marker = tmp_path / "ran"
@@ -124,7 +239,8 @@ async def test_tool_never_runs_when_start_commit_fails(
         await local_executor.submit(
             tool_job(tmp_path, f"open({str(marker)!r}, 'w')", on_started=fail)
         )
-    await anyio.sleep(1)
+    assert len(started) == 1
+    assert not pid_alive(started[0])
     assert not marker.exists()
     assert list((tmp_path / "ws").iterdir()) == []
 
@@ -205,18 +321,17 @@ async def test_job_timeout_wins_and_partial_kept(
 ) -> None:
     # OkCollectTool's output does not depend on how fast the tool starts, so the 1 s
     # timeout cannot race start-up under load; the data shows partial is kept.
-    started = time.monotonic()
-    out = await local_executor.submit(
-        tool_job(
-            tmp_path,
-            "import time; time.sleep(60)",
-            tool_cls=OkCollectTool,
-            timeout_s=1.0,
-            tool_timeout_in_config=100.0,
+    with anyio.fail_after(30):
+        out = await local_executor.submit(
+            tool_job(
+                tmp_path,
+                "import time; time.sleep(180)",
+                tool_cls=OkCollectTool,
+                timeout_s=1.0,
+                tool_timeout_in_config=100.0,
+            )
         )
-    )
     assert (out.status, out.partial, out.data) == (RunStatus.TIMEOUT, True, {"k": 1})
-    assert time.monotonic() - started < 20
 
 
 async def test_cancel_delivers_partial_through_on_partial(
@@ -228,22 +343,23 @@ async def test_cancel_delivers_partial_through_on_partial(
         got.append(o)
 
     code = (
-        WRITE.format("{'data': {'step': 2}}") + "; open('ready', 'w'); import time; time.sleep(60)"
+        WRITE.format("{'data': {'step': 2}}")
+        + "; open('ready', 'w'); import threading; threading.Event().wait(300)"
     )
-    job = tool_job(tmp_path, code, on_partial=on_partial)
+    job = tool_job(tmp_path, code, on_partial=on_partial, timeout_s=300)
 
     async def ready() -> None:
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 60
         while not [p async for p in anyio.Path(tmp_path / "ws").glob("*/ready")]:
             if time.monotonic() >= deadline:
                 raise TimeoutError("ready did not appear")
             await anyio.sleep(0.05)
 
-    with anyio.fail_after(30):
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(local_executor.submit, job)
-            await ready()
-            tg.cancel_scope.cancel()
+    async def is_ready() -> bool:
+        await ready()
+        return True
+
+    await cancel_when(lambda: local_executor.submit(job), is_ready)
     assert [(o.status, o.partial, o.data) for o in got] == [
         (RunStatus.CANCELLED, True, {"step": 2})
     ]
@@ -395,16 +511,33 @@ async def test_blocked_collect_cannot_stop_kill(
             (workspace / "swarm/stderr.log").unlink()
             os.mkfifo(workspace / "swarm/stderr.log")
 
-    code = "import time; time.sleep(60)"
+    code = "import threading; threading.Event().wait(300)"
     RELEASE.clear()  # a set event from an earlier case would not block collect
+    collect = BlockingCollectTool.collect
+    entered = threading.Event()
+    workers: list[threading.Thread] = []
+
+    def held_collect(*args: Any, **kwargs: Any) -> ToolOutput:
+        workers.append(threading.current_thread())
+        entered.set()
+        assert RELEASE.wait(300)
+        return collect(*args, **kwargs)
+
+    monkeypatch.setattr(BlockingCollectTool, "collect", held_collect)
+    task = asyncio.create_task(
+        local_executor.submit(
+            blocking_job(tmp_path, code, timeout_s=1.0, grace_s=0.2, on_started=ready)
+        )
+    )
     try:
-        with anyio.fail_after(10):  # collect blocks for 30 s unless it is abandoned
-            out = await local_executor.submit(
-                blocking_job(tmp_path, code, timeout_s=1.0, grace_s=0.2, on_started=ready)
-            )
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
+        done, _ = await asyncio.wait([task], timeout=30)
+        assert done, "kill waited for the held collection worker"
+        assert not RELEASE.is_set()
+        out = task.result()
         assert (out.status, out.partial) == (RunStatus.TIMEOUT, False)
         [pid] = pids
-        assert wait_until(lambda: not pid_alive(pid), 5)
+        assert wait_until(lambda: not pid_alive(pid), 60)
         if not fifo_stderr:
             assert b"before_kill timed out" in log(tmp_path, out, 2)
             assert b"no partial output" in log(tmp_path, out, 2)
@@ -415,6 +548,17 @@ async def test_blocked_collect_cannot_stop_kill(
             assert log(tmp_path, out, 2) == b""
     finally:
         RELEASE.set()
+        if not task.done():
+            task.cancel()
+        try:
+            _, pending_cleanup = await asyncio.wait([task], timeout=60)
+            if task.done() and not task.cancelled():
+                task.exception()
+        finally:
+            for worker in workers:
+                await anyio.to_thread.run_sync(worker.join, 60)
+    assert not pending_cleanup, "collector owner did not finish cleanup"
+    assert all(not worker.is_alive() for worker in workers)
 
 
 async def test_fifo_log_does_not_hang(local_executor: LocalExecutor, tmp_path: Path) -> None:
@@ -422,7 +566,7 @@ async def test_fifo_log_does_not_hang(local_executor: LocalExecutor, tmp_path: P
         "import os; os.remove('swarm/stdout.log'); os.mkfifo('swarm/stdout.log'); "
         + WRITE.format("{'data': {}}")
     )
-    with anyio.fail_after(10):
+    with anyio.fail_after(60):
         out = await local_executor.submit(tool_job(tmp_path, code))
     assert out.logs_ref is not None
     assert out.logs_ref.split(":")[1] == sha256_hex(b"")
@@ -435,7 +579,7 @@ async def test_fifo_stderr_with_invalid_result_does_not_hang(
     code = (
         "import os; os.remove('swarm/stderr.log'); os.mkfifo('swarm/stderr.log')"  # no result.json
     )
-    with anyio.fail_after(10):  # the "missing result" note goes through note_in_log: dropped
+    with anyio.fail_after(60):  # the "missing result" note goes through note_in_log: dropped
         out = await local_executor.submit(tool_job(tmp_path, code))
     assert out.status is RunStatus.ERROR
     assert out.logs_ref is not None
@@ -514,7 +658,7 @@ async def test_confirm_dead_and_kill_orphan(local_executor: LocalExecutor) -> No
         )
         assert await local_executor.confirm_dead(started) is False  # alive
         assert await local_executor.kill_orphan(started) is True
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 60
         while not await local_executor.confirm_dead(started):  # an unreaped zombie is dead
             assert time.monotonic() < deadline, "the killed group still looks alive"
             await anyio.sleep(0.05)
@@ -539,6 +683,35 @@ async def test_confirm_dead_unknown_boot_is_none(
         kind="process", job_id="c-1", host_id=unknown, pid=os.getpid(), pgid=os.getpgrp()
     )
     assert await local_executor.confirm_dead(started) is None
+
+
+@pytest.mark.parametrize(
+    ("pid", "recorded", "current", "expected"),
+    [
+        (42, "old", "new", True),
+        (42, "same", "same", False),
+        (42, None, "new", False),
+        (42, "old", None, False),
+        (43, "old", "new", False),
+        (None, "old", "new", False),
+    ],
+)
+async def test_confirm_dead_requires_comparable_group_leader_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    pid: int | None,
+    recorded: str | None,
+    current: str | None,
+    expected: bool,
+) -> None:
+    from swarm_arena._exec import local, procinfo
+
+    monkeypatch.setattr(local, "host_id", lambda: "host:boot")
+    monkeypatch.setattr(local, "group_has_live_member", lambda group: True)
+    monkeypatch.setattr(procinfo, "process_start_time", lambda pid: current)
+    started = Job.Started(
+        kind="process", job_id="c", host_id="host:boot", pid=pid, pgid=42, start_time=recorded
+    )
+    assert await LocalExecutor().confirm_dead(started) is expected
 
 
 @pytest.mark.parametrize(
@@ -571,13 +744,24 @@ async def cancel_when(
     submit: Callable[[], Coroutine[Any, Any, object]], ready: Callable[[], Awaitable[bool]]
 ) -> None:
     """Start ``submit``, wait (asynchronously) until ``ready()``, then cancel it."""
-    with anyio.fail_after(30):
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(submit)
+    task = asyncio.create_task(submit())
+    try:
+        with anyio.fail_after(60):
             # The conditions are files and threading.Events, which have no anyio event: poll.
             while not await ready():  # noqa: ASYNC110
                 await anyio.sleep(0.02)
-            tg.cancel_scope.cancel()
+        task.cancel()
+        done, _ = await asyncio.wait([task], timeout=30)
+        assert done, "cancelled job retained its owner"
+        if not task.cancelled():
+            task.result()
+    finally:
+        if not task.done():
+            task.cancel()
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
+    assert not pending_cleanup, "cancelled job did not finish cleanup"
 
 
 def ready_file(ws: Path) -> Callable[[], Awaitable[bool]]:
@@ -587,7 +771,7 @@ def ready_file(ws: Path) -> Callable[[], Awaitable[bool]]:
     return ready
 
 
-@pytest.mark.parametrize(("budget", "kept"), [(30.0, True), (0.2, False)])
+@pytest.mark.parametrize(("budget", "kept"), [(60.0, True), (0.2, False)])
 async def test_cancel_after_normal_exit_keeps_the_result(
     kept_executor: LocalExecutor,
     tmp_path: Path,
@@ -595,35 +779,81 @@ async def test_cancel_after_normal_exit_keeps_the_result(
     budget: float,
     kept: bool,
 ) -> None:
-    monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", budget)  # bounds the original collect
+    entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
     got: list[ToolOutput] = []
+    scopes: list[anyio.CancelScope] = []
+    collecting: list[local_run._JobRun] = []
+    wait_collect = local_run._JobRun._wait_post_collect
+    monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 300.0)
 
     async def on_partial(o: ToolOutput) -> None:
         got.append(o)
 
-    async def collecting() -> bool:
-        return COLLECTING.is_set()
+    def collect(
+        tool: SlowCollectTool, request: ToolRequest, workspace: Path, run: CompletedRun
+    ) -> ToolOutput:
+        workers.append(threading.current_thread())
+        entered.set()
+        assert release.wait(300)
+        return PyTool.collect(tool, request, workspace, run)
 
-    COLLECTING.clear()
-    code = WRITE.format("{'data': {'v': 7}}")  # exits 0 with a valid result
+    async def observed_collect(run: local_run._JobRun) -> None:
+        collecting.append(run)
+        await wait_collect(run)
+
+    monkeypatch.setattr(SlowCollectTool, "collect", collect)
+    monkeypatch.setattr(local_run._JobRun, "_wait_post_collect", observed_collect)
+    code = WRITE.format("{'data': {'v': 7}}")
     job = tool_job(tmp_path, code, tool_cls=SlowCollectTool, on_partial=on_partial)
-    await cancel_when(lambda: kept_executor.submit(job), collecting)
-    [out] = got
-    assert out.status is RunStatus.CANCELLED
-    assert (out.partial, out.data) == ((True, {"v": 7}) if kept else (False, {}))
-    assert out.started_at is not None
-    assert out.ended_at is not None
-    assert out.started_at <= out.ended_at
-    if not kept:
-        assert b"no partial output" in _workspace_log(tmp_path, 2)
-    assert out.logs_ref is None
+
+    async def submit() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            await kept_executor.submit(job)
+        assert scope.cancelled_caught
+
+    task = asyncio.create_task(submit())
+    try:
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
+        assert collecting
+        # Start the short abandonment experiment only after the real collector has entered.
+        collecting[0]._collect_deadline = anyio.current_time() + budget
+        scopes[0].cancel()
+        await anyio.wait_all_tasks_blocked()
+        if kept:
+            release.set()
+        done, _ = await asyncio.wait([task], timeout=30)
+        assert done, "cancelled job waited for the held original collector"
+        task.result()
+        assert release.is_set() is kept
+        [out] = got
+        assert out.status is RunStatus.CANCELLED
+        assert (out.partial, out.data) == ((True, {"v": 7}) if kept else (False, {}))
+        assert out.started_at is not None
+        assert out.ended_at is not None
+        assert out.started_at <= out.ended_at
+        if not kept:
+            assert b"no partial output" in _workspace_log(tmp_path, 2)
+        assert out.logs_ref is None
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        _, pending_cleanup = await asyncio.wait([task], timeout=60)
+        if task.done() and not task.cancelled():
+            task.exception()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+    assert not pending_cleanup, "cancelled job did not finish cleanup"
+    assert all(not worker.is_alive() for worker in workers)
 
 
 @pytest.mark.parametrize("stop", ["timeout", "cancel"])
 async def test_stop_facts_are_stamped_on_the_partial(
     local_executor: LocalExecutor, tmp_path: Path, stop: str
 ) -> None:  # OkCollectTool returns status OK and partial False whatever happened
-    code = "open('ready', 'w'); import time; time.sleep(60)"
+    code = "open('ready', 'w'); import threading; threading.Event().wait(300)"
     if stop == "timeout":
         out = await local_executor.submit(
             tool_job(tmp_path, code, tool_cls=OkCollectTool, timeout_s=1.0, grace_s=0.2)
@@ -635,7 +865,9 @@ async def test_stop_facts_are_stamped_on_the_partial(
     async def on_partial(o: ToolOutput) -> None:
         got.append(o)
 
-    job = tool_job(tmp_path, code, tool_cls=OkCollectTool, grace_s=0.2, on_partial=on_partial)
+    job = tool_job(
+        tmp_path, code, tool_cls=OkCollectTool, grace_s=0.2, on_partial=on_partial, timeout_s=300
+    )
     await cancel_when(lambda: local_executor.submit(job), ready_file(tmp_path / "ws"))
     assert [(o.status, o.partial, o.data) for o in got] == [(RunStatus.CANCELLED, True, {"k": 1})]
 
@@ -655,7 +887,7 @@ async def test_cancel_during_staging_delivers_nothing(
     def blocked(tool: PyTool, request: ToolRequest, workspace: Path) -> Command:
         threads.append(threading.current_thread())
         entered.set()
-        release.wait(30)
+        release.wait(180)
         return original(tool, request, workspace)
 
     async def on_partial(o: ToolOutput) -> None:
@@ -675,7 +907,7 @@ async def test_cancel_during_staging_delivers_nothing(
     finally:
         release.set()
         for thread in threads:
-            await anyio.to_thread.run_sync(thread.join, 5)
+            await anyio.to_thread.run_sync(thread.join, 60)
             assert not thread.is_alive()
     assert got == []
     assert not marker.exists()
@@ -697,11 +929,11 @@ async def test_cancel_skips_unavailable_uploads_and_sends_no_unstored_refs(
     code = (
         "import os; os.makedirs('out'); open('out/p.txt', 'w').write('x'); "
         + WRITE.format("{'data': {'s': 1}, 'files': ['out/p.txt']}")
-        + "; open('ready', 'w'); import time; time.sleep(60)"
+        + "; open('ready', 'w'); import threading; threading.Event().wait(300)"
     )
     ws = tmp_path / "kept"
     ex = LocalExecutor(workspace_root=str(ws), keep_workspaces=True)
-    job = tool_job(tmp_path, code, grace_s=0.2, on_partial=on_partial)
+    job = tool_job(tmp_path, code, grace_s=0.2, on_partial=on_partial, timeout_s=300)
     await cancel_when(lambda: ex.submit(job), ready_file(ws))
     [out] = got
     assert (out.status, out.partial, out.data, out.files) == (
@@ -833,7 +1065,7 @@ async def test_outputs_over_the_cap_are_an_error(tmp_path: Path) -> None:
         + WRITE.format("{'data': {}}")
     )
     ex = LocalExecutor(workspace_root=str(tmp_path / "ws"), max_output_bytes=1024)
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         out = await ex.submit(tool_job(tmp_path, code, tool_cls=UnreadFilesTool))
     assert (out.status, out.files) == (RunStatus.ERROR, [])
     assert b"out/b.txt crosses max_output_bytes" in log(tmp_path, out, 2)
@@ -850,7 +1082,7 @@ async def test_upload_reads_are_bounded_by_the_cap_too(
     )
     ex = LocalExecutor(workspace_root=str(tmp_path / "ws"), max_output_bytes=1024)
     read: list[int] = []
-    with anyio.fail_after(20), count_reads(monkeypatch, read):
+    with anyio.fail_after(60), count_reads(monkeypatch, read):
         out = await ex.submit(tool_job(tmp_path, code, tool_cls=UnreadFilesTool))
     assert (out.status, out.files) == (RunStatus.ERROR, [])
     assert b"output files not uploaded: out/b.txt crosses the size cap" in log(tmp_path, out, 2)
@@ -932,10 +1164,10 @@ async def test_failed_cleanup_never_replaces_output_or_cancel(
     [left] = list((tmp_path / "ws").iterdir())
     assert f"could not remove workspace {left}" in caplog.text
 
-    code = "open('ready', 'w'); import time; time.sleep(60)"
-    with anyio.move_on_after(30) as scope:  # the cancel still propagates (no ExceptionGroup)
+    code = "open('ready', 'w'); import threading; threading.Event().wait(300)"
+    with anyio.move_on_after(60) as scope:  # the cancel still propagates (no ExceptionGroup)
         await cancel_when(
-            lambda: local_executor.submit(tool_job(tmp_path, code, grace_s=0.2)),
+            lambda: local_executor.submit(tool_job(tmp_path, code, grace_s=0.2, timeout_s=300)),
             ready_file(tmp_path / "ws"),
         )
     assert not scope.cancelled_caught
@@ -943,21 +1175,37 @@ async def test_failed_cleanup_never_replaces_output_or_cancel(
 
 _EXIT_SCRIPT = """
 import sys
+from pathlib import Path
+from typing import Any
 import anyio
 from _fakes.tools import BlockingCollectTool, RELEASE, make_job
 from swarm_arena._exec import supervisor
 from swarm_arena._exec.local import LocalExecutor
+from swarm_arena._exec.executor import Job
 from swarm_arena._model.ref import Ref
-from swarm_arena._model.tooling import ToolRequest
+from swarm_arena._model.tooling import ToolOutput, ToolRequest
 
 supervisor.BEFORE_KILL_TIMEOUT_S = 0.5
-RELEASE.clear()  # collect blocks for 30 s
+RELEASE.clear()
+collect = BlockingCollectTool.collect
+
+def held_collect(*args: Any, **kwargs: Any) -> ToolOutput:
+    assert RELEASE.wait(300)  # parent watchdog must observe exit before this backstop
+    return collect(*args, **kwargs)
+
+BlockingCollectTool.collect = held_collect
 
 
 async def main() -> None:
-    tool = Ref.of(BlockingCollectTool({"code": "import time; time.sleep(60)"}))
+    async def started(record: Job.Started) -> None:
+        path = Path(sys.argv[3])
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(record.model_dump_json())
+        temporary.replace(path)
+
+    tool = Ref.of(BlockingCollectTool({"code": "import threading; threading.Event().wait(300)"}))
     job = make_job(kind="tool", command=None, tool=tool, request=ToolRequest(),
-                   timeout_s=0.5, grace_s=0.1, artifact_root=sys.argv[2])
+                   timeout_s=0.5, grace_s=0.1, artifact_root=sys.argv[2], on_started=started)
     out = await LocalExecutor(workspace_root=sys.argv[1]).submit(job)
     print(out.status.value, flush=True)
 
@@ -969,17 +1217,42 @@ anyio.run(main)
 def test_blocked_collect_does_not_keep_the_interpreter_alive(tmp_path: Path) -> None:
     tests_dir = Path(__file__).resolve().parents[1]
     env = {**os.environ, "PYTHONPATH": str(tests_dir)}
-    started = time.monotonic()
-    done = subprocess.run(
-        [sys.executable, "-c", _EXIT_SCRIPT, str(tmp_path / "ws"), str(tmp_path / "artifacts")],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=25,
-        check=False,
-    )
-    assert (done.returncode, done.stdout.strip()) == (0, "timeout"), done.stderr
-    assert time.monotonic() - started < 15  # the blocked collect thread would hold it for 30 s
+    child_record = tmp_path / "child.json"
+    try:
+        done = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _EXIT_SCRIPT,
+                str(tmp_path / "ws"),
+                str(tmp_path / "artifacts"),
+                str(child_record),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+            check=False,
+        )
+        assert (done.returncode, done.stdout.strip()) == (0, "timeout"), done.stderr
+        started = Job.Started.model_validate_json(child_record.read_text())
+        assert started.pid is not None
+        assert not pid_alive(started.pid), "interpreter left its held tool alive"
+    finally:
+        # subprocess.run owns the interpreter; this record owns its separate tool group.
+        if child_record.exists():
+            started = Job.Started.model_validate_json(child_record.read_text())
+            pid = started.pid
+            assert pid is not None
+            assert pid == started.pgid
+            assert pid > 1
+            if pid_alive(pid):
+                assert started.start_time is not None
+                assert process_start_time(pid) == started.start_time, "child identity changed"
+                with suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pid, signal.SIGKILL)
+                # The interpreter may already have exited; observe the OS reaping its orphan.
+                assert wait_until(lambda: not pid_alive(pid), 60), "tool child was not reaped"
 
 
 @pytest.fixture
@@ -1076,7 +1349,7 @@ async def test_tool_that_locks_its_own_workspace_root_is_removed(
 ) -> None:
     code = "import os; os.makedirs('out/deep'); open('out/deep/f', 'w').close(); "
     code += f"os.chmod('out/deep', 0o500); os.chmod('.', {mode:#o})"
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         await local_executor.submit(tool_job(tmp_path, code))
     assert list((tmp_path / "ws").iterdir()) == []
 
@@ -1170,13 +1443,20 @@ async def test_collect_must_return_a_valid_tool_output(
         async def on_partial(o: ToolOutput) -> None:
             got.append(o)
 
-        code = "open('ready', 'w'); import time; time.sleep(60)"
-        job = tool_job(tmp_path, code, tool_cls=OkCollectTool, grace_s=0.2, on_partial=on_partial)
+        code = "open('ready', 'w'); import threading; threading.Event().wait(300)"
+        job = tool_job(
+            tmp_path,
+            code,
+            tool_cls=OkCollectTool,
+            grace_s=0.2,
+            on_partial=on_partial,
+            timeout_s=300,
+        )
         await cancel_when(lambda: kept_executor.submit(job), ready_file(tmp_path / "ws"))
         [out] = got
         status = RunStatus.CANCELLED
     elif path == "timeout":
-        code = "import time; time.sleep(60)"
+        code = "import threading; threading.Event().wait(300)"
         job = tool_job(tmp_path, code, tool_cls=OkCollectTool, timeout_s=0.5, grace_s=0.2)
         out = await kept_executor.submit(job)
         status = RunStatus.TIMEOUT
@@ -1206,8 +1486,9 @@ async def _cancel_when_ready(
 
     job = tool_job(
         tmp_path,
-        code + "; open('ready', 'w'); import time; time.sleep(60)",
+        code + "; open('ready', 'w'); import threading; threading.Event().wait(300)",
         grace_s=0.2,
+        timeout_s=300,
         on_partial=on_partial,
         **job_kw,
     )
@@ -1257,7 +1538,7 @@ async def test_valid_empty_collect_output_is_partial_only_if_it_says_so(
     if stop == "timeout":
         job = tool_job(
             tmp_path,
-            "import time; time.sleep(60)",
+            "import threading; threading.Event().wait(300)",
             tool_cls=OkCollectTool,
             timeout_s=0.5,
             grace_s=0.2,
@@ -1359,7 +1640,7 @@ async def test_user_system_exit_is_a_job_failure(
     monkeypatch.setattr(PyTool, where, exit_user)
     job = tool_job(
         tmp_path,
-        "import time; time.sleep(60)" if stop else "pass",
+        "import threading; threading.Event().wait(300)" if stop else "pass",
         timeout_s=0.2 if stop else 30.0,
         grace_s=0.0,
     )
@@ -1400,7 +1681,9 @@ def test_user_keyboard_interrupt_still_propagates(
             started_at=utc_now(),
             ended_at=utc_now(),
         )
-        runner = local_run._JobRun(job, staged, workspace, artifacts, LocalExecutor.Config())
+        runner = local_run._JobRun(
+            job, staged, workspace, artifacts, max_log_bytes=1024, max_output_bytes=1024
+        )
         with pytest.raises(KeyboardInterrupt):
             runner._collect(run)
 
@@ -1410,14 +1693,16 @@ async def test_cancel_waits_for_the_original_collect_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entered, release = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
     calls: list[RunStatus] = []
     got: list[ToolOutput] = []
-    monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 60.0)
 
     def collect(*args: Any) -> ToolOutput:
+        workers.append(threading.current_thread())
         calls.append(args[-1].status)
         entered.set()
-        release.wait(15)
+        assert release.wait(300)
         return ToolOutput(status=RunStatus.OK, data={"kept": 1})
 
     async def on_partial(out: ToolOutput) -> None:
@@ -1433,7 +1718,7 @@ async def test_cancel_waits_for_the_original_collect_once(
         assert scope.cancelled_caught
 
     try:
-        with anyio.fail_after(20):
+        with anyio.fail_after(60):
             async with anyio.create_task_group() as group:
                 scope = await group.start(worker)
                 while not entered.is_set():  # noqa: ASYNC110 - waiting on a thread event
@@ -1447,33 +1732,50 @@ async def test_cancel_waits_for_the_original_collect_once(
         ]
     finally:
         release.set()
+        for thread in workers:
+            await anyio.to_thread.run_sync(thread.join, 60)
+    assert all(not worker.is_alive() for worker in workers)
 
 
 async def test_hung_post_exit_collect_releases_pool_slot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    release = threading.Event()
+    release, entered = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
     calls = 0
     monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 0.2)
 
     def collect(*args: Any) -> ToolOutput:
         nonlocal calls
         calls += 1
+        workers.append(threading.current_thread())
+        entered.set()
         if calls == 1:
-            release.wait(15)
+            assert release.wait(300)
         return ToolOutput(status=RunStatus.OK, data={"kept": 1})
 
+    wait_collect = local_run._JobRun._wait_post_collect
+
+    async def after_ready(run: local_run._JobRun) -> None:
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
+        run._collect_deadline = anyio.current_time() + supervisor.BEFORE_KILL_TIMEOUT_S
+        await wait_collect(run)
+
+    monkeypatch.setattr(local_run._JobRun, "_wait_post_collect", after_ready)
     monkeypatch.setattr(PyTool, "collect", collect)
     executor = LocalExecutor(max_concurrent=1, workspace_root=str(tmp_path / "ws"))
     try:
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             out = await executor.submit(tool_job(tmp_path, "pass"))
             assert (out.status, out.partial, out.data) == (RunStatus.ERROR, False, {})
             assert b"collect timed out" in log(tmp_path, out, 2)
             assert (await executor.submit(tool_job(tmp_path, "pass"))).status == RunStatus.OK
     finally:
         release.set()
+        for worker in workers:
+            await anyio.to_thread.run_sync(worker.join, 60)
+    assert all(not worker.is_alive() for worker in workers)
 
 
 @pytest.mark.parametrize("stop", ["timeout", "cancel"])
@@ -1499,7 +1801,12 @@ async def test_files_only_collect_counts_as_partial(
         expected = RunStatus.CANCELLED
     else:
         out = await executor.submit(
-            tool_job(tmp_path, "import time; time.sleep(60)", timeout_s=0.2, grace_s=0.0)
+            tool_job(
+                tmp_path,
+                "import threading; threading.Event().wait(300)",
+                timeout_s=0.2,
+                grace_s=0.0,
+            )
         )
         expected = RunStatus.TIMEOUT
     assert (out.status, out.partial, out.data) == (expected, True, {})

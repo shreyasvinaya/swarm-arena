@@ -34,7 +34,6 @@ def config(root: Path) -> RunConfig:
         arena_root=str(root / "arena"),
         executor=Ref.of(LocalExecutor(workspace_root=str(root / "ws"))),
         limits=Limits(max_tokens=1000, max_usd=0.001, run_timeout_s=120, round_timeout_s=60),
-        settle_timeout_s=2.0,
     )
 
 
@@ -126,7 +125,7 @@ def test_cli_manager_failure_is_local(tmp_path: Path, kind: str) -> None:
         capture_output=True,
         text=True,
         env=env,
-        timeout=25,
+        timeout=60,
     )
     output = process.stdout + process.stderr
     assert hooks.MARK not in output

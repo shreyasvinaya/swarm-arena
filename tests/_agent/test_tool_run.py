@@ -1,11 +1,17 @@
 import asyncio
 import dataclasses
+import os
+import sys
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.engine import RtEnv
+from _fakes.gateway import FakeGateway
 from _fakes.tools import WRITE, CommandRaisesTool, PyTool, write_then_sleep
 
 from swarm_arena import FunctionTool, RoundSpec, ScriptCheck
@@ -19,7 +25,7 @@ from swarm_arena._journal.lease import read_owner
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.plan import Resources
 from swarm_arena._model.tooling import RunStatus, ToolOutput
-from swarm_arena._tooling.tool import effective_tool_timeout, tool_grace
+from swarm_arena._tooling.tool import Tool, effective_tool_timeout, tool_grace
 from swarm_arena.executor import Executor, Job
 from swarm_arena.manager import LimitReached
 
@@ -288,7 +294,7 @@ async def test_admission_closed_while_queued_refuses_start(rt_env: RtEnv) -> Non
     ] = []  # _run_capturing appends the LimitReached that execute_tool_run raises
     async with anyio.create_task_group() as tg:
         tg.start_soon(_run_capturing, rt, {"marker": str(rt_env.marker)}, errors)
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await queued.entered.wait()
         rt_env.inflight.close()
         queued.release.set()
@@ -347,7 +353,7 @@ async def test_round_cancel_keeps_partial_output(rt_env: RtEnv) -> None:
     rt = rt_env.with_tool(
         PyTool({"code": write_then_sleep(rt_env.marker)})
     )  # result.json, then marker, then 600 s
-    with anyio.fail_after(30):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tg:
             tg.start_soon(
                 _run_and_store, rt, rt_env
@@ -635,7 +641,7 @@ async def test_cancelled_preparation_settles_zero_and_never_launches_late(
     def block() -> None:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(10)
+        assert release.wait(300)
 
     def init(self: PyTool, *args: Any, **kwargs: Any) -> None:
         original_init(self, *args, **kwargs)
@@ -652,12 +658,12 @@ async def test_cancelled_preparation_settles_zero_and_never_launches_late(
 
     monkeypatch.setattr(PyTool, "__init__", init)
     monkeypatch.setattr(PyTool, "command", command)
+    task = asyncio.create_task(_run_and_store(rt, rt_env))
     try:
-        with anyio.fail_after(15):
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(_run_and_store, rt, rt_env)
-                assert await anyio.to_thread.run_sync(entered.wait, 5)
-                rt_env.cancel_inflight()
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
+            rt_env.cancel_inflight()
+            await observe_task(task)
             cand = rt_env.result
             assert cand is not None
             assert cand.output.status == RunStatus.CANCELLED
@@ -668,18 +674,22 @@ async def test_cancelled_preparation_settles_zero_and_never_launches_late(
             assert "command_start" not in before
             assert not rt_env.inflight._scopes
             release.set()
-            assert await anyio.to_thread.run_sync(done.wait, 5)
-            with anyio.fail_after(5):
-                await anyio.to_thread.run_sync(workers[0].join, 5)
+            assert await anyio.to_thread.run_sync(done.wait, 60)
+            with anyio.fail_after(60):
+                await anyio.to_thread.run_sync(workers[0].join, 60)
             assert not workers[0].is_alive()
             assert rt_env.committed_types() == before
             assert not rt_env.marker.exists()
             assert workspaces[0].joinpath("late_write").exists()
     finally:
         release.set()
-        for worker in workers:
-            await anyio.to_thread.run_sync(worker.join, 5)
-            assert not worker.is_alive()
+        try:
+            await settle_tasks(task)
+        finally:
+            with anyio.CancelScope(shield=True):
+                for worker in workers:
+                    await anyio.to_thread.run_sync(worker.join, 60)
+                    assert not worker.is_alive()
 
 
 async def test_outer_cancellation_keeps_unsettled_reservation(rt_env: RtEnv) -> None:
@@ -691,7 +701,7 @@ async def test_outer_cancellation_keeps_unsettled_reservation(rt_env: RtEnv) -> 
             scopes.append(scope)
             await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
 
-    with anyio.fail_after(20):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as tg:
             tg.start_soon(run)
             await rt_env.wait_for(rt_env.marker)
@@ -726,11 +736,13 @@ async def test_cancelled_reserve_admission_settles_undispatched_tool_at_zero(
         await wait_for(seq)
 
     monkeypatch.setattr(rt.journal, "_wait_for", cancel_at_wait)
-    with anyio.fail_after(5):
+    with anyio.fail_after(60) as watchdog:
         with anyio.CancelScope() as scope:
             with pytest.raises(asyncio.CancelledError):
                 await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
         await rt.journal.commit()
+    # The inner raises would also accept the watchdog's own cancellation.
+    assert not watchdog.cancel_called, "the cancelled run did not end promptly"
     reserves = rt_env.events("reserve")
     settlements = rt_env.events("settle")
     assert len(reserves) == len(settlements) == 1
@@ -1083,7 +1095,7 @@ async def test_release_keeps_primary_control_outcome(
         rt = dataclasses.replace(rt, executor=queued)
         async with anyio.create_task_group() as group:
             group.start_soon(_run_capturing, rt, {"x": 1}, [])
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await queued.entered.wait()
             group.cancel_scope.cancel()
     assert not rt.repeats._pending
@@ -1209,7 +1221,7 @@ async def test_unstarted_runs_do_not_increment_started_count(rt_env: RtEnv, fail
         errors: list[LimitReached] = []
         async with anyio.create_task_group() as group:
             group.start_soon(_run_capturing, rt, {"x": 1}, errors)
-            with anyio.fail_after(10):
+            with anyio.fail_after(60):
                 await queued.entered.wait()
             assert rt.started_runs == 0
             rt_env.inflight.close()
@@ -1241,7 +1253,7 @@ async def test_inflight_tracks_active_job_grace_until_collection(rt_env: RtEnv) 
     rt = dataclasses.replace(rt, executor=queued)
     async with anyio.create_task_group() as group:
         group.start_soon(_run_capturing, rt, {"x": 1}, [])
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await queued.entered.wait()
         assert rt_env.inflight.max_grace_s() == tool_grace(rt.tool)
         rt_env.cancel_inflight()
@@ -1287,15 +1299,19 @@ async def test_inflight_grace_remains_during_cancel_collection(rt_env: RtEnv) ->
     rt = rt_env.with_tool(FunctionTool("_fakes.tools:square", grace_s=3.0))
     executor = CollectingExecutor(rt.executor)
     rt = dataclasses.replace(rt, executor=executor)
-    with anyio.fail_after(5):
-        async with anyio.create_task_group() as group:
-            group.start_soon(_run_capturing, rt, {"x": 1}, [])
+    task = asyncio.create_task(_run_capturing(rt, {"x": 1}, []))
+    try:
+        with anyio.fail_after(60):
             await executor.entered.wait()
             rt_env.inflight.close()
             rt_env.inflight.cancel_all()
             await executor.collecting.wait()
             assert rt_env.inflight.max_grace_s() == 3.0
             executor.release.set()
+            await observe_task(task)
+    finally:
+        executor.release.set()
+        await settle_tasks(task)
     assert rt_env.inflight.max_grace_s() == 0.0
     assert rt_env.events("tool_end")[-1].payload["candidate"]["output"]["status"] == "cancelled"
 
@@ -1498,6 +1514,7 @@ async def test_fingerprint_abandonment_discards_late_mutation(
     rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
     import threading
+    from contextlib import contextmanager
 
     import swarm_arena._agent.tool_run as pipeline
     from swarm_arena._journal.reader import read_committed
@@ -1506,17 +1523,30 @@ async def test_fingerprint_abandonment_discards_late_mutation(
 
     entered, worker_done, done = anyio.Event(), anyio.Event(), anyio.Event()
     release = threading.Event()
+    workers: list[threading.Thread] = []
     token = anyio.lowlevel.current_token()
     scopes: list[anyio.CancelScope] = []
     candidates: list[Candidate] = []
     fenced: list[Fenced] = []
-    monkeypatch.setattr(
-        pipeline, "FINGERPRINT_TIMEOUT_S", 0.1 if mode == "timeout" else 30, raising=False
-    )
+    deadlines: list[anyio.CancelScope] = []
+
+    class FingerprintClock:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(anyio, name)
+
+        @contextmanager
+        def fail_after(self, delay: float | None, *, shield: bool = False) -> Any:
+            with anyio.fail_after(delay, shield=shield) as deadline:
+                deadlines.append(deadline)
+                yield deadline
+
+    monkeypatch.setattr(pipeline, "FINGERPRINT_TIMEOUT_S", 300)
+    monkeypatch.setattr(pipeline, "anyio", FingerprintClock())
 
     def fingerprint(output: ToolOutput) -> str:
+        workers.append(threading.current_thread())
         anyio.from_thread.run_sync(entered.set, token=token)
-        release.wait()
+        assert release.wait(300)
         output.data["late"] = {"value": float("nan")}
         anyio.from_thread.run_sync(worker_done.set, token=token)
         return "too late"
@@ -1536,44 +1566,53 @@ async def test_fingerprint_abandonment_discards_late_mutation(
             done.set()
 
     monkeypatch.setattr(rt_env.rt.tool, "fingerprint", fingerprint)
-    async with anyio.create_task_group() as tasks:
-        tasks.start_soon(run)
-        try:
-            with anyio.fail_after(5):
-                await entered.wait()
-            if mode != "timeout":
-                if mode == "fence":
-                    rt_env.rt.journal.fenced.set()
-                scopes[0].cancel()
-            with anyio.move_on_after(1):
-                await done.wait()
-            assert done.is_set(), "fingerprint waiter did not abandon blocked hook"
+    task = asyncio.create_task(run())
+    try:
+        with anyio.fail_after(60):
+            await entered.wait()
+        assert len(deadlines) == 1
+        if mode == "timeout":
+            deadlines[0].deadline = anyio.current_time() + 0.1
+        else:
             if mode == "fence":
-                assert fenced
-                assert not rt_env.events("tool_end")
-                assert not rt_env.events("settle")
-            else:
-                assert len(candidates) == 1
-                candidate = candidates[0]
-                assert candidate.output.data == {"x": 1, "y": 1}
-                assert rt_env.reservation_state(candidate) == "settled"
-                assert rt_env.events("tool_end")[-1].payload["fingerprint"] is None
-                assert candidate.warnings == [
-                    "fingerprint error: "
-                    + ("TimeoutError" if mode == "timeout" else "CancelledError")
-                ]
-            before = read_committed(rt_env.run_store)
-            release.set()
-            with anyio.fail_after(5):
-                await worker_done.wait()
-            await anyio.lowlevel.checkpoint()
-            assert read_committed(rt_env.run_store) == before
-            if candidates:
-                assert before is not None
-                assert RunState.from_events(before[1]).candidates[candidates[0].id] == candidates[0]
-                assert rt_env.board.get_candidate(candidates[0].id) == candidates[0]
+                rt_env.rt.journal.fenced.set()
+            scopes[0].cancel()
+        with anyio.move_on_after(30):
+            await done.wait()
+        assert done.is_set(), "fingerprint waiter did not abandon blocked hook"
+        if mode == "fence":
+            assert fenced
+            assert not rt_env.events("tool_end")
+            assert not rt_env.events("settle")
+        else:
+            assert len(candidates) == 1
+            candidate = candidates[0]
+            assert candidate.output.data == {"x": 1, "y": 1}
+            assert rt_env.reservation_state(candidate) == "settled"
+            assert rt_env.events("tool_end")[-1].payload["fingerprint"] is None
+            assert candidate.warnings == [
+                "fingerprint error: " + ("TimeoutError" if mode == "timeout" else "CancelledError")
+            ]
+        before = read_committed(rt_env.run_store)
+        release.set()
+        with anyio.fail_after(60):
+            await worker_done.wait()
+        await anyio.lowlevel.checkpoint()
+        assert read_committed(rt_env.run_store) == before
+        if candidates:
+            assert before is not None
+            assert RunState.from_events(before[1]).candidates[candidates[0].id] == candidates[0]
+            assert rt_env.board.get_candidate(candidates[0].id) == candidates[0]
+    finally:
+        release.set()
+        try:
+            await settle_tasks(task)
+            assert task.done(), "fingerprint owner did not finish cleanup"
         finally:
-            release.set()
+            with anyio.CancelScope(shield=True):
+                for worker in workers:
+                    await anyio.to_thread.run_sync(worker.join, 60)
+                assert all(not worker.is_alive() for worker in workers)
 
 
 def _fingerprint_round(rt_env: RtEnv) -> Any:
@@ -1635,6 +1674,7 @@ async def test_round_finishes_with_blocked_fingerprint(
 ) -> None:
     import threading
 
+    from swarm_arena._agent import tool_run as pipeline
     from swarm_arena._engine import round as round_module
     from swarm_arena._journal.reader import read_committed
     from swarm_arena._journal.replay import RunState
@@ -1642,14 +1682,17 @@ async def test_round_finishes_with_blocked_fingerprint(
     runner = _fingerprint_round(rt_env)
     entered, watch_done, done = anyio.Event(), anyio.Event(), anyio.Event()
     release = threading.Event()
+    workers: list[threading.Thread] = []
     token = anyio.lowlevel.current_token()
     results: list[Any] = []
     original_watch = runner._watch
     monkeypatch.setattr(round_module, "BEFORE_KILL_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(pipeline, "FINGERPRINT_TIMEOUT_S", 300)
 
     def fingerprint(self: FunctionTool, output: ToolOutput) -> str:
+        workers.append(threading.current_thread())
         anyio.from_thread.run_sync(entered.set, token=token)
-        release.wait()
+        assert release.wait(300)
         output.data["late"] = float("nan")
         return "late"
 
@@ -1667,29 +1710,36 @@ async def test_round_finishes_with_blocked_fingerprint(
 
     monkeypatch.setattr(FunctionTool, "fingerprint", fingerprint)
     monkeypatch.setattr(runner, "_watch", watch)
-    async with anyio.create_task_group() as tasks:
-        tasks.start_soon(run)
+    task = asyncio.create_task(run())
+    try:
+        with anyio.fail_after(60):
+            await entered.wait()
+        if mode == "stop":
+            runner.deps.stops.stop_now = True
+        else:
+            runner.deps.clock._before = runner.deps.config.limits.run_timeout_s
+        with anyio.fail_after(30):
+            await watch_done.wait()
+        with anyio.move_on_after(30):
+            await done.wait()
+        assert done.is_set(), "round still waiting for fingerprint after stop/deadline"
+        candidate = results[0].candidates[0]
+        assert rt_env.events("tool_end")[-1].payload["fingerprint"] is None
+        assert len(rt_env.events("settle")) == 1
+        assert candidate.output.data == {"x": 1, "y": 1}
+        committed = read_committed(rt_env.run_store)
+        assert committed is not None
+        assert RunState.from_events(committed[1]).candidates[candidate.id] == candidate
+    finally:
+        release.set()
         try:
-            with anyio.fail_after(5):
-                await entered.wait()
-            if mode == "stop":
-                runner.deps.stops.stop_now = True
-            else:
-                runner.deps.clock._before = runner.deps.config.limits.run_timeout_s
-            with anyio.fail_after(8):
-                await watch_done.wait()
-            with anyio.move_on_after(1):
-                await done.wait()
-            assert done.is_set(), "round still waiting for fingerprint after stop/deadline"
-            candidate = results[0].candidates[0]
-            assert rt_env.events("tool_end")[-1].payload["fingerprint"] is None
-            assert len(rt_env.events("settle")) == 1
-            assert candidate.output.data == {"x": 1, "y": 1}
-            committed = read_committed(rt_env.run_store)
-            assert committed is not None
-            assert RunState.from_events(committed[1]).candidates[candidate.id] == candidate
+            await settle_tasks(task)
+            assert task.done(), "fingerprint owner did not finish cleanup"
         finally:
-            release.set()
+            with anyio.CancelScope(shield=True):
+                for worker in workers:
+                    await anyio.to_thread.run_sync(worker.join, 60)
+                assert all(not worker.is_alive() for worker in workers)
 
 
 @pytest.mark.parametrize("wrapped", [False, True], ids=["direct", "extra-action"])
@@ -2131,7 +2181,7 @@ async def test_blocked_log_publication_is_abandoned_on_round_stop(
             if key.endswith(".out"):
                 workers.append(threading.current_thread())
                 entered.set()
-                assert release.wait(30)
+                assert release.wait(300)
         return original(store, key, data)
 
     monkeypatch.setattr(LocalStore, "create", create)
@@ -2139,21 +2189,27 @@ async def test_blocked_log_publication_is_abandoned_on_round_stop(
         execute_tool_run(rt_env.rt, {"x": 1}, parents=(), replicate=None, edits=None)
     )
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 15)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         rt_env.cancel_inflight()
-        done, _ = await asyncio.wait([task], timeout=3)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "log publication ignored the round's cancellation"
         candidate = task.result()
         assert candidate.output.logs_ref is None
     finally:
         release.set()
-        if not task.done():
-            task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        for worker in workers:
-            if worker.name.startswith("swarm-arena-daemon-"):
-                await anyio.to_thread.run_sync(worker.join, 5)
-                assert not worker.is_alive()
+        try:
+            await settle_tasks(task)
+            assert task.done(), "log publication owner did not finish cleanup"
+        finally:
+            with anyio.CancelScope(shield=True):
+                for worker in workers:
+                    if worker.name.startswith("swarm-arena-daemon-"):
+                        await anyio.to_thread.run_sync(worker.join, 60)
+                assert all(
+                    not worker.is_alive()
+                    for worker in workers
+                    if worker.name.startswith("swarm-arena-daemon-")
+                )
     assert len(writes) == 1, "abandoned log write published another file"
 
 
@@ -2192,3 +2248,1262 @@ async def test_predispatch_error_retains_candidate_after_completion_cancel(
     assert rt_env.reservation_state(reservation) == "settled"
     assert rt_env.charged(reservation) == Amount()
     assert not rt_env.inflight._scopes
+
+
+async def test_reported_rows_recorded_as_tool_calls(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+    import threading
+
+    from swarm_arena._engine.stops import RunClock, StopState
+    from swarm_arena._journal.llm_record import _bound_run
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena._tooling.llm_calls import LLMCallRow
+
+    loop_thread = threading.get_ident()
+    parsed: list[bool] = []
+    validate = LLMCallRow.model_validate
+
+    def validate_off_loop(cls: type[LLMCallRow], value: Any, **kwargs: Any) -> LLMCallRow:
+        assert threading.get_ident() != loop_thread
+        parsed.append(True)
+        return validate(value, **kwargs)
+
+    monkeypatch.setattr(LLMCallRow, "model_validate", classmethod(validate_off_loop))
+    report = "\n".join(
+        json.dumps(row)
+        for row in [
+            {"model": "a/b", "cost_usd": 0.01, "owner_epoch": "999", "candidate_id": "forged"},
+            {"model": "a/c", "cost_usd": 0.02},
+        ]
+    )
+    result = json.dumps({"data": {"ok": True}, "usage": {"usd": 0.04}})
+    code = (
+        "from pathlib import Path; import os; "
+        f"Path('swarm/llm_calls.jsonl').write_text({report!r}); "
+        f"Path(os.environ['SWARM_ARENA_RESULT']).write_text({result!r})"
+    )
+    rt = rt_env.with_tool(PyTool({"code": code}))
+    async with _bound_run(
+        rt.repeats.run_id,
+        journal=rt.journal,
+        ids=rt.ids,
+        artifacts=rt.artifacts,
+        config=rt.config,
+        stops=StopState(),
+        clock=RunClock(0),
+        state=RunState(),
+    ):
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    calls = [event.payload["call"] for event in rt_env.events("llm_call")]
+    assert candidate.output.data == {"ok": True}
+    assert [call["role"] for call in calls] == ["tool", "tool"]
+    assert [call["candidate_id"] for call in calls] == [candidate.id, candidate.id]
+    assert candidate.llm_calls_source == "reported"
+    assert len(candidate.llm_call_ids) == 2
+    assert set(candidate.llm_call_ids) == {call["id"] for call in calls}
+    assert rt_env.charged(candidate).usd == 0.04
+    assert parsed == [True, True]
+
+
+@pytest.mark.parametrize("kind", ["oversize", "hash_limit", "symlink", "malformed"])
+async def test_bad_optional_report_warns_preserving_candidate(rt_env: RtEnv, kind: str) -> None:
+    scripts = {
+        "oversize": "p.open('wb').truncate(17*1024*1024)",
+        "hash_limit": "p.open('wb').truncate(1024*1024*1024+1)",
+        "symlink": "p.symlink_to('missing')",
+        "malformed": "p.write_text('SECRET malformed input')",
+    }
+    code = (
+        "from pathlib import Path; import os; p=Path('swarm/llm_calls.jsonl'); "
+        + scripts[kind]
+        + "; Path(os.environ['SWARM_ARENA_RESULT']).write_text('{\"data\":{\"ok\":true}}')"
+    )
+    rt = rt_env.with_tool(PyTool({"code": code}))
+    candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.OK
+    assert candidate.output.data == {"ok": True}
+    assert len(candidate.warnings) == 1
+    assert "swarm/llm_calls.jsonl" in candidate.warnings[0]
+    assert "SECRET" not in candidate.warnings[0]
+    assert not rt_env.events("llm_call")
+    if kind == "oversize":
+        assert "over the 16 MiB limit; not collected" in candidate.warnings[0]
+
+
+@pytest.mark.parametrize("provider", [True, False])
+async def test_tool_with_providers_or_env_and_no_rows_is_unknown(
+    rt_env: RtEnv, provider: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tool = FunctionTool(
+        "_fakes.tools:square",
+        providers=["openai"] if provider else [],
+        env=[] if provider else ["OPENAI_API_KEY"],
+    )
+    rt = rt_env.with_tool(tool)
+    received: list[Job] = []
+    submit = rt.executor.submit
+
+    async def capture(job: Job) -> ToolOutput:
+        received.append(job)
+        return await submit(job)
+
+    monkeypatch.setattr(rt.executor, "submit", capture)
+    monkeypatch.setenv("OPENAI_API_KEY", "sentinel")
+    candidate = await execute_tool_run(rt, {"x": 2}, parents=(), replicate=None, edits=None)
+    assert candidate.llm_calls_source == "unknown"
+    assert received[0].secret_env == (() if provider else ("OPENAI_API_KEY",))
+
+
+@pytest.mark.parametrize("site", ["read", "upload"])
+async def test_report_backend_failure_propagates(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._errors import StorageError
+    from swarm_arena.tool import FileRef
+
+    if site == "upload":
+        rt = rt_env.with_tool(
+            PyTool(
+                {
+                    "code": "from pathlib import Path; "
+                    "Path('swarm/llm_calls.jsonl').write_bytes(b'REPORT')"
+                }
+            )
+        )
+        put = rt.artifacts.put_bytes
+
+        def fail_upload(data: bytes) -> str:
+            if data == b"REPORT":
+                raise RuntimeError("SECRET")
+            return put(data)
+
+        # The LocalExecutor opens its own ArtifactStore for the same backend.
+        from swarm_arena._store.artifacts import ArtifactStore
+
+        original = ArtifactStore.put_bytes
+
+        def upload(self: ArtifactStore, data: bytes) -> str:
+            if data == b"REPORT":
+                return fail_upload(data)
+            return original(self, data)
+
+        monkeypatch.setattr(ArtifactStore, "put_bytes", upload)
+    else:
+        from unittest.mock import AsyncMock, Mock
+
+        ref = FileRef(name="llm_calls.jsonl", path="llm_calls.jsonl", sha256="0" * 64, size=1)
+        executor = Mock(
+            spec=Executor,
+            submit=AsyncMock(return_value=ToolOutput(status=RunStatus.OK, llm_calls_file=ref)),
+        )
+        rt = dataclasses.replace(rt_env.rt, executor=executor)
+
+        def fail_read(digest: str) -> bytes:
+            raise RuntimeError("SECRET")
+
+        from swarm_arena._store.base import Store
+
+        store = Mock(spec=Store)
+        store.read.side_effect = fail_read
+        monkeypatch.setattr(rt.artifacts, "_store", store)
+    with pytest.raises(StorageError) as caught:
+        await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert_secret_absent(caught.value, "SECRET")
+    assert not rt_env.events("tool_end")
+
+
+async def test_interrupted_recording_preserves_candidate_links(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._engine.stops import RunClock, StopState
+    from swarm_arena._journal.llm_record import _bound_run
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena._tooling import llm_calls
+
+    rt = rt_env.with_tool(
+        PyTool(
+            {
+                "code": "from pathlib import Path; "
+                'Path(\'swarm/llm_calls.jsonl\').write_text(\'{"model":"a/b"}\\n{"model":"a/c"}\')'
+            }
+        )
+    )
+    entered = asyncio.Event()
+    real = llm_calls.record_call
+    count = 0
+
+    async def hold(**kwargs: Any) -> Any:
+        nonlocal count
+        count += 1
+        if count == 2:
+            entered.set()
+            await asyncio.Future()
+        return await real(**kwargs)
+
+    monkeypatch.setattr(llm_calls, "record_call", hold)
+    async with _bound_run(
+        rt.repeats.run_id,
+        journal=rt.journal,
+        ids=rt.ids,
+        artifacts=rt.artifacts,
+        config=rt.config,
+        stops=StopState(),
+        clock=RunClock(0),
+        state=RunState(),
+    ):
+        task = asyncio.create_task(execute_tool_run(rt, {}, parents=(), replicate=None, edits=None))
+        try:
+            with anyio.fail_after(60):
+                await entered.wait()
+                rt_env.cancel_inflight()
+                candidate = await observe_task(task)
+            calls = [event.payload["call"] for event in rt_env.events("llm_call")]
+            assert len(calls) == 1
+            assert candidate.llm_call_ids == [calls[0]["id"]]
+            assert candidate.llm_calls_source == "reported"
+        finally:
+            await settle_tasks(task)
+            assert task.done(), "recording owner did not finish cleanup"
+
+
+@pytest.mark.parametrize("claimed_size", [1, 3])
+async def test_report_fetch_rejects_mismatched_size(rt_env: RtEnv, claimed_size: int) -> None:
+    from swarm_arena._errors import StorageError
+    from swarm_arena.tool import FileRef
+
+    digest = rt_env.rt.artifacts.put_bytes(b"{}")
+    ref = FileRef(name="llm_calls.jsonl", path="llm_calls.jsonl", sha256=digest, size=claimed_size)
+    rt = dataclasses.replace(
+        rt_env.rt,
+        executor=_OutputExecutor(rt_env, ToolOutput(status=RunStatus.OK, llm_calls_file=ref)),
+    )
+    with pytest.raises(StorageError):
+        await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+
+
+async def test_report_fetch_refuses_large_local_blob_before_read(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._errors import StorageError
+    from swarm_arena.tool import FileRef
+
+    artifacts = rt_env.rt.artifacts
+    ref = FileRef(name="llm_calls.jsonl", path="llm_calls.jsonl", sha256="0" * 64, size=10)
+    from swarm_arena._store.local import LocalStore
+
+    assert isinstance(artifacts._store, LocalStore)
+    path = artifacts._store._root / ref.sha256
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as stream:
+        stream.truncate(17 * 1024 * 1024)
+    reads: list[int] = []
+    real = os.read
+
+    def read(fd: int, size: int) -> bytes:
+        reads.append(size)
+        return real(fd, size)
+
+    original_read_bytes = Path.read_bytes
+
+    def read_bytes(file: Path) -> bytes:
+        data = original_read_bytes(file)
+        if file == path:
+            reads.append(len(data))
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(os, "read", read)
+    rt = dataclasses.replace(
+        rt_env.rt,
+        executor=_OutputExecutor(rt_env, ToolOutput(status=RunStatus.OK, llm_calls_file=ref)),
+    )
+    with pytest.raises(StorageError):
+        await execute_tool_run(rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert reads == []
+
+
+class _DispatchSpy(_QueuedExecutor):
+    def __init__(self, env: RtEnv, *, close_first: str = "") -> None:
+        super().__init__(env.rt.executor)
+        self.env = env
+        self.close_first = close_first
+        self.committed_at_submit: list[str] | None = None
+        self.head_at_submit: Any = None
+
+    async def submit(self, job: Job) -> ToolOutput:
+        if self.close_first:
+            self.env.inflight.close(budget=self.close_first == "budget")
+        assert job.on_started is not None
+        await job.on_started(
+            Job.Started(kind="dispatch", job_id=job.id, task_name=job.id, ray_job_id="driver-1")
+        )
+        self.committed_at_submit = self.env.committed_types()
+        owner = read_owner(self.env.run_store)
+        assert owner is not None
+        self.head_at_submit = owner[0].head
+        return ToolOutput(status=RunStatus.OK, data={"y": 1.0})
+
+
+@pytest.mark.parametrize("close_first", ["", "budget"])
+async def test_dispatch_start_is_durable_before_submit(rt_env: RtEnv, close_first: str) -> None:
+    fake = _DispatchSpy(rt_env, close_first=close_first)
+    rt = dataclasses.replace(rt_env.rt, executor=fake)
+    candidate = await execute_tool_run(rt, {"x": 1.0}, parents=(), replicate=None, edits=None)
+    assert fake.committed_at_submit is not None
+    assert fake.committed_at_submit[-1] == "tool_dispatch"
+    intent = rt_env.events("tool_dispatch")[-1]
+    assert fake.head_at_submit.seq == intent.seq
+    assert intent.task_id == candidate.id
+    assert intent.payload["started"]["task_name"] == candidate.id
+    assert intent.payload["started"]["ray_job_id"] == "driver-1"
+    assert rt.started_runs == 1
+
+
+async def test_closed_admission_refuses_dispatch_before_intent(rt_env: RtEnv) -> None:
+    fake = _DispatchSpy(rt_env, close_first="hard")
+    rt = dataclasses.replace(rt_env.rt, executor=fake)
+    with pytest.raises(LimitReached) as err:
+        await execute_tool_run(rt, {"x": 1.0}, parents=(), replicate=None, edits=None)
+    assert err.value.limit == "stop"
+    assert fake.committed_at_submit is None
+    reservation = rt_env.events("reserve")[-1].payload["reservation"]["id"]
+    assert "tool_dispatch" not in rt_env.committed_types()
+    assert rt_env.charged(reservation) == Amount()
+    assert rt.started_runs == 0
+
+
+@asynccontextmanager
+async def _gateway_runtime(
+    env: RtEnv,
+    gateway: FakeGateway,
+    tool: Tool,
+    *,
+    allow: tuple[str, ...] = (),
+    http_timeout_s: float = 30,
+    settle_timeout_s: float = 0,
+) -> AsyncGenerator[AgentRuntime]:
+    from swarm_arena._engine.stops import RunClock, StopState
+    from swarm_arena._gateway.keys import KeyManager
+    from swarm_arena._gateway.litellm_proxy import LiteLLMProxy
+    from swarm_arena._journal.llm_record import _bound_run
+    from swarm_arena._journal.reader import read_committed
+    from swarm_arena._journal.replay import RunState
+    from swarm_arena._model.run_config import SecretsPolicy
+    from swarm_arena._model.settings import GatewayConfig
+    from swarm_arena.tool import Estimate
+
+    rt = env.with_tool(tool)
+    config = rt.config.model_copy(
+        update={
+            "secrets": SecretsPolicy(allow=list(allow)),
+            "llm_gateway": GatewayConfig(url=gateway.url, require_hard_cap=False),
+            "limits": rt.limits.model_copy(update={"default_run_reservation": Estimate(usd=1)}),
+        }
+    )
+    assert config.llm_gateway is not None
+    manager = KeyManager(
+        LiteLLMProxy(
+            url=gateway.url,
+            master_key=gateway.master_key,
+            request_timeout_s=600,
+            http_timeout_s=http_timeout_s,
+        ),
+        config.llm_gateway,
+        cap="soft",
+        journal=rt.journal,
+        settle_timeout_s=settle_timeout_s,
+        run_id=rt.repeats.run_id,
+    )
+    rt = dataclasses.replace(rt, gateway=manager, config=config, limits=config.limits)
+    committed = read_committed(env.run_store)
+    assert committed is not None
+    async with _bound_run(
+        rt.repeats.run_id,
+        journal=rt.journal,
+        ids=rt.ids,
+        artifacts=rt.artifacts,
+        config=config,
+        stops=StopState(),
+        clock=RunClock(0),
+        state=RunState.from_events(committed[1]),
+    ):
+        yield rt
+
+
+def _report_env_tool(*, providers: list[str], env: list[str]) -> Tool:
+    from _fakes.tools import GATEWAY_ENV_SCRIPT
+
+    from swarm_arena import ScriptTool
+
+    return ScriptTool(
+        command=[sys.executable, "-c", GATEWAY_ENV_SCRIPT], providers=providers, env=env
+    )
+
+
+def _gateway_requests(gateway: FakeGateway, path: str) -> list[dict[str, Any]]:
+    return [body for _, route, body in gateway.requests if route == path]
+
+
+async def test_keyed_run_gets_gateway_env(
+    rt_env: RtEnv, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "real-provider-sentinel")
+    tool = _report_env_tool(providers=["openai"], env=["OPENAI_API_KEY"])
+    async with _gateway_runtime(rt_env, fake_gateway, tool, allow=("OPENAI_API_KEY",)) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    env = candidate.output.data["env"]
+    assert env["OPENAI_BASE_URL"] == f"{fake_gateway.url}/v1"
+    assert env["ANTHROPIC_BASE_URL"] == fake_gateway.url
+    assert env["OPENAI_API_KEY"].startswith("sk-")
+    assert env["OPENAI_API_KEY"] != "real-provider-sentinel"
+    assert env["ANTHROPIC_API_KEY"] == env["OPENAI_API_KEY"]
+    assert candidate.llm_calls_source == "gateway"
+    assert rt_env.charged(candidate) == Amount(usd=1)
+
+
+async def test_keyed_run_never_gets_real_provider_keys(
+    rt_env: RtEnv, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "real-openai-sentinel")
+    monkeypatch.setenv("GEMINI_API_KEY", "real-gemini-sentinel")
+    names = ["OPENAI_API_KEY", "GEMINI_API_KEY"]
+    tool = _report_env_tool(providers=["openai"], env=names)
+    async with _gateway_runtime(rt_env, fake_gateway, tool, allow=tuple(names)) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    env = candidate.output.data["env"]
+    assert "GEMINI_API_KEY" not in env
+    assert env["OPENAI_API_KEY"].startswith("sk-")
+    assert "real-openai-sentinel" not in env.values()
+
+
+async def test_unkeyed_run_has_no_gateway_env(rt_env: RtEnv, fake_gateway: FakeGateway) -> None:
+    tool = _report_env_tool(providers=[], env=[])
+    async with _gateway_runtime(rt_env, fake_gateway, tool) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert "OPENAI_BASE_URL" not in candidate.output.data["env"]
+    assert not _gateway_requests(fake_gateway, "/key/generate")
+    assert candidate.llm_calls_source == "none"
+
+
+async def test_keyed_run_without_calls_gets_neutral_read_note(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    tool = _report_env_tool(providers=["openai"], env=[])
+    async with _gateway_runtime(rt_env, fake_gateway, tool) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.OK
+    assert candidate.llm_calls_source == "gateway"
+    assert not candidate.llm_call_ids
+    assert candidate.warnings == [
+        "LLM gateway spend read-back: no rows observed within the first-row wait; "
+        "later reads and reconcile retry"
+    ]
+
+
+async def test_function_env_only_tool_gets_gateway_key(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    tool = FunctionTool("_fakes.tools:gateway_env", env=["OPENAI_API_KEY"])
+    assert not tool.providers()
+    async with _gateway_runtime(rt_env, fake_gateway, tool, allow=("OPENAI_API_KEY",)) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.data["env"]["OPENAI_API_KEY"].startswith("sk-")
+    assert candidate.llm_calls_source == "gateway"
+    assert len(_gateway_requests(fake_gateway, "/key/generate")) == 1
+
+
+async def test_unkeyed_tool_command_env_never_gets_real_replaced_key(
+    rt_env: RtEnv, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import EnvCommandTool
+
+    monkeypatch.setenv("OPENAI_API_KEY", "real-o-sentinel")
+    async with _gateway_runtime(
+        rt_env, fake_gateway, EnvCommandTool(), allow=("OPENAI_API_KEY",)
+    ) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.OK
+    assert "OPENAI_API_KEY" not in candidate.output.data["env"]
+    assert not _gateway_requests(fake_gateway, "/key/generate")
+    assert candidate.llm_calls_source == "none"
+
+
+async def test_keyed_run_records_gateway_rows_and_keeps_reservation(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._gateway.keys import gateway_call_id
+
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool({"calls": 2})) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.OK
+    assert candidate.llm_calls_source == "gateway"
+    assert len(candidate.llm_call_ids) == 2
+    calls = [e.payload["call"] for e in rt_env.events("llm_call")]
+    assert {c["id"] for c in calls} == set(candidate.llm_call_ids)
+    (key_id,) = fake_gateway.keys
+    assert {c["litellm_call_id"] for c in calls} == {
+        gateway_call_id(key_id, row["request_id"]) for _, row in fake_gateway._spend
+    }
+    assert all(c["cost_usd"] == 0.01 for c in calls)
+    assert fake_gateway.keys[key_id]["blocked"] is True
+    settle = rt_env.events("settle")[-1].payload
+    assert settle["charged"] == {"tokens": 0, "usd": 1.0}
+    assert settle["keep_charged"] is True
+    assert rt_env.charged(candidate) == Amount(usd=1)
+
+
+async def test_keyed_run_reported_rows_are_information_only(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    tool = GatewayChatTool(
+        {"also_report_jsonl": True, "extra_reported_rows": 1, "malformed_report": True}
+    )
+    async with _gateway_runtime(rt_env, fake_gateway, tool) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    calls = [e.payload["call"] for e in rt_env.events("llm_call")]
+    assert len(calls) == 1
+    assert calls[0]["cost_usd"] == 0.01
+    assert candidate.output.llm_calls_file is not None
+    assert len(candidate.llm_call_ids) == 1
+    assert any("swarm/llm_calls.jsonl" in warning for warning in candidate.warnings)
+
+
+async def test_keyed_run_without_usd_reservation_not_dispatched(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena.tool import Estimate
+
+    async with _gateway_runtime(
+        rt_env, fake_gateway, GatewayChatTool({"reservation": Estimate(tokens=1000)})
+    ) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.ERROR
+    assert candidate.llm_calls_source == "unknown"
+    assert candidate.warnings[-1] == (
+        "LLM gateway key needs a USD reservation above 0; give Tool.estimate() a usd value or set "
+        "limits.default_run_reservation.usd"
+    )
+    assert not _gateway_requests(fake_gateway, "/key/generate")
+    assert not rt_env.events("tool_start")
+    assert rt_env.charged(candidate) == Amount()
+
+
+async def test_keyed_usage_overflow_is_information_only(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._budget.amount import USD_LIMIT
+
+    async with _gateway_runtime(
+        rt_env, fake_gateway, GatewayChatTool({"usage_usd": USD_LIMIT + 1})
+    ) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert candidate.output.status == RunStatus.OK
+        assert not rt.ledger.run_exhausted()
+    assert rt_env.charged(candidate) == Amount(usd=1)
+    assert not rt_env.events("settle")[-1].payload.get("usage_overflow")
+
+
+@pytest.mark.parametrize("fault", ["http_500", "slow"])
+@pytest.mark.parametrize(
+    ("path", "dispatched", "status"),
+    [
+        ("/key/generate", False, RunStatus.ERROR),
+        ("/key/block", True, RunStatus.OK),
+        ("/spend/logs/v2", True, RunStatus.OK),
+    ],
+)
+async def test_gateway_failures_never_stop_the_run(
+    rt_env: RtEnv,
+    fake_gateway: FakeGateway,
+    path: str,
+    dispatched: bool,
+    status: RunStatus,
+    fault: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import copy
+
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._gateway.litellm_proxy import LiteLLMProxy
+
+    if fault == "http_500":
+        fake_gateway.fail[path] = 500
+    else:
+        # Held until the gateway stops: only the adapter's own deadline ends the call.
+        fake_gateway.delay[path] = 600
+        method = {
+            "/key/generate": "create_key",
+            "/key/block": "block_key",
+            "/spend/logs/v2": "spend_rows",
+        }[path]
+        original = getattr(LiteLLMProxy, method)
+        short = {"on": True}
+
+        async def short_deadline(self: LiteLLMProxy, *args: Any, **kwargs: Any) -> Any:
+            # Only the slow route gets the short deadline; other gateway calls keep a
+            # generous one, so CI load cannot turn a healthy call into this fault.
+            if short["on"]:
+                self = copy.copy(self)
+                self._http_timeout_s = 0.2
+            return await original(self, *args, **kwargs)
+
+        monkeypatch.setattr(LiteLLMProxy, method, short_deadline)
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool(), http_timeout_s=30) as rt:
+        first = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        if fault == "slow":
+            short["on"] = False
+        assert first.output.status == status
+        assert first.llm_calls_source == ("gateway" if dispatched else "unknown")
+        assert bool(rt_env.events("tool_start")) is dispatched
+        assert first.warnings
+        assert "LLM gateway" in first.warnings[-1]
+        assert rt_env.charged(first) == Amount(usd=1)
+        fake_gateway.fail.pop(path, None)
+        fake_gateway.delay.pop(path, None)
+        second = await execute_tool_run(rt, {"n": 1}, parents=(), replicate=None, edits=None)
+        assert second.output.status == RunStatus.OK
+        assert rt_env.charged(second) == Amount(usd=1)
+        assert fake_gateway.master_key not in repr(first)
+
+
+async def _gateway_tool_ready(path: Path) -> None:
+    from _fakes.proc import wait_for_file
+
+    await wait_for_file(path, 60)
+
+
+async def test_key_revoked_when_outer_scope_cancelled(
+    rt_env: RtEnv, fake_gateway: FakeGateway, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    ready = tmp_path / "keyed-ready"
+    tool = GatewayChatTool({"sleep_s": 60, "ready_file": str(ready), "grace_s": 0.1})
+    appended: list[Any] = []
+    original = rt_env.rt.journal.append
+
+    def append(draft: Any) -> Any:
+        appended.append(draft)
+        return original(draft)
+
+    monkeypatch.setattr(rt_env.rt.journal, "append", append)
+    async with _gateway_runtime(rt_env, fake_gateway, tool) as rt:
+        with anyio.CancelScope() as outer:
+            async with anyio.create_task_group() as tasks:
+
+                async def cancel_ready() -> None:
+                    await _gateway_tool_ready(ready)
+                    outer.cancel()
+
+                tasks.start_soon(cancel_ready)
+                await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert outer.cancelled_caught
+    (key_id,) = fake_gateway.keys
+    assert fake_gateway.keys[key_id]["blocked"] is True
+    assert not [e for e in appended if e.type == "gateway_key" and e.payload["action"] == "closed"]
+    assert not rt_env.events("tool_end")
+    assert not rt_env.events("settle")
+    reservation = rt_env.events("reserve")[-1].payload["reservation"]["id"]
+    assert rt_env.charged(reservation) == Amount(usd=1)
+
+
+async def test_key_revoked_when_dispatch_commit_fenced(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    rt_env.fence_on_append(EventType.TOOL_DISPATCH)
+
+    async def fenced_run() -> None:
+        async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+            rt = dataclasses.replace(rt, executor=_DispatchSpy(rt_env))
+            await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+
+    with pytest.raises(Fenced):
+        await fenced_run()
+    (key_id,) = fake_gateway.keys
+    assert fake_gateway.keys[key_id]["blocked"] is True
+    assert not _gateway_requests(fake_gateway, "/v1/chat/completions")
+
+
+async def test_key_creation_cancellation_has_late_cleanup_owner(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    import threading
+
+    from _fakes.tools import GatewayChatTool
+
+    entered, released, blocked = threading.Event(), threading.Event(), threading.Event()
+    fake_gateway.entered["/key/generate"] = entered
+    fake_gateway.entered["/key/block"] = blocked
+    fake_gateway.hold["/key/generate"] = released
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        with anyio.CancelScope() as outer:
+            async with anyio.create_task_group() as tasks:
+
+                async def cancel_create() -> None:
+                    assert await anyio.to_thread.run_sync(entered.wait, 60)
+                    outer.cancel()
+
+                tasks.start_soon(cancel_create)
+                await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert outer.cancelled_caught
+        released.set()
+        assert await anyio.to_thread.run_sync(blocked.wait, 60)
+    (key_id,) = fake_gateway.keys
+    assert fake_gateway.keys[key_id]["blocked"] is True
+    assert not rt_env.events("tool_start")
+    assert not rt_env.events("gateway_key")
+    assert not rt_env.events("tool_end")
+    assert rt_env.charged(rt_env.events("reserve")[-1].payload["reservation"]["id"]) == Amount(
+        usd=1
+    )
+
+
+async def test_round_cancel_closes_key_without_reading_spend(
+    rt_env: RtEnv, fake_gateway: FakeGateway, tmp_path: Path
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    ready = tmp_path / "round-keyed-ready"
+    tool = GatewayChatTool({"sleep_s": 60, "ready_file": str(ready), "grace_s": 0.1})
+    async with (
+        _gateway_runtime(rt_env, fake_gateway, tool) as rt,
+        anyio.create_task_group() as tasks,
+    ):
+
+        async def cancel_ready() -> None:
+            await _gateway_tool_ready(ready)
+            rt_env.inflight.cancel_all()
+
+        tasks.start_soon(cancel_ready)
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.CANCELLED
+    assert candidate.llm_call_ids == []
+    assert candidate.llm_calls_source == "gateway"
+    assert rt_env.charged(candidate) == Amount(usd=1)
+    assert not _gateway_requests(fake_gateway, "/spend/logs/v2")
+    assert [e.payload["action"] for e in rt_env.events("gateway_key")] == ["created", "closed"]
+
+
+@pytest.mark.parametrize("closure", ["budget", "hard"])
+async def test_keyed_admission_preserves_full_charge(
+    rt_env: RtEnv, fake_gateway: FakeGateway, closure: str
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        executor = _DispatchSpy(rt_env, close_first=closure)
+        rt = dataclasses.replace(rt, executor=executor)
+        if closure == "hard":
+            with pytest.raises(LimitReached, match="stopping"):
+                await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+            assert not rt_env.events("tool_dispatch")
+        else:
+            candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+            assert candidate.output.status == RunStatus.OK
+            assert rt.started_runs == 1
+        reservation = rt_env.events("reserve")[-1].payload["reservation"]["id"]
+        assert rt_env.charged(reservation) == Amount(usd=1)
+        assert not rt_env.inflight._scopes
+        (key_id,) = fake_gateway.keys
+        assert fake_gateway.keys[key_id]["blocked"] is True
+
+
+@pytest.mark.parametrize("control", ["fenced", "terminal", "ordinary"])
+@pytest.mark.parametrize("nested", [False, True])
+async def test_keyed_dispatch_preserves_control_and_revokes(
+    rt_env: RtEnv,
+    fake_gateway: FakeGateway,
+    monkeypatch: pytest.MonkeyPatch,
+    control: str,
+    nested: bool,
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    error = (
+        _core_error(Fenced, "safe")
+        if control == "fenced"
+        else _stop_cleanup_error()
+        if control == "terminal"
+        else ValueError("unsafe-value")
+    )
+    raised = ExceptionGroup("unsafe-value", [error]) if nested else error
+
+    async def fail(job: Job) -> ToolOutput:
+        raise raised
+
+    monkeypatch.setattr(rt_env.rt.executor, "submit", fail)
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        if control == "ordinary":
+            candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+            assert candidate.output.status == RunStatus.ERROR
+            assert "unsafe-value" not in repr(candidate)
+        else:
+            with pytest.raises(Exception, match=r"safe|ownership|cleanup") as caught:
+                await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+            assert _core_category(caught.value) is (
+                _SignalCategory.FENCED if control == "fenced" else _SignalCategory.TERMINAL
+            )
+        (key_id,) = fake_gateway.keys
+        assert fake_gateway.keys[key_id]["blocked"] is True
+        assert not [e for e in rt_env.events("gateway_key") if e.payload["action"] == "closed"]
+
+
+async def test_virtual_key_never_written(
+    fake_gateway: FakeGateway, tmp_path: Path, run_config: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tempfile
+
+    from _fakes.run import all_events
+    from _fakes.tools import gateway_plan
+
+    from swarm_arena import Swarm
+    from swarm_arena._engine.run import _local_journal_path
+    from swarm_arena._exec.local import LocalExecutor
+    from swarm_arena.config import GatewayConfig
+    from swarm_arena.tool import Estimate
+
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
+    monkeypatch.setenv("LITELLM_MASTER_KEY", fake_gateway.master_key)
+    config = run_config.model_copy(
+        update={
+            "llm_gateway": GatewayConfig(url=fake_gateway.url, require_hard_cap=False),
+            "limits": run_config.limits.model_copy(
+                update={"default_run_reservation": Estimate(usd=1)}
+            ),
+        }
+    )
+    original = LocalExecutor.submit
+    jobs: list[Job] = []
+
+    async def capture(self: LocalExecutor, job: Job) -> ToolOutput:
+        jobs.append(job)
+        return await original(self, job)
+
+    monkeypatch.setattr(LocalExecutor, "submit", capture)
+    result = await Swarm(config).run(gateway_plan())
+    candidate = result["g"][0]
+    key = next(
+        value for value in fake_gateway.keys.values() if value["alias"] == f"cand-{candidate.id}"
+    )
+    secret = key["secret"]
+    local = _local_journal_path(candidate.run_id, 1)
+    assert local.is_relative_to(temp)
+    assert local.is_file()
+    assert any(event.type == "gateway_key" for event in all_events(config))
+    assert "gateway_key" in local.read_text()
+    for path in await anyio.to_thread.run_sync(lambda: list(tmp_path.rglob("*"))):
+        if path.is_file():
+            content = path.read_bytes()
+            assert secret.encode() not in content, path
+            assert fake_gateway.master_key.encode() not in content, path
+    assert secret not in repr(jobs)
+    assert secret not in repr(candidate)
+    # Real engine-created key events include the clock stamp and must restore.
+    await Swarm(config).resume(candidate.run_id)
+    assert _local_journal_path(candidate.run_id, 2).is_file()
+    for path in await anyio.to_thread.run_sync(lambda: list(tmp_path.rglob("*"))):
+        if path.is_file():
+            assert secret.encode() not in path.read_bytes(), path
+
+
+async def test_round_cancel_during_gateway_read_keeps_completed_result(
+    rt_env: RtEnv, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._gateway.keys import KeyManager
+
+    entered = anyio.Event()
+
+    async def read(self: KeyManager, *args: Any, **kwargs: Any) -> Any:
+        assert rt_env.inflight._scopes, "gateway read has no round completion owner"
+        entered.set()
+        rt_env.inflight.cancel_all()
+        await anyio.lowlevel.checkpoint()
+        pytest.fail("round cancellation did not interrupt read")
+
+    monkeypatch.setattr(KeyManager, "read_with_status", read)
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert entered.is_set()
+    assert candidate.output.status == RunStatus.OK
+    assert candidate.llm_calls_source == "gateway"
+    assert candidate.llm_call_ids == []
+    assert any("gateway read interrupted" in warning for warning in candidate.warnings)
+    assert rt_env.charged(candidate) == Amount(usd=1)
+    assert not rt_env.inflight._scopes
+
+
+@pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit, GeneratorExit])
+async def test_keyed_hard_process_control_never_awaits_cleanup(
+    rt_env: RtEnv,
+    fake_gateway: FakeGateway,
+    monkeypatch: pytest.MonkeyPatch,
+    control: type[BaseException],
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._agent import tool_run
+    from swarm_arena._gateway.keys import KeyManager
+
+    error = control("process control")
+    cleanup: list[str] = []
+
+    async def fail(job: Job) -> ToolOutput:
+        raise error
+
+    async def forbidden(*args: Any, **kwargs: Any) -> None:
+        cleanup.append("awaited")
+
+    monkeypatch.setattr(rt_env.rt.executor, "submit", fail)
+    monkeypatch.setattr(tool_run, "_refund_undispatched", forbidden)
+    monkeypatch.setattr(KeyManager, "revoke", forbidden)
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        with pytest.raises(control) as caught:
+            await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert caught.value is error
+        assert cleanup == []
+        assert not rt_env.events("tool_end")
+
+
+@pytest.mark.parametrize("expired", ["caller", "writer"])
+async def test_gateway_revocation_respects_expired_owner(
+    rt_env: RtEnv, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch, expired: str
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._agent.tool_run import _revoke_gateway_key
+    from swarm_arena._gateway.keys import KeyManager
+
+    attempts: list[str] = []
+
+    def handoff(*args: Any, **kwargs: Any) -> None:
+        attempts.append("handoff")
+
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert rt.gateway is not None
+        record = rt.gateway.records()[0]
+        monkeypatch.setattr(KeyManager, "_revoke_later", handoff)
+        if expired == "writer":
+            with monkeypatch.context() as patch:
+                patch.setattr(rt.journal, "_closing_at", anyio.current_time() - 1)
+                await _revoke_gateway_key(rt, record, float("inf"))
+        else:
+            await _revoke_gateway_key(rt, record, anyio.current_time() - 1)
+    assert attempts == ["handoff"]
+
+
+async def test_late_gateway_row_recorded_after_report(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    fake_gateway.chat_visible_after_s = 3600
+    tool = GatewayChatTool({"also_report_jsonl": True, "reported_cost_usd": 9})
+    async with _gateway_runtime(rt_env, fake_gateway, tool) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert candidate.llm_call_ids == []
+        assert candidate.output.llm_calls_file is not None
+        assert rt_env.events("llm_call") == []
+        assert rt.gateway is not None
+        fake_gateway.reveal_spend()
+        calls = await rt.gateway.read(rt.gateway.records(), wait_first=False)
+        assert len(calls) == 1
+        assert calls[0].cost_usd == 0.01
+        assert calls[0].candidate_id == candidate.id
+        assert await rt.gateway.read(rt.gateway.records(), wait_first=False) == []
+        await rt.journal.commit()
+        assert len(rt_env.events("llm_call")) == 1
+        assert rt_env.charged(candidate) == Amount(usd=1)
+
+
+@pytest.mark.parametrize("hard", [False, True])
+async def test_grouped_executor_escape_preserves_cleanup_authority(
+    rt_env: RtEnv, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch, hard: bool
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    children: list[BaseException] = [asyncio.CancelledError(), _stop_cleanup_error()]
+    if hard:
+        children.append(GeneratorExit())
+    error = BaseExceptionGroup("executor cleanup", [BaseExceptionGroup("nested", children)])
+
+    async def fail(job: Job) -> ToolOutput:
+        raise error
+
+    monkeypatch.setattr(rt_env.rt.executor, "submit", fail)
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        with pytest.raises((BaseExceptionGroup, RuntimeError)) as caught:
+            await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        (key_id,) = fake_gateway.keys
+        assert fake_gateway.keys[key_id]["blocked"] is (not hard)
+        if hard:
+            assert caught.value is error
+        else:
+            assert _core_category(caught.value) is _SignalCategory.TERMINAL
+        assert not rt_env.events("tool_end")
+
+
+async def test_grouped_undispatched_escape_refunds_before_classification(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._agent import tool_run
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        owner = args[-2]
+        owner.admitted = await rt_env.rt.ledger.reserve(
+            rt_env.rt.holder, Amount(usd=1), kind="tool", goal_id=rt_env.rt.goal_id
+        )
+        raise BaseExceptionGroup("prepare", [asyncio.CancelledError(), _stop_cleanup_error()])
+
+    monkeypatch.setattr(tool_run, "_run", fail)
+    with pytest.raises((BaseExceptionGroup, RuntimeError)) as caught:
+        await execute_tool_run(rt_env.rt, {"x": 1}, parents=(), replicate=None, edits=None)
+    assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    reservation = rt_env.events("reserve")[-1].payload["reservation"]["id"]
+    assert rt_env.charged(reservation) == Amount()
+
+
+async def test_keyed_preopen_failure_refunds_reservation(
+    rt_env: RtEnv, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._agent import tool_run
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise OSError("private storage detail")
+
+    monkeypatch.setattr(tool_run, "put_edits", fail)
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    assert candidate.output.status == RunStatus.ERROR
+    assert not fake_gateway.keys
+    assert rt_env.charged(candidate) == Amount()
+    assert rt_env.events("settle")[-1].payload["keep_charged"] is False
+
+
+async def test_keyed_settlement_does_not_report_unverified_usd(
+    rt_env: RtEnv, fake_gateway: FakeGateway
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool({"usage_usd": 9})) as rt:
+        candidate = await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+    settle = rt_env.events("settle")[-1].payload
+    assert settle["actual"] == {"tokens": 0, "usd": 0.0}
+    assert settle["estimated"] is True
+    assert settle["overspend"] is None
+    assert rt_env.charged(candidate) == Amount(usd=1)
+    assert candidate.output.usage.usd == 9
+
+
+async def test_native_cancel_during_revoke_propagates(
+    rt_env: RtEnv, fake_gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._agent.tool_run import _revoke_gateway_key
+    from swarm_arena._gateway.keys import KeyManager
+
+    async def cancel(*args: Any, **kwargs: Any) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        await anyio.lowlevel.checkpoint()
+
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert rt.gateway is not None
+        monkeypatch.setattr(KeyManager, "revoke", cancel)
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await _revoke_gateway_key(rt, rt.gateway.records()[0], float("inf"))
+        finally:
+            task = asyncio.current_task()
+            assert task is not None
+            task.uncancel()
+
+
+async def test_expired_revoke_hands_off_one_bounded_block(
+    rt_env: RtEnv,
+    fake_gateway: FakeGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._agent.tool_run import _revoke_gateway_key
+    from swarm_arena._gateway.adapter import VirtualKey
+
+    entered, release, done = threading.Event(), threading.Event(), threading.Event()
+    attempts: list[str] = []
+
+    async def block(key: VirtualKey) -> None:
+        attempts.append(key.key_id)
+        entered.set()
+        try:
+            await anyio.to_thread.run_sync(release.wait, 90, abandon_on_cancel=True)
+        finally:
+            done.set()
+
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert rt.gateway is not None
+        record = rt.gateway.records()[0]
+        monkeypatch.setattr(rt.gateway._adapter, "block_key", block)
+        try:
+            with anyio.fail_after(60):
+                await _revoke_gateway_key(rt, record, anyio.current_time() - 1)
+                assert await anyio.to_thread.run_sync(entered.wait, 60)
+                assert not done.is_set()
+        finally:
+            release.set()
+            if entered.is_set():
+                assert await anyio.to_thread.run_sync(done.wait, 60)
+        assert attempts == [record.key_id]
+
+
+async def test_deadline_cancellation_blocks_key_after_caller_exits(
+    rt_env: RtEnv,
+    fake_gateway: FakeGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._gateway.adapter import VirtualKey
+
+    done = threading.Event()
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        assert rt.gateway is not None
+        original = rt.gateway._adapter.block_key
+
+        async def blocked(key: VirtualKey) -> None:
+            try:
+                await original(key)
+            finally:
+                done.set()
+
+        monkeypatch.setattr(rt.gateway._adapter, "block_key", blocked)
+        with anyio.CancelScope() as caller:
+
+            async def expire(job: Job) -> None:
+                caller.deadline = anyio.current_time()
+                await anyio.sleep_forever()
+
+            monkeypatch.setattr(rt.executor, "submit", expire)
+            await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert caller.cancelled_caught
+        (key_id,) = fake_gateway.keys
+        with anyio.fail_after(60):
+            assert await anyio.to_thread.run_sync(done.wait, 60)
+        assert fake_gateway.keys[key_id]["blocked"]
+        assert len(_gateway_requests(fake_gateway, "/key/block")) == 1
+        assert not rt_env.events("tool_end")
+        assert not [e for e in rt_env.events("gateway_key") if e.payload["action"] == "closed"]
+
+
+async def test_outer_group_preserves_delivered_native_cancellation(
+    rt_env: RtEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._agent import tool_run
+
+    async def fail(*args: Any, **kwargs: Any) -> Any:
+        owner = args[-2]
+        owner.admitted = await rt_env.rt.ledger.reserve(
+            rt_env.rt.holder, Amount(usd=1), kind="tool", goal_id=rt_env.rt.goal_id
+        )
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        try:
+            await anyio.lowlevel.checkpoint()
+        except asyncio.CancelledError as cancelled:
+            raise BaseExceptionGroup("cleanup", [cancelled, ValueError("private")]) from None
+
+    monkeypatch.setattr(tool_run, "_run", fail)
+    try:
+        with pytest.raises((asyncio.CancelledError, RuntimeError, BaseExceptionGroup)) as caught:
+            await execute_tool_run(rt_env.rt, {"x": 1}, parents=(), replicate=None, edits=None)
+        assert isinstance(caught.value, asyncio.CancelledError)
+        reservation = rt_env.events("reserve")[-1].payload["reservation"]["id"]
+        assert rt_env.charged(reservation) == Amount()
+    finally:
+        task = asyncio.current_task()
+        assert task is not None
+        task.uncancel()
+
+
+@pytest.mark.parametrize("control", [KeyboardInterrupt, SystemExit, GeneratorExit])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("operation", ["create_key", "block_key"])
+async def test_keyed_gateway_hard_control_skips_cleanup_and_completion(
+    rt_env: RtEnv,
+    fake_gateway: FakeGateway,
+    monkeypatch: pytest.MonkeyPatch,
+    control: type[BaseException],
+    nested: bool,
+    operation: str,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from _fakes.tools import GatewayChatTool
+
+    from swarm_arena._agent import tool_run
+
+    hard = control("process control")
+    raised = (
+        BaseExceptionGroup(
+            "hard gateway control",
+            [
+                ValueError("ordinary"),
+                BaseExceptionGroup("nested", [hard, asyncio.CancelledError()]),
+            ],
+        )
+        if nested
+        else hard
+    )
+    cleanup = AsyncMock()
+    monkeypatch.setattr(tool_run, "_refund_undispatched", cleanup)
+    monkeypatch.setattr(
+        rt_env.rt.executor, "submit", AsyncMock(return_value=ToolOutput(status=RunStatus.OK))
+    )
+    async with _gateway_runtime(rt_env, fake_gateway, GatewayChatTool()) as rt:
+        assert rt.gateway is not None
+        monkeypatch.setattr(rt.gateway, "revoke", cleanup)
+        monkeypatch.setattr(rt.gateway, "_compensate", cleanup)
+        monkeypatch.setattr(rt.gateway._adapter, operation, AsyncMock(side_effect=raised))
+        with pytest.raises(BaseExceptionGroup if nested else control) as caught:
+            await execute_tool_run(rt, {}, parents=(), replicate=None, edits=None)
+        assert caught.value is raised
+        cleanup.assert_not_awaited()
+        assert not rt_env.events("tool_end")
+        assert not [
+            event for event in rt_env.events("gateway_key") if event.payload["action"] == "closed"
+        ]

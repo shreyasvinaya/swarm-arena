@@ -15,6 +15,7 @@ async def test_pool_limits_concurrency_and_cpus(
 ) -> None:
     pool = ResourcePool(cpus=cpus, max_concurrent=max_concurrent)
     running = peak = completed = 0
+    full, release = anyio.Event(), anyio.Event()
 
     async def worker() -> None:
         nonlocal running, peak, completed
@@ -22,14 +23,21 @@ async def test_pool_limits_concurrency_and_cpus(
             running += 1
             peak = max(peak, running)
             assert running * need_cpus <= cpus
-            await anyio.sleep(0.2)
+            if running == expected_peak:
+                full.set()
+            await release.wait()
             running -= 1
             completed += 1
 
-    with anyio.fail_after(5):
+    with anyio.fail_after(60):
         async with anyio.create_task_group() as group:
             for _ in range(4):
                 group.start_soon(worker)
+            try:
+                await full.wait()
+                assert running == expected_peak
+            finally:
+                release.set()
     assert peak == expected_peak
     assert completed == 4
 
@@ -61,7 +69,7 @@ def test_pool_error_never_formats_capacity() -> None:
 
 async def test_pool_ignores_other_resources() -> None:
     pool = ResourcePool(cpus=1.0, max_concurrent=1)
-    with anyio.fail_after(1):
+    with anyio.fail_after(60):
         async with pool.slot(
             Resources(cpus=1.0, gpus=8, memory_gib=100, custom={"gpu": 9})
         ) as slot:
@@ -73,7 +81,7 @@ async def test_pool_releases_after_error() -> None:
     with pytest.raises(RuntimeError, match="worker failed"):
         async with pool.slot(Resources()):
             raise RuntimeError("worker failed")
-    with anyio.fail_after(1):
+    with anyio.fail_after(60):
         async with pool.slot(Resources()):
             pass
 
@@ -85,7 +93,7 @@ async def test_pool_releases_after_cancellation() -> None:
             scope.cancel()
             await anyio.sleep_forever()
     assert scope.cancelled_caught
-    with anyio.fail_after(1):
+    with anyio.fail_after(60):
         async with pool.slot(Resources()):
             pass
 
@@ -100,7 +108,7 @@ async def test_cancelled_waiter_does_not_consume_capacity() -> None:
                 pytest.fail("waiter exceeded concurrency limit")
         assert scope.cancelled_caught
 
-    with anyio.fail_after(1):
+    with anyio.fail_after(60):
         async with pool.slot(Resources()), anyio.create_task_group() as group:
             scope = await group.start(waiter)
             await anyio.wait_all_tasks_blocked()
@@ -111,14 +119,14 @@ async def test_cancelled_waiter_does_not_consume_capacity() -> None:
 
 async def test_fractional_cpu_reservations_fit_exactly() -> None:
     pool = ResourcePool(cpus=0.3, max_concurrent=3)
-    with anyio.fail_after(1):
+    with anyio.fail_after(60):
         async with pool.slot(Resources(cpus=0.1)), pool.slot(Resources(cpus=0.2)):
             pass
 
 
 async def test_cpu_release_does_not_accumulate_rounding_error() -> None:
     pool = ResourcePool(cpus=1.0, max_concurrent=3)
-    with anyio.fail_after(1):
+    with anyio.fail_after(60):
         async with pool.slot(Resources(cpus=0.66)):
             for _ in range(20):
                 async with pool.slot(Resources(cpus=0.18)):

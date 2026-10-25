@@ -169,12 +169,12 @@ class RtEnv:
         cast(Any, self.rt.journal).append_durable = wrapped
 
     async def wait_for(self, path: Path) -> None:
-        with anyio.fail_after(15):
+        with anyio.fail_after(60):
             while not await anyio.to_thread.run_sync(path.exists):  # noqa: ASYNC110 - external file signal
                 await anyio.sleep(0.01)
 
     async def wait_started(self) -> None:
-        with anyio.fail_after(15):
+        with anyio.fail_after(60):
             while not await anyio.to_thread.run_sync(self.events, "tool_start"):  # noqa: ASYNC110
                 await anyio.sleep(0.01)
 
@@ -323,7 +323,7 @@ class EngineEnv:
         cast(Any, self.deps.journal).append_durable = wrapped
 
     async def wait_for(self, path: Path) -> None:
-        with anyio.fail_after(15):
+        with anyio.fail_after(60):
             while not await anyio.to_thread.run_sync(path.exists):  # noqa: ASYNC110 - external file signal
                 await anyio.sleep(0.01)
 

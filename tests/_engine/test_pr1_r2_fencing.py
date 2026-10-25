@@ -3,13 +3,13 @@
 import asyncio
 import json
 import traceback
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 import anyio
 import pytest
 from _fakes import pr1_fm as hooks
+from _fakes.cleanup import observe_task, settle_tasks
 
 from swarm_arena import Swarm
 from swarm_arena._errors import Fenced, _core_error
@@ -95,14 +95,13 @@ async def test_caller_cancel_wins_over_replacement_fence(
         monkeypatch.setattr(hooks.PaidTool, "extra_actions", actions)
     task = asyncio.create_task(Swarm(config(tmp_path)).run(plan(where, "fence"), run_id="r"))
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await ready.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError) as caught:
-            await task
+            await observe_task(task)
         assert hooks.MARK not in "".join(traceback.format_exception(caught.value))
     finally:
         if not task.done():
             task.cancel()
-            with suppress(BaseException):
-                await task
+            await settle_tasks(task)

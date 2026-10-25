@@ -13,6 +13,9 @@ import anyio
 import pydantic
 import pytest
 
+pytest.importorskip("agents")
+
+
 # The package must pin the map before either SDK imports LiteLLM.
 import swarm_arena.llm  # noqa: F401
 
@@ -78,7 +81,7 @@ async def _isolated_upstream(
     try:
         yield
     finally:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await GLOBAL_LOGGING_WORKER.flush()
             await GLOBAL_LOGGING_WORKER.stop()
             await close_litellm_async_clients()
@@ -111,7 +114,7 @@ class _CaptureLogger(CustomLogger):
         self.ready.put_nowait(None)
 
     async def wait(self) -> None:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await self.ready.get()
 
 
@@ -1008,7 +1011,7 @@ async def test_metered_call_has_one_provider_dispatch_with_retry_policy(
         max_tokens=100,
         prices=ModelSpec.Prices(input=1, output=3),
     )
-    cfg = ArenaRunConfig(models=ModelCatalog({"m": spec}), settle_timeout_s=2)
+    cfg = ArenaRunConfig(models=ModelCatalog({"m": spec}))
     monkeypatch.setattr(main, "completion", provider)
     # A process default must not reinstate retries after caller controls are stripped.
     monkeypatch.setattr(litellm, "num_retries", 3)

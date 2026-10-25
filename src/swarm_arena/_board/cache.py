@@ -1309,7 +1309,7 @@ class ArenaCache:
         """Detach publication material from an exactly covered ingest checkpoint.
 
         No SQL schema extension is needed: committed event envelopes already
-        retain calls and private revision provenance. Historical marks replay
+        retain calls, gateway reports and private revision provenance. Historical marks replay
         only during publication; composite readers never invoke this seam.
         """
         with self._lock:
@@ -1328,6 +1328,8 @@ class ArenaCache:
                 goals=deepcopy(state.goals),
                 plan_first_rounds=deepcopy(state.plan_first_rounds),
                 llm_calls=deepcopy(state.llm_calls),
+                gateway_keys=deepcopy(state.gateway_keys),
+                gateway_reconcile=deepcopy(state.gateway_reconcile),
             )
 
     def _replay(self, run_id: str, *, through_seq: int | None = None) -> RunState:

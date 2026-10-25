@@ -132,7 +132,7 @@ async def test_concurrent_goal_returns_match_committed_order(
             await second.run()
             finished.set()
 
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             async with anyio.create_task_group() as group:
                 group.start_soon(first.run)
                 group.start_soon(finish_second)

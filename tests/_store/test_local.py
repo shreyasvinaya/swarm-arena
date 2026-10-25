@@ -1,10 +1,10 @@
 import fcntl
 import os
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
 
 import pytest
+from _fakes.cleanup import BoundedThreadPoolExecutor
 from _fakes.secrecy import assert_secret_absent
 
 from swarm_arena._errors import AlreadyExists, NotFound, PreconditionFailed, StorageError
@@ -35,14 +35,18 @@ def test_create_race_has_one_winner(tmp_path: Path) -> None:
 
     def create(i: int) -> tuple[bytes, str] | None:
         data = f"{i}".encode()
-        barrier.wait()
+        barrier.wait(timeout=300)
         try:
             return data, LocalStore(tmp_path).create("k", data)
         except AlreadyExists:
             return None
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(create, range(8)))
+    with BoundedThreadPoolExecutor(max_workers=8) as pool:
+        try:
+            futures = [pool.submit(create, i) for i in range(8)]
+            results = [future.result(timeout=60) for future in futures]
+        finally:
+            barrier.abort()
     winners = [result for result in results if result is not None]
     assert len(winners) == 1
     assert results.count(None) == 7
@@ -246,11 +250,15 @@ def test_concurrent_replace_has_one_winner(store: LocalStore) -> None:
     barrier = Barrier(8)
 
     def replace(i: int) -> str:
-        barrier.wait()
+        barrier.wait(timeout=300)
         return _try_replace(store, etag, i)
 
-    with ThreadPoolExecutor(8) as pool:
-        results = list(pool.map(replace, range(8)))
+    with BoundedThreadPoolExecutor(8) as pool:
+        try:
+            futures = [pool.submit(replace, i) for i in range(8)]
+            results = [future.result(timeout=60) for future in futures]
+        finally:
+            barrier.abort()
     assert results.count("ok") == 1 and results.count("lost") == 7  # noqa: PT018
     winner = results.index("ok")
     data = f"v{winner + 1}".encode()

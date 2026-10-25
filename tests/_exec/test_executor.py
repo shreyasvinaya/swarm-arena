@@ -8,6 +8,25 @@ from swarm_arena._exec.executor import Executor, Job
 from swarm_arena.tool import ParentRef, RunStatus, ToolOutput
 
 
+def test_schedule_timeout_scope() -> None:
+    from swarm_arena._exec.executor import current_schedule_timeout, schedule_timeout_scope
+
+    assert current_schedule_timeout() is None
+    with schedule_timeout_scope(600.0):
+        assert current_schedule_timeout() == 600.0
+        with schedule_timeout_scope(42.0):
+            assert current_schedule_timeout() == 42.0
+        with pytest.raises(RuntimeError, match="restore"), schedule_timeout_scope(42.0):
+            raise RuntimeError("restore")
+        assert current_schedule_timeout() == 600.0
+    assert current_schedule_timeout() is None
+
+
+def test_dispatch_retains_original_ray_job_id() -> None:
+    started = Job.Started(kind="dispatch", job_id="x", task_name="x", ray_job_id="01000000")
+    assert Job.Started.model_validate_json(started.model_dump_json()).ray_job_id == "01000000"
+
+
 @pytest.mark.parametrize("envelope", ["request", "candidate_request", "candidate_output"])
 def test_workspace_envelopes_refuse_newer_versions(envelope: str) -> None:
     secret = "a464d9fa-secret-envelope"
@@ -370,3 +389,15 @@ def test_job_timeout_is_positive_and_grace_can_be_zero() -> None:
     with pytest.raises(ValueError, match="timeout_s"):
         make_job(timeout_s=0)
     assert make_job(timeout_s=None, grace_s=0).grace_s == 0
+
+
+@pytest.mark.parametrize("drop_env", ["GEMINI_API_KEY", ["GEMINI_API_KEY"], ("SECRET", 1), None])
+def test_job_drop_env_requires_tuple_of_strings(drop_env: object) -> None:
+    with pytest.raises(ValueError, match=r"Job\.drop_env") as caught:
+        make_job(drop_env=drop_env)
+    assert_secret_absent(caught.value, "GEMINI_API_KEY")
+    assert_secret_absent(caught.value, "SECRET")
+
+
+def test_job_drop_env_accepts_tuple_of_strings() -> None:
+    assert make_job(drop_env=("GEMINI_API_KEY",)).drop_env == ("GEMINI_API_KEY",)

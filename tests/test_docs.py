@@ -5,6 +5,7 @@ import importlib
 import importlib.metadata
 import inspect
 import re
+import runpy
 import subprocess
 import sys
 from html.parser import HTMLParser
@@ -17,6 +18,10 @@ GUIDES = sorted(
     path for path in (ROOT / "docs").glob("*.md") if path.name != "writing-a-connector.md"
 )
 ROADMAP = Path("docs/superpowers/plans/2026-10-18-swarm-arena-roadmap.md")
+BARE_OPTIONAL_INSTALL = re.compile(
+    r"\b(?:uv\s+add|(?:uv\s+)?pip(?:3)?\s+install)\s+[\"']?"
+    r"swarm-arena\[(?:llm|cache|langfuse|ray)[^\]]*\](?!\s+@\s+git\+)"
+)
 
 
 def test_optional_install_examples_use_prerelease_uv() -> None:
@@ -24,13 +29,10 @@ def test_optional_install_examples_use_prerelease_uv() -> None:
     readme = (ROOT / "README.md").read_text()
     for extra in ("llm", "cache", "langfuse"):
         assert f'uv add "swarm-arena[{extra}] @ {source}"' in readme
+    assert f"uv add 'swarm-arena[ray] @ {source}'" in readme
     concepts = re.sub(r"\s+", " ", (ROOT / "docs/concepts.md").read_text())
     for extras in ("llm", "llm,cache"):
         assert f'uv add "swarm-arena[{extras}] @ {source}"' in concepts
-    bare_install = re.compile(
-        r"\b(?:uv\s+add|(?:uv\s+)?pip(?:3)?\s+install)\s+[\"']?"
-        r"swarm-arena\[(?:llm|cache|langfuse)[^\]]*\](?!\s+@\s+git\+)"
-    )
     stale: list[str] = []
     for directory in (ROOT / "docs", ROOT / "src"):
         for path in sorted(directory.rglob("*")):
@@ -39,10 +41,37 @@ def test_optional_install_examples_use_prerelease_uv() -> None:
             if ROOT / "docs/superpowers" in path.parents:
                 continue
             text = path.read_text()
-            for match in bare_install.finditer(text):
+            for match in BARE_OPTIONAL_INSTALL.finditer(text):
                 line = text.count("\n", 0, match.start()) + 1
                 stale.append(f"{path.relative_to(ROOT)}:{line}")
     assert not stale, "Bare optional install commands: " + ", ".join(stale)
+
+
+@pytest.mark.parametrize("command", ["pip install", "pip3 install", "uv pip install", "uv add"])
+@pytest.mark.parametrize("quote", ["", "'", '"'])
+@pytest.mark.parametrize("extras", ["ray", "llm", "llm,cache", "langfuse"])
+def test_bare_optional_install_guard_matches_quoted_extras(
+    command: str, quote: str, extras: str
+) -> None:
+    assert BARE_OPTIONAL_INSTALL.search(f"{command} {quote}swarm-arena[{extras}]{quote}")
+    source = "git+https://github.com/shreyasvinaya/swarm-arena"
+    assert not BARE_OPTIONAL_INSTALL.search(f'{command} "swarm-arena[{extras}] @ {source}"')
+
+
+def test_ray_missing_extra_hint_uses_prerelease_uv(monkeypatch: pytest.MonkeyPatch) -> None:
+    def missing(name: str) -> str:
+        assert name == "ray"
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", missing)
+    with pytest.raises(ModuleNotFoundError) as caught:
+        runpy.run_path(str(ROOT / "src/swarm_arena/ray/_imports.py"))
+    assert caught.value.name == "ray"
+    assert str(caught.value) == (
+        "swarm_arena.ray needs the 'ray' extra: uv add "
+        '"swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena"'
+    )
+    assert caught.value.__cause__ is None
 
 
 def test_roadmap_records_supported_llm_dependency_deviation() -> None:

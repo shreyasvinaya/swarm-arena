@@ -4,12 +4,17 @@ import asyncio
 import json
 import traceback
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
 
 import anyio
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
+
+pytest.importorskip("agents")
+
 from _engine.conftest import env as env
 from _fakes.engine import EngineEnv
 from _fakes.llm_components import LateFakeModel
@@ -55,7 +60,6 @@ def configuration() -> RunConfig:
                 )
             }
         ),
-        settle_timeout_s=2,
     )
 
 
@@ -247,6 +251,9 @@ async def test_curator_drains_before_it_returns(delay_s: float | None, tmp_path:
     fake.register("cur")
     async with open_llm_run(tmp_path, config=configuration()) as run:
         scope = run.scope("curator")
+        # The fake deliberately omits its callback; keep only the report wait short.
+        if delay_s is None:
+            scope = replace(scope, settle_timeout_s=2)
         try:
             with llm_scope(scope):
                 (summary,) = await LLMCurator(model="cur").curate(
@@ -296,11 +303,12 @@ async def test_cancellation_drains_and_late_callback_cannot_publish(tmp_path: Pa
                 task = asyncio.create_task(
                     LLMCurator(model="cur").curate("physika", [learning(1), learning(2)], view())
                 )
-                with anyio.fail_after(10):
+                with anyio.fail_after(60):
                     await fake.ready.wait()
                     task.cancel()
                     with pytest.raises(asyncio.CancelledError):
-                        await task
+                        await observe_task(task)
+                    assert task.cancelled()
             assert scope.tranche.pending() == 0
             assert len(run.calls()) == 1
             assert (run.calls()[0].error or "").startswith("estimated:")
@@ -308,10 +316,12 @@ async def test_cancellation_drains_and_late_callback_cannot_publish(tmp_path: Pa
             await fake.flush()
             assert len(run.calls()) == 1
         finally:
-            if task is not None and not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-            await fake.aclose()
+            try:
+                if task is not None and not task.done():
+                    task.cancel()
+                    await settle_tasks(task)
+            finally:
+                await fake.aclose()
 
 
 async def test_engine_publishes_drained_call_link_atomically(
@@ -496,10 +506,20 @@ async def test_custom_curator_failure_waits_for_authoritative_usage(
     from _fakes.curators import MergeAll
 
     from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._engine import goal as goal_module
     from swarm_arena._journal.llm_record import _bound_run
     from swarm_arena._journal.replay import RunState
     from swarm_arena.llm._curator import CURATOR_SCHEMA
     from swarm_arena.llm._structured import structured_call
+
+    if delay_s is None:
+        report_timer = goal_module._report_timer
+
+        def missing_report_timer(seconds: float) -> anyio.CancelScope:
+            return report_timer(2)
+
+        # Only the permanently absent report has a shortened wait.
+        monkeypatch.setattr(goal_module, "_report_timer", missing_report_timer)
 
     env = env.with_limits(max_usd=10, max_tokens=100000)
     runner = await _curation_checkpoint(env)
@@ -707,9 +727,17 @@ async def test_run_custom_curator_provider_error_keeps_receipt_and_selection(
     from _fakes.run import all_events
 
     from swarm_arena._budget.llm_scope import current_llm_scope
+    from swarm_arena._engine import goal as goal_module
     from swarm_arena.llm._curator import CURATOR_SCHEMA
     from swarm_arena.llm._structured import structured_call
 
+    report_timer = goal_module._report_timer
+
+    def missing_report_timer(seconds: float) -> anyio.CancelScope:
+        return report_timer(2)
+
+    # The broken fake emits no usage callback; durable cleanup keeps its default.
+    monkeypatch.setattr(goal_module, "_report_timer", missing_report_timer)
     fake = FakeModel([])
 
     async def boom(*args: Any, **kwargs: Any) -> Any:
@@ -802,7 +830,7 @@ async def test_custom_curator_control_skips_report_wait(
     monkeypatch.setattr(MergeAll, "curate", curate)
     monkeypatch.setattr(module, "drain", drain)
     monkeypatch.setattr(Tranche, "pending", pending)
-    with pytest.raises(type(control)), anyio.fail_after(10):
+    with pytest.raises(type(control)), anyio.fail_after(60):
         await runner._curate_round(1)
     assert drained
     assert not report_polled

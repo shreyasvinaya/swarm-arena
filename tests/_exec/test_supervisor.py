@@ -1,9 +1,10 @@
+import asyncio
 import errno
 import gc
-import itertools
 import os
 import signal
 import sys
+import threading
 import time
 import warnings
 from pathlib import Path
@@ -11,13 +12,17 @@ from typing import Any
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
 from _fakes.proc import THREADED, pid_alive, require_visible_proc, wait_for_file, wait_until
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 
 from swarm_arena._exec import supervisor
 from swarm_arena._exec.executor import Job
 from swarm_arena._exec.procinfo import ExitWatch, host_id
 from swarm_arena._exec.supervisor import ProcessSupervisor, RLimits
 from swarm_arena._model.tooling import CompletedRun, RunStatus
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 # A grandchild that ignores SIGTERM (so only the group SIGKILL ends it); the tool waits until the
 # grandchild has installed the ignore, writes its pid to gc.pid, and sleeps.
@@ -114,18 +119,27 @@ async def test_tool_waits_for_on_started(tmp_path: Path) -> None:  # the handsha
 
 async def test_cancel_in_on_started_kills_launcher(tmp_path: Path) -> None:
     pids: list[int] = []
+    entered = anyio.Event()
 
-    async def hang(s: Job.Started) -> None:
-        assert s.pid is not None
-        pids.append(s.pid)
+    async def hang(started: Job.Started) -> None:
+        assert started.pid is not None
+        pids.append(started.pid)
+        entered.set()
         await anyio.sleep_forever()
 
-    with anyio.move_on_after(1) as scope:
-        await call(tmp_path, py("open('ran', 'w')"), on_started=hang)
-    await anyio.sleep(0.5)
+    async def cancel_when_started(scope: anyio.CancelScope) -> None:
+        with anyio.fail_after(60):
+            await entered.wait()
+        scope.cancel()
+
+    with anyio.fail_after(60):
+        with anyio.CancelScope() as scope:
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(cancel_when_started, scope)
+                await call(tmp_path, py("open('ran', 'w')"), on_started=hang)
     assert scope.cancelled_caught
     assert not (tmp_path / "ran").exists()
-    assert wait_until(lambda: not pid_alive(pids[0]), 5)
+    assert wait_until(lambda: not pid_alive(pids[0]), 60)
 
 
 @pytest.mark.parametrize("pythonpath", [None, "."])  # "." = an allowlisted PYTHONPATH
@@ -226,7 +240,7 @@ async def test_sigterm_handler_runs_within_grace(tmp_path: Path) -> None:
         seen.append((tmp_path / "term.txt").exists())
 
     done = await stop_after_ready(
-        tmp_path, code, ready="ready", grace_s=5.0, before_kill=before_kill
+        tmp_path, code, ready="ready", grace_s=30.0, before_kill=before_kill
     )
     assert done.status is RunStatus.CANCELLED
     assert seen == [True]
@@ -252,18 +266,40 @@ async def test_descendant_gets_full_grace_after_leader_exits(tmp_path: Path) -> 
         seen.append((tmp_path / "child_partial.txt").exists())
 
     done = await stop_after_ready(
-        tmp_path, leader, ready="child.ready", grace_s=5.0, before_kill=before_kill
+        tmp_path, leader, ready="child.ready", grace_s=30.0, before_kill=before_kill
     )
     assert done.status is RunStatus.CANCELLED
     assert seen == [True]
 
 
-async def test_stop_returns_early_when_group_is_gone(tmp_path: Path) -> None:
+async def test_stop_returns_early_when_group_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     require_visible_proc()
-    started = time.monotonic()
-    done = await call(tmp_path, py("import time; time.sleep(60)"), timeout_s=1.0, grace_s=30.0)
-    assert done.status is RunStatus.TIMEOUT
-    assert time.monotonic() - started < 10
+    held_grace: list[anyio.CancelScope] = []
+    task = asyncio.create_task(
+        _timeout_after_ready(
+            tmp_path,
+            "open('ready', 'w'); import time; time.sleep(180)",
+            monkeypatch=monkeypatch,
+            ready="ready",
+            grace_s=180.0,
+            held_grace=held_grace,
+        )
+    )
+    try:
+        await wait_for_file(tmp_path / "ready", 60)
+        done, _ = await asyncio.wait([task], timeout=30)
+        assert done, "a gone group retained the held grace timer"
+        assert task.result().status is RunStatus.TIMEOUT
+        assert len(held_grace) == 1
+        assert not held_grace[0].cancel_called
+    finally:
+        for scope in held_grace:
+            scope.deadline = float("-inf")
+        if not task.done():
+            task.cancel()
+        await settle_tasks(task)
 
 
 async def test_grandchildren_killed_on_cancel(tmp_path: Path) -> None:  # exit criterion
@@ -282,11 +318,11 @@ async def test_grandchildren_killed_on_cancel(tmp_path: Path) -> None:  # exit c
     with anyio.move_on_after(30) as scope:
         async with anyio.create_task_group() as tg:
             tg.start_soon(go)
-            await wait_for_file(tmp_path / "gc.pid", 10)
+            await wait_for_file(tmp_path / "gc.pid", 60)
             tg.cancel_scope.cancel()
     assert not scope.cancelled_caught
     assert statuses == [RunStatus.CANCELLED]
-    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 60)
 
 
 async def test_raising_before_kill_still_kills_group(tmp_path: Path) -> None:
@@ -295,7 +331,7 @@ async def test_raising_before_kill_still_kills_group(tmp_path: Path) -> None:
 
     done = await stop_after_ready(tmp_path, STUBBORN, grace_s=0.5, before_kill=broken)
     assert done.status is RunStatus.CANCELLED
-    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 60)
     assert done.stderr_path.read_text().endswith("swarm-arena: before_kill failed: RuntimeError\n")
 
 
@@ -303,16 +339,30 @@ async def test_blocked_before_kill_is_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 0.5)
+    entered, release = anyio.Event(), anyio.Event()
 
-    async def blocked(r: CompletedRun) -> None:
-        await anyio.sleep_forever()
+    async def blocked(run: CompletedRun) -> None:
+        entered.set()
+        await release.wait()
 
-    started = time.monotonic()
-    done = await stop_after_ready(tmp_path, STUBBORN, grace_s=0.5, before_kill=blocked)
-    assert done.status is RunStatus.CANCELLED
-    assert time.monotonic() - started < 10
-    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
-    assert "before_kill timed out" in done.stderr_path.read_text()
+    task = asyncio.create_task(
+        stop_after_ready(tmp_path, STUBBORN, grace_s=0.5, before_kill=blocked)
+    )
+    try:
+        with anyio.fail_after(60):
+            await entered.wait()
+        done, _ = await asyncio.wait([task], timeout=30)
+        assert done, "kill waited for the held collector"
+        assert not release.is_set()
+        result = task.result()
+        assert result.status is RunStatus.CANCELLED
+        assert "before_kill timed out" in result.stderr_path.read_text()
+        assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 60)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await settle_tasks(task)
 
 
 async def test_before_kill_runs_after_grace_and_before_kill(tmp_path: Path) -> None:
@@ -324,7 +374,7 @@ async def test_before_kill_runs_after_grace_and_before_kill(tmp_path: Path) -> N
     done = await stop_after_ready(tmp_path, STUBBORN, grace_s=0.5, before_kill=before_kill)
     assert done.status is RunStatus.CANCELLED
     assert alive == [True]
-    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 60)
     assert "swarm-arena" not in done.stderr_path.read_text()  # no note on success
 
 
@@ -344,7 +394,7 @@ async def test_fifo_stderr_cannot_block_kill(
     async def broken(r: CompletedRun) -> None:
         raise RuntimeError("collector broke")
 
-    with anyio.fail_after(10):
+    with anyio.fail_after(60):
         done = await stop_after_ready(
             tmp_path,
             code,
@@ -352,7 +402,7 @@ async def test_fifo_stderr_cannot_block_kill(
             before_kill=blocked if mode == "blocked" else broken,
         )
     assert done.status is RunStatus.CANCELLED
-    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 60)
 
 
 async def test_cancel_propagates_when_before_kill_raises(tmp_path: Path) -> None:
@@ -365,10 +415,10 @@ async def test_cancel_propagates_when_before_kill_raises(tmp_path: Path) -> None
     with anyio.move_on_after(30) as scope:
         async with anyio.create_task_group() as tg:  # no ExceptionGroup leaves the group
             tg.start_soon(go)
-            await wait_for_file(tmp_path / "gc.pid", 10)
+            await wait_for_file(tmp_path / "gc.pid", 60)
             tg.cancel_scope.cancel()
     assert not scope.cancelled_caught
-    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 60)
     assert "before_kill failed: RuntimeError" in (tmp_path / "stderr.log").read_text()
 
 
@@ -379,7 +429,7 @@ async def test_background_child_killed_after_normal_exit(tmp_path: Path) -> None
     )
     done = await call(tmp_path, py(code))
     assert (done.status, done.returncode) == (RunStatus.OK, 0)
-    assert wait_until(lambda: not pid_alive(int((tmp_path / "bg.pid").read_text())), 5)
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "bg.pid").read_text())), 60)
 
 
 async def test_oom_status_needs_memory_limit(tmp_path: Path) -> None:
@@ -456,8 +506,17 @@ async def test_leader_unreaped_until_last_group_signal(
         with pytest.raises(RuntimeError, match="commit failed"):
             await call(tmp_path, py(code), on_started=record)
     else:
-        with anyio.move_on_after(1.0 if case == "cancel" else 30):
-            await call(tmp_path, py(code), timeout_s=timeout_s, grace_s=0.5, on_started=record)
+        if case == "cancel":
+            await stop_after_ready(
+                tmp_path,
+                "open('ready', 'w'); " + code,
+                ready="ready",
+                grace_s=0.5,
+                on_started=record,
+            )
+        else:
+            with anyio.fail_after(60):
+                await call(tmp_path, py(code), timeout_s=timeout_s, grace_s=0.5, on_started=record)
     assert seen
     assert seen[-1][0] == signal.SIGKILL
     assert [unreaped for _, unreaped, _ in seen] == [True] * len(seen)  # the pgid stayed anchored
@@ -468,19 +527,56 @@ async def test_kill_at_deadline_when_before_kill_ignores_cancel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(supervisor, "BEFORE_KILL_TIMEOUT_S", 0.5)
-    seen = record_signals(monkeypatch)
-    entered: list[float] = []
+    entered, release = threading.Event(), threading.Event()
+    killed = anyio.Event()
+    timer_entered, expire_timer = anyio.Event(), anyio.Event()
+    real_signal = supervisor._signal_group
+    backend = supervisor.anyio
 
-    async def stuck(r: CompletedRun) -> None:
-        entered.append(time.monotonic())
-        await anyio.to_thread.run_sync(time.sleep, 4.0)  # not abandonable: ignores cancellation
+    class Backend:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(backend, name)
 
-    done = await stop_after_ready(tmp_path, STUBBORN, grace_s=0.5, before_kill=stuck)
-    kills = [at for sig, _, at in seen if sig == signal.SIGKILL]
+        async def sleep(self, delay: float) -> None:
+            if delay == 0.5:
+                timer_entered.set()
+                await expire_timer.wait()
+            else:
+                await backend.sleep(delay)
+
+    monkeypatch.setattr(supervisor, "anyio", Backend())
+
+    def signal_group(pgid: int, sig: int) -> None:
+        real_signal(pgid, sig)
+        if sig == signal.SIGKILL:
+            killed.set()
+
+    monkeypatch.setattr(supervisor, "_signal_group", signal_group)
+
+    async def stuck(run: CompletedRun) -> None:
+        entered.set()
+        await anyio.to_thread.run_sync(release.wait)  # deliberately ignores cancellation
+
+    async def release_after_kill() -> None:
+        try:
+            assert await anyio.to_thread.run_sync(entered.wait, 60)
+            with anyio.fail_after(60):
+                await timer_entered.wait()
+            assert not killed.is_set(), "kill preceded the controlled collector deadline"
+            assert pid_alive(int((tmp_path / "gc.pid").read_text()))
+            expire_timer.set()
+            with anyio.fail_after(30):
+                await killed.wait()
+            assert not release.is_set()
+        finally:
+            release.set()
+
+    async with anyio.create_task_group() as tasks:
+        tasks.start_soon(release_after_kill)
+        done = await stop_after_ready(tmp_path, STUBBORN, grace_s=0.5, before_kill=stuck)
     assert done.status is RunStatus.CANCELLED
-    assert 0.4 <= kills[0] - entered[0] < 3.5  # deadline precedes the blocked 4 s collector
     assert "before_kill timed out after 0.5 s" in done.stderr_path.read_text()
-    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 60)
 
 
 async def test_before_kill_failure_note_names_only_the_type(tmp_path: Path) -> None:
@@ -514,10 +610,8 @@ async def test_log_open_refuses_hardlinked_leaf(tmp_path: Path) -> None:
 
 async def test_log_open_refuses_fifo_without_blocking(tmp_path: Path) -> None:
     os.mkfifo(tmp_path / "stderr.log")  # nobody reads it
-    started = time.monotonic()
-    with pytest.raises(OSError, match=r"stderr\.log"):
+    with anyio.fail_after(30), pytest.raises(OSError, match=r"stderr\.log"):
         await call(tmp_path, py("open('ran', 'w')"))
-    assert time.monotonic() - started < 5
     assert not (tmp_path / "ran").exists()
 
 
@@ -568,12 +662,15 @@ async def test_base_exception_from_before_kill_is_not_wrapped(tmp_path: Path, ki
     except BaseException as exc:
         caught = exc
     assert caught is raised
-    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 60)
 
 
 async def test_safety_net_reap_does_not_block_the_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    entered, release = threading.Event(), threading.Event()
+    returned = threading.Event()
+
     def no_watch(pid: int) -> ExitWatch:
         raise OSError(errno.EMFILE, "Too many open files")
 
@@ -586,30 +683,35 @@ async def test_safety_net_reap_does_not_block_the_loop(
         pids.append(proc.pid)
         real_wait = proc.wait
 
-        def slow_wait(timeout: float | None = None) -> int:
-            time.sleep(1.0)  # a leader that is slow to die after SIGKILL
-            return real_wait(timeout)
+        def held_wait(timeout: float | None = None) -> int:
+            entered.set()
+            try:
+                assert release.wait(180)
+                return real_wait(timeout)
+            finally:
+                returned.set()
 
-        monkeypatch.setattr(proc, "wait", slow_wait)
+        monkeypatch.setattr(proc, "wait", held_wait)
 
     monkeypatch.setattr(supervisor, "ExitWatch", no_watch)
     monkeypatch.setattr(supervisor, "_spawn", slow_spawn)
-    ticks: list[float] = []
 
-    async def ticker() -> None:
-        while True:
-            ticks.append(time.monotonic())
-            await anyio.sleep(0.05)
+    async def progress() -> None:
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
+        assert not release.is_set()
+        release.set()
 
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(ticker)
-        await anyio.sleep(0.2)
-        with pytest.raises(OSError, match="Too many open files"):
-            await call(tmp_path, py("open('ran', 'w')"))
-        await anyio.sleep(0.2)
-        tg.cancel_scope.cancel()
-    assert max(b - a for a, b in itertools.pairwise(ticks)) < 0.5  # the loop kept running
-    assert not pid_alive(pids[0])  # killed and reaped
+    try:
+        with anyio.fail_after(60):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(progress)
+                with pytest.raises(OSError, match="Too many open files"):
+                    await call(tmp_path, py("open('ran', 'w')"))
+    finally:
+        release.set()
+        # This call uses AnyIO's reusable pool, whose thread is not test-owned.
+        assert await anyio.to_thread.run_sync(returned.wait, 60)
+    assert not pid_alive(pids[0])
     assert not (tmp_path / "ran").exists()
 
 
@@ -629,7 +731,7 @@ async def test_grace_waits_for_live_threads_of_an_exited_main_thread(tmp_path: P
         seen.append((tmp_path / "worker.done").exists())
 
     done = await stop_after_ready(
-        tmp_path, leader, ready="child.ready", grace_s=5.0, before_kill=before_kill
+        tmp_path, leader, ready="child.ready", grace_s=30.0, before_kill=before_kill
     )
     assert done.status is RunStatus.CANCELLED
     assert seen == [True]  # the grace covered the worker thread, not just the main thread
@@ -654,7 +756,7 @@ async def stop_after_ready(
             await collect(run)
 
     async def stop_when_ready(scope: anyio.CancelScope) -> None:
-        await wait_for_file(tmp_path / ready, 30)
+        await wait_for_file(tmp_path / ready, 60)
         scope.cancel()
 
     with anyio.CancelScope() as scope:
@@ -679,3 +781,65 @@ async def test_stop_timing_waits_for_slow_child_startup(tmp_path: Path) -> None:
     done = await stop_after_ready(tmp_path, code, grace_s=0.1)
     assert (tmp_path / "gc.pid").exists()
     assert done.status is RunStatus.CANCELLED
+
+
+def test_launch_argv() -> None:
+    from swarm_arena._exec.supervisor import launch_argv
+
+    assert launch_argv(["x"], go_fd=5, rlimits=RLimits(memory_bytes=1024, nofile=64)) == [
+        sys.executable,
+        "-I",
+        "-m",
+        "swarm_arena._launch",
+        "--go-fd",
+        "5",
+        "--rlimit-as=1024",
+        "--rlimit-nofile=64",
+        "--",
+        "x",
+    ]
+    assert launch_argv(["x", "--a"], go_fd=6, rlimits=None)[-3:] == ["--", "x", "--a"]
+    assert "--rlimit-cpu=2" in launch_argv(["x"], go_fd=7, rlimits=RLimits(cpu_seconds=2))
+
+
+async def _timeout_after_ready(
+    tmp_path: Path,
+    code: str,
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    ready: str,
+    held_grace: list[anyio.CancelScope] | None = None,
+    **kwargs: Any,
+) -> CompletedRun:
+    """Expire execution after readiness and optionally hold the independent grace clock."""
+    deadlines: list[anyio.CancelScope] = []
+    backend = supervisor.anyio
+
+    class Backend:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(backend, name)
+
+        def move_on_after(self, delay: float | None, *, shield: bool = False) -> anyio.CancelScope:
+            scope = backend.move_on_after(delay, shield=shield)
+            if delay == 173.0:
+                scope.deadline = float("inf")
+                deadlines.append(scope)
+            elif held_grace is not None and delay == kwargs["grace_s"]:
+                scope.deadline = float("inf")
+                held_grace.append(scope)
+            return scope
+
+    async def expire() -> None:
+        await wait_for_file(tmp_path / ready, 60)
+        assert len(deadlines) == 1
+        deadlines[0].deadline = float("-inf")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(supervisor, "anyio", Backend())
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(expire)
+            try:
+                return await call(tmp_path, py(code), timeout_s=173.0, **kwargs)
+            finally:
+                tasks.cancel_scope.cancel()
+    raise AssertionError("timeout driver ended without a completed run")

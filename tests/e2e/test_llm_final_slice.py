@@ -219,7 +219,6 @@ async def test_final_input_size_controls_predispatch_refusal(tmp_path: Path, siz
             run_root=str(tmp_path / "runs"),
             arena_root=str(tmp_path / "arena"),
             artifact_root=str(tmp_path / "artifacts"),
-            settle_timeout_s=2,
             limits=Limits(
                 max_tokens=10_000,
                 llm_tranche_tokens=1000,

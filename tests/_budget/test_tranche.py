@@ -6,6 +6,7 @@ from typing import cast
 import anyio
 import anyio.lowlevel
 import pytest
+from _fakes.cleanup import observe_task, settle_tasks
 
 from swarm_arena import Limits, RunConfig
 from swarm_arena._budget.amount import USD_LIMIT, Amount
@@ -243,7 +244,7 @@ async def test_cancelled_reserve_returns_unused_funding_on_close(
             except asyncio.CancelledError:
                 cancelled.append(True)
 
-        with anyio.fail_after(5):
+        with anyio.fail_after(60):
             async with anyio.create_task_group() as tasks:
                 tasks.start_soon(request)
                 if after_commit:
@@ -663,7 +664,7 @@ async def test_cancelled_overflow_lock_wait_keeps_one_admission_latch(env: Ledge
         assert not task.done()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            await observe_task(task)
         before = list(env.journal.events)
         assert not tranche.can_cover(Amount())
         with pytest.raises(LimitReached) as caught:
@@ -674,7 +675,7 @@ async def test_cancelled_overflow_lock_wait_keeps_one_admission_latch(env: Ledge
         entry.lock.release()
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await settle_tasks(task)
     assert (await tranche.close()).overflow
     assert env.count("settle") == 1
     assert _replay(env).run_exhausted()

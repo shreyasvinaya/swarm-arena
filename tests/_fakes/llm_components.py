@@ -6,12 +6,15 @@ from dataclasses import replace
 from typing import Any
 
 import anyio
+import pytest
+from _fakes.cleanup import settle_tasks
 from agents import AgentOutputSchemaBase, Handoff, ModelResponse, ModelSettings, Tool
 from agents.items import TResponseInputItem
 from agents.models.interface import ModelTracing
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 
 import swarm_arena.llm  # noqa: F401 - register optional model and price hooks
+from swarm_arena._budget.llm_scope import LLMScope
 from swarm_arena._journal.llm_record import pending_scope, record_call
 from swarm_arena._model.base import _SafeModel
 from swarm_arena._model.goal import Goal
@@ -192,8 +195,40 @@ class LateFakeModel(FakeModel):
 
     async def aclose(self) -> None:
         """Cancel and join outstanding callbacks without leaking tasks."""
-        for task in self.callbacks:
-            task.cancel()
-        if self.callbacks:
-            await asyncio.gather(*self.callbacks, return_exceptions=True)
-        self.callbacks.clear()
+        if self.release is not None:
+            self.release.set()
+        try:
+            await settle_tasks(*self.callbacks)
+        finally:
+            self.callbacks.clear()
+
+
+def missing_callback_timeout(patch: pytest.MonkeyPatch) -> None:
+    """
+    Give fabricated provider failures a short report wait, preserving cleanup.
+
+    Parameters
+    ----------
+    patch : pytest.MonkeyPatch
+        Test-owned patch lifetime. Use only for fakes that never emit their
+        usage callback; normal run/journal cleanup keeps RunConfig's allowance.
+
+    Examples
+    --------
+    >>> with pytest.MonkeyPatch.context() as patch:
+    ...     missing_callback_timeout(patch)
+    """
+    from swarm_arena._engine import round as round_module
+
+    original_scope = round_module.LLMScope
+    original_child = LLMScope.child
+
+    def child(parent: LLMScope) -> LLMScope:
+        return replace(original_child(parent), settle_timeout_s=2)
+
+    def scope(**fields: Any) -> LLMScope:
+        fields["settle_timeout_s"] = 2
+        return original_scope(**fields)
+
+    patch.setattr(LLMScope, "child", child)
+    patch.setattr(round_module, "LLMScope", scope)

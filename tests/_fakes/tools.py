@@ -1472,3 +1472,298 @@ class ProviderPyTool(PyTool):
 
     def providers(self) -> frozenset[str]:
         return frozenset({"fake"})
+
+
+WORKER_SCRIPTS: dict[str, str] = {
+    "partial_on_sigterm.py": """
+import argparse, json, os, signal, time
+from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument('--ready-file')
+args = parser.parse_args()
+n = 0
+result = Path(os.environ['SWARM_ARENA_RESULT'])
+def publish():
+    pending = result.with_suffix('.tmp')
+    pending.write_text(json.dumps({'data': {'step': n}}))
+    pending.replace(result)
+def stop(signum, frame):
+    publish()
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, stop)
+while True:
+    n += 1
+    publish()
+    if args.ready_file:
+        Path(args.ready_file).touch()
+    time.sleep(0.2)
+""",
+    "ignore_sigterm.py": """
+import argparse, os, signal, time
+from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument('--pid-file')
+parser.add_argument('--fifo-stderr', action='store_true')
+args = parser.parse_args()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if args.fifo_stderr:
+    os.remove('swarm/stderr.log')
+    os.mkfifo('swarm/stderr.log')
+if args.pid_file:
+    Path(args.pid_file).write_text(str(os.getpid()))
+time.sleep(300)
+""",
+    "spawn_grandchild.py": """
+import argparse, signal, subprocess, time
+from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument('--pid-file', required=True)
+parser.add_argument('--exit-after', type=float, default=300)
+parser.add_argument('--ignore-term', action='store_true')
+args = parser.parse_args()
+if args.ignore_term:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child = subprocess.Popen(['sleep', '300'])
+Path(args.pid_file).write_text(str(child.pid))
+time.sleep(args.exit_after)
+""",
+    "report_env.py": """
+import json, os
+selected = ('SWARM_ARENA_CANDIDATE_ID', 'CUDA_VISIBLE_DEVICES', 'SA_TEST_SECRET')
+with open(os.environ['SWARM_ARENA_RESULT'], 'w') as f:
+    json.dump({'data': {'env': {k: os.environ.get(k) for k in selected},
+        'pgid': os.getpgrp(), 'parent_pgid': os.getpgid(os.getppid())}}, f)
+""",
+}
+
+
+def _write_module(path: Path) -> None:
+    """Write a standalone annotated FunctionTool fixture."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('def f(a: int) -> dict[str, int]:\n    return {"a": a}\n')
+
+
+class EditSpyTool(PyTool):
+    """Expose the live edit contents seen by command and collection hooks."""
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        (workspace / "edit_spy.json").write_text(json.dumps(request.edits))
+        return super().command(request, workspace)
+
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        return ToolOutput(
+            status=run.status,
+            data={
+                "command_edits": json.loads((workspace / "edit_spy.json").read_text()),
+                "collect_edits": dict(request.edits),
+            },
+        )
+
+
+class StallCollectTool(PyTool):
+    """Hold cancellation collection until the driver must force-stop the worker."""
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        script = "spawn_grandchild.py"
+        argv = [script, "--pid-file", request.inputs["pid_file"], "--ignore-term"]
+        code = f"import sys; sys.argv = {argv!r}\n" + WORKER_SCRIPTS[script]
+        return Command(argv=[sys.executable, "-c", code])
+
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        time.sleep(60)
+        return super().collect(request, workspace, run)
+
+
+GATEWAY_ENV_SCRIPT = """
+import json, os
+names = ('OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY',
+         'OPENAI_BASE_URL', 'ANTHROPIC_BASE_URL')
+with open(os.environ['SWARM_ARENA_RESULT'], 'w') as handle:
+    json.dump({'data': {'env': {k: os.environ[k] for k in names if k in os.environ}}}, handle)
+"""
+
+
+class EnvCommandTool(PyTool):
+    """Request a provider credential only in the worker's command hook."""
+
+    class Config(PyTool.Config):  # ty: ignore[invalid-attribute-override]
+        code: str = ""
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        (workspace / "report_env.py").write_text(GATEWAY_ENV_SCRIPT)
+        return Command(argv=[sys.executable, "report_env.py"], env=["OPENAI_API_KEY"])
+
+
+class GatewayChatTool(PyTool):
+    """Make loopback chat calls without printing or writing the virtual key."""
+
+    class Config(PyTool.Config):  # ty: ignore[invalid-attribute-override]
+        code: str = ""
+        calls: int = 1
+        also_report_jsonl: bool = False
+        reported_cost_usd: float = 9.0
+        extra_reported_rows: int = 0
+        malformed_report: bool = False
+        sleep_s: float = 0
+        ready_file: str = ""
+        reservation: Estimate | None = None
+        usage_usd: float | None = None
+
+    @property
+    def config(self) -> Config:
+        return cast(GatewayChatTool.Config, super().config)
+
+    def providers(self) -> frozenset[str]:
+        return frozenset({"openai"})
+
+    def estimate(self, request: ToolRequest) -> Estimate | None:
+        return self.config.reservation
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        code = (
+            f"settings = {self.config.model_dump()!r}\n"
+            + """
+import json, os, time, urllib.request
+from pathlib import Path
+rows = []
+for index in range(settings['calls']):
+    req = urllib.request.Request(os.environ['OPENAI_BASE_URL'] + '/chat/completions',
+        data=json.dumps({'model': 'chat-model', 'messages': []}).encode(),
+        headers={'Authorization': 'Bearer ' + os.environ['OPENAI_API_KEY'],
+                 'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        rows.append({'model': 'openai/chat-model',
+                     'cost_usd': settings['reported_cost_usd'],
+                     'litellm_call_id': response.headers['x-litellm-call-id']})
+if settings['also_report_jsonl']:
+    rows.extend({'model': 'openai/chat-model', 'cost_usd': settings['reported_cost_usd']}
+                for _ in range(settings['extra_reported_rows']))
+    report = ''.join(json.dumps(row) + '\\n' for row in rows)
+    if settings['malformed_report']:
+        report += 'not-json\\n'
+    Path('swarm/llm_calls.jsonl').write_text(report)
+Path(os.environ['SWARM_ARENA_RESULT']).write_text(json.dumps(
+    {'data': {'chats': settings['calls'], 'y': 1}, 'usage': {'usd': settings['usage_usd']}}))
+if settings['ready_file']:
+    Path(settings['ready_file']).touch()
+time.sleep(settings['sleep_s'])
+"""
+        )
+        return Command(argv=[sys.executable, "-c", code], grace_s=self.config.grace_s)
+
+
+def gateway_env() -> dict[str, Any]:
+    """Report credential routing for the env-only FunctionTool regression."""
+    names = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL")
+    return {"env": {name: os.environ[name] for name in names if name in os.environ}}
+
+
+def gateway_plan(*, rounds: int = 1, converge_team: bool = False) -> Any:
+    """Build a deterministic chat-tool plan for assembled gateway checks."""
+    from swarm_arena import (
+        AgentSpec,
+        ConvergeSpec,
+        Plan,
+        ProgramJudge,
+        Ref,
+        RoundSpec,
+        ScriptedManager,
+        TeamSpec,
+    )
+
+    def team(name: str, *, final: bool = False) -> TeamSpec:
+        return TeamSpec(
+            name=name,
+            rationale="Exercise gateway routing",
+            agents=[
+                AgentSpec(
+                    name="a",
+                    rationale="Run a keyed tool",
+                    tool=Ref.of(GatewayChatTool()),
+                    manager=Ref.of(
+                        ScriptedManager(
+                            [
+                                {
+                                    "inputs": {"n": 1000 if final else r},
+                                    **({} if final else {"round": r}),
+                                }
+                                for r in range(1, (1 if final else rounds) + 1)
+                            ]
+                        )
+                    ),
+                )
+            ],
+        )
+
+    return Plan(
+        goal=Goal(id="g", namespace="n"),
+        teams=[team("t")],
+        judges=[Ref.of(ProgramJudge("_fakes.tools:score_min_y")).model_copy(update={"name": "y"})],
+        ranking="y",
+        rounds=[RoundSpec() for _ in range(rounds)],
+        converge=ConvergeSpec(
+            mode="team" if converge_team else "select",
+            team=team("conv", final=True) if converge_team else None,
+        ),
+    )
+
+
+def llm_tool(prompt: str) -> dict[str, str]:
+    """
+    Send one chat request using only the injected gateway environment.
+
+    Parameters
+    ----------
+    prompt : str
+        User message sent to the loopback test model.
+
+    Returns
+    -------
+    dict of str to str
+        Assistant reply, without credentials or response identifiers.
+
+    Examples
+    --------
+    With a running fake gateway and an injected virtual key:
+
+    >>> llm_tool("hello")  # doctest: +SKIP
+    {'reply': 'ok'}
+    """
+    import urllib.request
+
+    request = urllib.request.Request(
+        os.environ["OPENAI_BASE_URL"] + "/chat/completions",
+        data=json.dumps(
+            {"model": "chat-model", "messages": [{"role": "user", "content": prompt}]}
+        ).encode(),
+        headers={
+            "Authorization": "Bearer " + os.environ["OPENAI_API_KEY"],
+            "Content-Type": "application/json",
+        },
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=60) as response:
+        body = json.load(response)
+    return {"reply": body["choices"][0]["message"]["content"]}
+
+
+def plain_tool(x: float) -> dict[str, float]:
+    """
+    Square a number without using a provider or its environment.
+
+    Parameters
+    ----------
+    x : float
+        Number to square.
+
+    Returns
+    -------
+    dict of str to float
+        Squared value under ``y``.
+
+    Examples
+    --------
+    >>> plain_tool(3.0)
+    {'y': 9.0}
+    """
+    return {"y": x * x}

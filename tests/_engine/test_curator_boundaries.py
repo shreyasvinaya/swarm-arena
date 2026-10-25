@@ -149,7 +149,7 @@ async def test_curator_native_cancel_at_reserve_admission_refunds_exactly(
 
     monkeypatch.setattr(MergeAll, "curate", curate)
     monkeypatch.setattr(JournalWriter, "_wait_for", wait)
-    with anyio.fail_after(10):
+    with anyio.fail_after(60):
         await runner._curate_round(1)
     await env.deps.journal.commit()
     assert len(admitted) == 1

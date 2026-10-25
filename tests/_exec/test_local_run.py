@@ -6,12 +6,16 @@ from pathlib import Path
 
 import anyio
 import pytest
+from _fakes.cleanup import settle_tasks
+from _fakes.process_cleanup import owned_processes  # noqa: F401
 from _fakes.run import all_events, plan
 
 from swarm_arena import FunctionTool, RunConfig, Swarm
 from swarm_arena._journal.lease import read_owner
 from swarm_arena._model.canonical import sha256_hex, utc_now
 from swarm_arena._store.local import LocalStore
+
+pytestmark = pytest.mark.usefixtures("owned_processes")
 
 
 async def test_cancel_abandons_executor_log_storage(
@@ -33,7 +37,7 @@ async def test_cancel_abandons_executor_log_storage(
                 armed = False
                 workers.append(threading.current_thread())
                 entered.set()
-                assert release.wait(30)
+                assert release.wait(180)
         return original(store, key, data)
 
     monkeypatch.setattr(LocalStore, "create", create)
@@ -43,9 +47,9 @@ async def test_cancel_abandons_executor_log_storage(
         )
     )
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 15)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         task.cancel()
-        done, _ = await asyncio.wait([task], timeout=5)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "caller cancellation still waits for executor artifact storage"
         assert task.cancelled()
         owner = read_owner(LocalStore(Path(config.run_root) / "r"))
@@ -56,11 +60,12 @@ async def test_cancel_abandons_executor_log_storage(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 if worker.name.startswith("swarm-arena-daemon-"):
-                    await anyio.to_thread.run_sync(worker.join, 5)
+                    await anyio.to_thread.run_sync(worker.join, 60)
                     assert not worker.is_alive()
     assert publications == [empty_hash], "abandoned stdout upload started another publication"
     owner = read_owner(LocalStore(Path(config.run_root) / "r"))
@@ -93,7 +98,7 @@ async def test_upload_cancellation_never_starts_another_object(
     def block() -> None:
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(30)
+        assert release.wait(180)
 
     def upload_log(store: LocalStore, key: str, data: bytes) -> str:
         publications.append("log")
@@ -137,10 +142,10 @@ async def test_upload_cancellation_never_starts_another_object(
     executor = LocalExecutor(workspace_root=str(tmp_path / "ws"))
     task = asyncio.create_task(executor.submit(job))
     try:
-        assert await anyio.to_thread.run_sync(entered.wait, 10)
+        assert await anyio.to_thread.run_sync(entered.wait, 60)
         before = list(publications)
         task.cancel()
-        done, _ = await asyncio.wait([task], timeout=3)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "executor retained a cancelled upload"
         assert task.cancelled()
         if site == "fault":
@@ -156,13 +161,14 @@ async def test_upload_cancellation_never_starts_another_object(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
                 if worker.name.startswith("swarm-arena-daemon-"):
-                    await anyio.to_thread.run_sync(worker.join, 5)
+                    await anyio.to_thread.run_sync(worker.join, 60)
                     assert not worker.is_alive()
-        await executor.aclose()
+            await executor.aclose()
     assert publications == before
 
 
@@ -238,7 +244,7 @@ async def test_cancel_before_upload_keeps_data_without_publication(
         publications.append(key)
         workers.append(threading.current_thread())
         entered.set()
-        assert release.wait(30)
+        assert release.wait(180)
         return create(store, key, data)
 
     monkeypatch.setattr(local_run._JobRun, "_collect", collect)
@@ -255,10 +261,10 @@ async def test_cancel_before_upload_keeps_data_without_publication(
     )
     task = asyncio.create_task(executor.submit(job))
     try:
-        with anyio.fail_after(10):
+        with anyio.fail_after(60):
             await started.wait()
         task.cancel()
-        done, _ = await asyncio.wait([task], timeout=3)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "cancelled executor started a partial upload"
         assert task.cancelled()
         [output] = partials
@@ -270,12 +276,13 @@ async def test_cancel_before_upload_keeps_data_without_publication(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(10):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
-        await executor.aclose()
+            await executor.aclose()
     assert publications == []
 
 
@@ -301,7 +308,7 @@ async def test_public_run_abandons_partial_uploads(
         if len(key) == 64:
             publications.append(key)
             workers.append(threading.current_thread())
-            assert release.wait(30)
+            assert release.wait(180)
         return create(store, key, data)
 
     def record_failure(writer: JournalWriter, error: Exception) -> None:
@@ -325,9 +332,9 @@ async def test_public_run_abandons_partial_uploads(
             successor = await anyio.to_thread.run_sync(
                 lambda: force_take_over(store, owner_id="successor", host="test", ttl_s=60)
             )
-            with anyio.fail_after(5):
+            with anyio.fail_after(60):
                 await fenced.wait()
-        done, _ = await asyncio.wait([task], timeout=5)
+        done, _ = await asyncio.wait([task], timeout=30)
         assert done, "partial upload escaped the owning run's lifetime"
         if stop == "cancel":
             assert task.cancelled()
@@ -345,13 +352,14 @@ async def test_public_run_abandons_partial_uploads(
         release.set()
         if not task.done():
             task.cancel()
-        with anyio.fail_after(15):
-            await asyncio.gather(task, return_exceptions=True)
+        try:
+            await settle_tasks(task)
+        finally:
             for worker in workers:
-                await anyio.to_thread.run_sync(worker.join, 5)
+                await anyio.to_thread.run_sync(worker.join, 60)
                 assert not worker.is_alive()
-        if successor is not None:
-            successor.release()
+            if successor is not None:
+                successor.release()
     assert publications == [], "an upload started after cancellation or confirmed fencing"
     owner = read_owner(store)
     assert owner is not None

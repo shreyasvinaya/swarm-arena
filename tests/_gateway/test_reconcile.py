@@ -1,0 +1,1359 @@
+"""Reconcile real owned journals using explicit offline gateway capabilities."""
+
+from datetime import timedelta
+from pathlib import Path
+from typing import Any, cast
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+from _fakes.llm_run import open_llm_run
+from _fakes.reconcile import (
+    T0,
+    CapableGateway,
+    committed,
+    config_at,
+    created,
+    key_record,
+    seed_run,
+    spend,
+)
+from _fakes.secrecy import assert_secret_absent
+
+from swarm_arena._errors import ConditionalWritesUnsupported, Fenced, _core_error
+from swarm_arena._exec.executor import Executor, Job
+from swarm_arena._gateway import reconcile
+from swarm_arena._gateway.adapter import GatewayError, ProfileReport
+from swarm_arena._gateway.keys import gateway_call_id
+from swarm_arena._journal.event import EventDraft
+from swarm_arena._journal.lease import OWNER_KEY, Lease, read_owner
+from swarm_arena._model.canonical import canonical_json, utc_now
+from swarm_arena._model.settings import GatewayConfig
+from swarm_arena._store.base import Store
+from swarm_arena._store.local import LocalStore
+
+
+def executor(dead: bool | None = True) -> Executor:
+    return cast(Executor, Mock(spec=Executor, confirm_dead=AsyncMock(return_value=dead)))
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_all_conditions_and_replay(tmp_path: Path, terminal: bool) -> None:
+    adapter = CapableGateway()
+    adapter.terminal_accounting = terminal
+    adapter.rows = [spend("one", 0.01), spend("two", 0.02)]
+    async with open_llm_run(tmp_path) as run:
+        run.journal.append(created(key_record(run.run_id)))
+        await run.journal.commit()
+        first = await reconcile.reconcile_keys(
+            run.events("gateway_key"),
+            run_id=run.run_id,
+            journal=run.journal,
+            adapter=adapter,
+            executor=executor(),
+            gateway=GatewayConfig(url="http://gw"),
+            profile=adapter.profile,
+            now=lambda: T0,
+        )
+        assert first.keys[0].label == "estimated"
+        assert adapter.rows
+        assert not adapter.windows
+        assert not adapter.deleted
+        await run.journal.commit()
+        second = await reconcile.reconcile_keys(
+            run.events("gateway_key"),
+            run_id=run.run_id,
+            journal=run.journal,
+            adapter=adapter,
+            executor=executor(),
+            gateway=GatewayConfig(url="http://gw"),
+            profile=adapter.profile,
+            now=lambda: T0 + timedelta(seconds=610),
+        )
+        await run.journal.commit()
+        key = second.keys[0]
+        assert key.observed_usd == second.spend_usd() == 0.03
+        assert key.label == ("observed" if terminal else "observed (completeness unverified)")
+        assert key.deleted
+        assert key.reasons == []
+        assert adapter.deleted == ["hash-1"]
+        assert len([e for e in run.events("gateway_key") if e.payload["action"] == "closed"]) == 1
+        assert run.state().gateway_reconcile[("c-1", "hash-1")] == key
+        assert {call.litellm_call_id for call in run.calls()} == {
+            gateway_call_id("hash-1", "one"),
+            gateway_call_id("hash-1", "two"),
+        }
+        assert {call.candidate_id for call in run.calls()} == {"c-1"}
+        assert not run.events("settle")
+
+
+@pytest.mark.parametrize(
+    ("setup", "reason"),
+    [
+        ("alive", "tool not confirmed dead"),
+        ("unknown", "tool not confirmed dead"),
+        ("not_closed", "key closure not confirmed by the gateway"),
+        ("too_soon", "request_timeout_s has not passed since closure"),
+        ("no_interval", "gateway batch write interval unknown"),
+        ("no_duration_limit", "gateway maximum request duration not verified"),
+        ("duration_too_long", "gateway maximum request duration not verified"),
+        ("no_profile", "gateway maximum request duration not verified"),
+    ],
+)
+async def test_failed_condition_is_estimated(tmp_path: Path, setup: str, reason: str) -> None:
+    adapter = CapableGateway()
+    profile: ProfileReport | None = adapter.profile
+    dead = None if setup == "unknown" else setup != "alive"
+    clock = T0 + timedelta(seconds=609 if setup == "too_soon" else 610)
+    if setup == "not_closed":
+        adapter.closure = None
+    if setup == "no_profile":
+        profile = None
+    elif setup in {"no_interval", "no_duration_limit", "duration_too_long"}:
+        profile = ProfileReport(
+            verified=False,
+            failures=("unverified",),
+            request_timeout_s=None
+            if setup == "no_duration_limit"
+            else (900 if setup == "duration_too_long" else 300),
+            batch_write_interval_s=None if setup == "no_interval" else 10,
+        )
+    async with open_llm_run(tmp_path) as run:
+        run.journal.append(created(key_record(run.run_id)))
+        started = Job.Started(kind="dispatch", job_id="c-1", task_name="c-1", ray_job_id="old")
+        run.journal.append(
+            EventDraft(
+                type="tool_dispatch",
+                payload={
+                    "candidate_id": "c-1",
+                    "reservation_id": "res-c-1",
+                    "started": started.model_dump(mode="json"),
+                },
+            )
+        )
+        await run.journal.commit()
+        probe = executor(dead)
+        report = await reconcile.reconcile_keys(
+            [*run.events("gateway_key"), *run.events("tool_dispatch")],
+            run_id=run.run_id,
+            journal=run.journal,
+            adapter=adapter,
+            executor=probe,
+            gateway=GatewayConfig(url="http://gw"),
+            profile=profile,
+            now=lambda: clock,
+        )
+        row = report.keys[0]
+        assert row.label == "estimated"
+        assert row.observed_usd is None
+        assert not row.deleted
+        assert reason in row.reasons
+        assert report.spend_usd() == 1
+        assert adapter.deleted == []
+        assert adapter.windows == []
+        if setup in {"alive", "unknown"}:
+            cast(Any, probe.confirm_dead).assert_awaited_once_with(started)
+        else:
+            cast(Any, probe.confirm_dead).assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "costs", [[0.1, 0.2], [600_000_000.0, 600_000_000.0], [0.0000005, 0.0000015]]
+)
+async def test_exact_deduplicated_totals_survive_deleted_key_retention(
+    tmp_path: Path, costs: list[float]
+) -> None:
+    from swarm_arena._budget.amount import _micro_units
+
+    config = config_at(tmp_path)
+    await seed_run(config)
+    adapter = CapableGateway()
+    adapter.rows = [spend(str(i), cost) for i, cost in enumerate(costs)]
+    adapter.rows += adapter.rows[:1]
+    expected = sum(_micro_units(cost) for cost in costs) / 1_000_000
+    first = await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+    assert first.spend_usd() == expected
+    assert first.keys[0].deleted
+    before = committed(config)
+    adapter.rows = [spend("late", 0.02)]
+    second = await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+    assert second == first
+    adapter.rows = []
+    third = await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+    assert third == second
+    assert adapter.deleted == ["hash-1"]
+    calls = [e for e in committed(config) if e.type == "llm_call"]
+    assert len(calls) == len(costs)
+    assert len([e for e in before if e.type == "llm_call"]) == len(costs)
+    assert not [e for e in committed(config) if e.type == "settle"]
+    assert all("-e2-" in event.payload["call"]["id"] for event in calls)
+    assert len(adapter.windows) == 1
+
+
+async def test_conflicting_observation_stays_estimated(tmp_path: Path) -> None:
+    config = config_at(tmp_path)
+    await seed_run(config)
+    adapter = CapableGateway()
+    adapter.rows = [spend("one", 0.1), spend("one", 0.2)]
+    report = await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+    assert report.keys[0].label == "estimated"
+    assert not adapter.deleted
+    assert not [e for e in committed(config) if e.type == "llm_call"]
+    assert "conflicting gateway observations" in report.keys[0].reasons
+
+
+async def test_reconcile_run_fails_with_live_owner_writes_nothing(tmp_path: Path) -> None:
+    config = config_at(tmp_path)
+    store = LocalStore(Path(config.run_root) / "r-reconcile")
+    lease = Lease.acquire_new(store, owner_id="live", host="h", ttl_s=60)
+    before = store.read(OWNER_KEY)
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match=r"^run r-reconcile has a live owner; retry after its lease expires$",
+        ):
+            await reconcile.reconcile_run(config, "r-reconcile", CapableGateway(), executor())
+        assert store.read(OWNER_KEY) == before
+        assert store.list("journal/") == []
+    finally:
+        lease.release()
+
+
+async def test_reconcile_checks_storage_before_takeover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = config_at(tmp_path)
+    await seed_run(config)
+    store = LocalStore(Path(config.run_root) / "r-reconcile")
+    before = store.read(OWNER_KEY)
+
+    def refuse(config: Any) -> None:
+        raise ConditionalWritesUnsupported("conditional writes not honoured")
+
+    monkeypatch.setattr(reconcile, "check_storage", refuse)
+    with pytest.raises(ConditionalWritesUnsupported):
+        await reconcile.reconcile_run(config, "r-reconcile", CapableGateway(), executor())
+    assert store.read(OWNER_KEY) == before
+    assert not [e for e in committed(config) if e.type in {"takeover", "reconcile"}]
+
+
+async def test_reconcile_run_without_head_reports_no_keys(tmp_path: Path) -> None:
+    from swarm_arena._engine.resume import resume_run
+
+    config = config_at(tmp_path)
+    store = LocalStore(Path(config.run_root) / "r-reconcile")
+    lease = Lease.acquire_new(store, owner_id="old", host="h", ttl_s=60)
+    lease.release()
+    report = await reconcile.reconcile_run(config, "r-reconcile", CapableGateway(), executor())
+    assert report.run_id == "r-reconcile"
+    assert report.keys == []
+    owner = read_owner(store)
+    assert owner is not None
+    assert owner[0].epoch == 2
+    assert owner[0].expires_at < utc_now()
+    assert owner[0].head is None
+    assert store.list("journal/") == []
+    before = store.read(OWNER_KEY)
+    with pytest.raises(ValueError, match="has no committed events"):
+        await resume_run(config, "r-reconcile", force=False, replanner=None)
+    assert store.read(OWNER_KEY) == before
+
+
+@pytest.mark.parametrize("race", ["renew", "other_fenced", "other_first"])
+async def test_takeover_races_preserve_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, race: str
+) -> None:
+    config = config_at(tmp_path)
+    await seed_run(config)
+    store = LocalStore(Path(config.run_root) / "r-reconcile")
+    before = store.list("journal/")
+    real = Lease.take_over.__func__
+    calls: list[int] = []
+
+    def racing(cls: type[Lease], store: Store, **kw: Any) -> Lease:
+        calls.append(1)
+        if len(calls) == 1:
+            if race == "renew":
+                doc, etag = cast(Any, read_owner(store))
+                store.replace(
+                    OWNER_KEY,
+                    canonical_json(
+                        doc.model_copy(update={"version": doc.version + 1}).model_dump(mode="json")
+                    ),
+                    if_match=etag,
+                )
+            else:
+                other: dict[str, Any] = {**kw, "owner_id": "other"}
+                real(cls, store, **other)
+            if race != "other_first":
+                raise _core_error(Fenced, "another owner changed the lease")
+        return real(cls, store, **kw)
+
+    monkeypatch.setattr(Lease, "take_over", classmethod(racing))
+    if race == "renew":
+        await reconcile.reconcile_run(config, "r-reconcile", CapableGateway(), executor())
+        assert len(calls) == 2
+    else:
+        with pytest.raises(Fenced, match="another owner took the run"):
+            await reconcile.reconcile_run(config, "r-reconcile", CapableGateway(), executor())
+        assert store.list("journal/") == before
+    owner = read_owner(store)
+    assert owner is not None
+    assert owner[0].epoch == 2
+    if race != "renew":
+        assert owner[0].owner_id == "other"
+
+
+async def test_gateway_failure_is_value_free(tmp_path: Path) -> None:
+    config = config_at(tmp_path)
+    await seed_run(config)
+    adapter = CapableGateway()
+    adapter.errors["read"] = GatewayError("SECRET")
+    report = await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+    assert report.keys[0].label == "estimated"
+    assert not report.keys[0].deleted
+    assert "SECRET" not in repr(committed(config))
+    assert "SECRET" not in report.model_dump_json()
+
+
+async def test_missing_owner_has_safe_cli_diagnostic(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError) as caught:
+        await reconcile.take_run(
+            config_at(tmp_path), "r-reconcile", owner_id="reconciler", force=False
+        )
+    assert "has no control/owner.json" in str(caught.value)
+    assert_secret_absent(caught.value, str(tmp_path))
+
+
+async def test_pinned_proxy_profile_keeps_full_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.gateway import FakeGateway
+
+    from swarm_arena._gateway.litellm_proxy import LiteLLMProxy
+
+    wire = FakeGateway()
+    proxy = LiteLLMProxy(url="http://gateway.invalid", master_key="secret", request_timeout_s=600)
+
+    def request(operation: Any, method: str, path: str, **kwargs: Any) -> Any:
+        status, body, _ = wire._route(
+            method, path, kwargs.get("body") or {}, f"Bearer {wire.master_key}"
+        )
+        assert status == 200
+        return body
+
+    monkeypatch.setattr(proxy, "_request", request)
+    adapter = CapableGateway()
+    adapter.profile = await proxy.preflight()
+    assert adapter.profile.verified is False
+    assert adapter.profile.request_timeout_s is None
+    config = config_at(tmp_path)
+    await seed_run(config)
+    report = await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+    assert report.keys[0].label == "estimated"
+    assert report.spend_usd() == 1
+    assert not adapter.deleted
+    assert not adapter.windows
+
+
+@pytest.mark.parametrize("site", ["preflight", "read"])
+async def test_cancelled_reconcile_releases_and_unbinds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    import anyio
+
+    from swarm_arena._journal import llm_record
+
+    config = config_at(tmp_path)
+    await seed_run(config)
+    adapter = CapableGateway()
+    entered = anyio.Event()
+
+    async def held(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await anyio.sleep_forever()
+
+    monkeypatch.setattr(adapter, "preflight" if site == "preflight" else "spend_rows", held)
+    with anyio.fail_after(60):
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(reconcile.reconcile_run, config, "r-reconcile", adapter, executor())
+            await entered.wait()
+            tasks.cancel_scope.cancel()
+    owner = read_owner(LocalStore(Path(config.run_root) / "r-reconcile"))
+    assert owner is not None
+    assert owner[0].expires_at < utc_now()
+    assert "r-reconcile" not in llm_record._bindings
+    assert not adapter.deleted
+
+
+async def test_writer_entry_failure_releases_takeover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from swarm_arena._journal.writer import JournalWriter
+
+    config = config_at(tmp_path)
+    await seed_run(config)
+
+    async def failed(self: JournalWriter) -> JournalWriter:
+        raise _core_error(RuntimeError, "writer unavailable")
+
+    monkeypatch.setattr(JournalWriter, "__aenter__", failed)
+    with pytest.raises(RuntimeError, match="writer unavailable"):
+        await reconcile.reconcile_run(config, "r-reconcile", CapableGateway(), executor())
+    owner = read_owner(LocalStore(Path(config.run_root) / "r-reconcile"))
+    assert owner is not None
+    assert owner[0].expires_at < utc_now()
+
+
+@pytest.mark.parametrize("kind", ["foreign", "terminal_group", "hard_group", "cancel"])
+async def test_external_boundary_preserves_controls(kind: str) -> None:
+    import asyncio
+
+    import anyio
+
+    from swarm_arena._errors import _core_category, _SignalCategory, _stop_cleanup_error
+
+    error: BaseException
+    if kind == "foreign":
+        error = ValueError("PRIVATE")
+    elif kind == "terminal_group":
+        error = BaseExceptionGroup("PRIVATE", [asyncio.CancelledError(), _stop_cleanup_error()])
+    elif kind == "hard_group":
+        error = BaseExceptionGroup("PRIVATE", [GeneratorExit(), ValueError("PRIVATE")])
+    else:
+        error = asyncio.CancelledError()
+
+    async def fail() -> None:
+        raise error
+
+    expected = {
+        "foreign": GatewayError,
+        "terminal_group": RuntimeError,
+        "hard_group": BaseExceptionGroup,
+        "cancel": GatewayError,
+    }[kind]
+    with pytest.raises(expected) as caught:
+        await reconcile._external(fail, anyio.current_time() + 1)
+    if kind in {"foreign", "cancel"}:
+        assert_secret_absent(caught.value, "PRIVATE")
+    elif kind == "terminal_group":
+        assert _core_category(caught.value) is _SignalCategory.TERMINAL
+    else:
+        assert caught.value is error
+
+
+@pytest.mark.parametrize("stop", [True, False])
+async def test_reconcile_external_wait_obeys_stop_and_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop: bool
+) -> None:
+    import anyio
+
+    from swarm_arena._journal import llm_record
+
+    config = config_at(tmp_path)
+    await seed_run(config)
+    original = reconcile.take_run
+    authority: dict[str, Any] = {}
+
+    async def capture(*args: Any, **kwargs: Any) -> Any:
+        result = await original(*args, **kwargs)
+        authority["writer"] = result[2]
+        authority["stops"] = kwargs["_stops"]
+        return result
+
+    async def held(*args: Any, **kwargs: Any) -> Any:
+        if stop:
+            authority["stops"].stop_now = True
+        else:
+            authority["writer"]._fail(_core_error(Fenced, "owner lost"))
+        await anyio.sleep_forever()
+
+    adapter = CapableGateway()
+    monkeypatch.setattr(reconcile, "take_run", capture)
+    monkeypatch.setattr(adapter, "spend_rows", held)
+    with anyio.fail_after(60), pytest.raises(RuntimeError if stop else Fenced):
+        await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+    assert "r-reconcile" not in llm_record._bindings
+    assert not adapter.deleted
+    assert not [e for e in committed(config) if e.type == "reconcile"]
+
+
+async def test_same_upstream_id_on_distinct_keys_has_distinct_totals(tmp_path: Path) -> None:
+    adapter = CapableGateway()
+    adapter.rows = [spend("same", 0.1), spend("same", 0.2, key_id="hash-2")]
+    async with open_llm_run(tmp_path) as run:
+        run.journal.append(created(key_record(run.run_id)))
+        run.journal.append(created(key_record(run.run_id, key_id="hash-2", candidate_id="c-2")))
+        await run.journal.commit()
+        report = await reconcile.reconcile_keys(
+            run.events("gateway_key"),
+            run_id=run.run_id,
+            journal=run.journal,
+            adapter=adapter,
+            executor=executor(),
+            gateway=GatewayConfig(url="http://gw"),
+            profile=adapter.profile,
+            now=lambda: T0 + timedelta(seconds=610),
+        )
+        assert report.spend_usd() == 0.3
+        assert [row.observed_usd for row in report.keys] == [0.1, 0.2]
+        await run.journal.commit()
+        assert len(run.calls()) == 2
+        assert len({call.litellm_call_id for call in run.calls()}) == 2
+
+
+@pytest.mark.parametrize("operation", ["block", "closed_at", "read", "delete"])
+async def test_reconcile_failures_use_shared_payload(tmp_path: Path, operation: str) -> None:
+    from swarm_arena._gateway.reports import GatewayKeyFailure
+
+    config = config_at(tmp_path)
+    await seed_run(config)
+    adapter = CapableGateway()
+    adapter.errors[operation] = GatewayError("PRIVATE")
+    await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+    failures = [
+        event
+        for event in committed(config)
+        if event.type == "gateway_key"
+        and event.payload["action"] in {"read_failed", "close_failed"}
+    ]
+    assert len(failures) == 1
+    row = GatewayKeyFailure.model_validate(failures[0].payload)
+    assert (row.key_id, row.candidate_id) == ("hash-1", "c-1")
+    assert "PRIVATE" not in repr(failures)
+
+
+@pytest.mark.parametrize("missing", [False, True])
+async def test_reconcile_refuses_gateway_change_before_takeover(
+    tmp_path: Path, missing: bool
+) -> None:
+    from swarm_arena._errors import ConfigError
+
+    config = config_at(tmp_path)
+    await seed_run(config)
+    store = LocalStore(Path(config.run_root) / "r-reconcile")
+    before = store.read(OWNER_KEY).data
+    changed = config.model_copy(
+        update={
+            "llm_gateway": None
+            if missing
+            else GatewayConfig(url="http://user:PRIVATE@different.invalid", require_hard_cap=False)
+        }
+    )
+    adapter = CapableGateway()
+    adapter.preflight = AsyncMock(return_value=adapter.profile)
+    with pytest.raises(ConfigError, match=r"^llm_gateway$") as caught:
+        await reconcile.reconcile_run(changed, "r-reconcile", adapter, executor())
+    assert_secret_absent(caught.value, "PRIVATE")
+    assert store.read(OWNER_KEY).data == before
+    adapter.preflight.assert_not_awaited()
+    assert not adapter.blocked
+
+
+async def test_reconcile_gateway_identity_ignores_userinfo(tmp_path: Path) -> None:
+    config = config_at(tmp_path)
+    await seed_run(config)
+    changed = config.model_copy(
+        update={
+            "llm_gateway": GatewayConfig(
+                url="http://user:PRIVATE@gateway.invalid", require_hard_cap=False
+            )
+        }
+    )
+    report = await reconcile.reconcile_run(changed, "r-reconcile", CapableGateway(), executor())
+    assert report.keys[0].label == "observed (completeness unverified)"
+
+
+async def test_reconcile_rechecks_gateway_binding_after_acquisition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from _fakes.journals import FakeRun
+
+    from swarm_arena._errors import ConfigError
+
+    config = config_at(tmp_path)
+    run = FakeRun(config.run_root, "r-reconcile")
+    run.commit(
+        EventDraft(type="run_config", payload={"config": config.model_dump()}),
+        created(key_record("r-reconcile")),
+    )
+    run._lease.release()
+    original = Lease.take_over.__func__
+
+    def race(cls: type[Lease], store: Store, **kwargs: Any) -> Lease:
+        changed = config.model_copy(update={"llm_gateway": GatewayConfig(url="http://different")})
+        run.commit(EventDraft(type="run_config", payload={"config": changed.model_dump()}))
+        run._lease.release()
+        return original(cls, store, **kwargs)
+
+    monkeypatch.setattr(Lease, "take_over", classmethod(race))
+    adapter = CapableGateway()
+    adapter.preflight = AsyncMock(return_value=adapter.profile)
+    with pytest.raises(ConfigError, match=r"^llm_gateway$"):
+        await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+    adapter.preflight.assert_not_awaited()
+    owner = read_owner(run.store)
+    assert owner is not None
+    assert owner[0].epoch == 2
+    assert owner[0].expires_at < utc_now()
+    assert not [event for event in committed(config) if event.type == "takeover"]
+
+
+@pytest.mark.parametrize("bound", ["caller", "closing", "io", "settlement"])
+async def test_reconcile_external_allowance_respects_owner_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bound: str
+) -> None:
+    import math
+
+    import anyio
+
+    adapter = CapableGateway()
+    deadlines: list[float] = []
+    original = reconcile._external
+
+    async def capture(operation: Any, deadline: float) -> Any:
+        deadlines.append(deadline)
+        return await original(operation, deadline)
+
+    monkeypatch.setattr(reconcile, "_external", capture)
+    async with open_llm_run(tmp_path) as run:
+        run.journal.append(created(key_record(run.run_id)))
+        await run.journal.commit()
+        limit = anyio.current_time() + 30
+        io_scope = anyio.CancelScope(deadline=limit)
+        if bound == "closing":
+            monkeypatch.setattr(run.journal, "_closing_at", limit)
+        elif bound == "io":
+            monkeypatch.setattr(run.journal, "_io_scope", io_scope)
+        elif bound == "settlement":
+            monkeypatch.setattr(run.journal, "_settle_timeout_s", 1)
+        try:
+            with anyio.CancelScope(deadline=limit if bound == "caller" else math.inf):
+                await reconcile.reconcile_keys(
+                    run.events("gateway_key"),
+                    run_id=run.run_id,
+                    journal=run.journal,
+                    adapter=adapter,
+                    executor=executor(),
+                    gateway=GatewayConfig(url="http://gw"),
+                    profile=adapter.profile,
+                    now=lambda: T0 + timedelta(seconds=610),
+                )
+            assert deadlines
+            assert max(deadlines) < (anyio.current_time() + 1 if bound == "settlement" else limit)
+        finally:
+            if bound == "io":
+                monkeypatch.setattr(run.journal, "_io_scope", None)
+            if bound == "closing":
+                monkeypatch.setattr(run.journal, "_closing_at", math.inf)
+
+
+async def test_reconcile_preflight_uses_maintenance_read_allowance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import anyio
+
+    config = config_at(tmp_path).model_copy(update={"settle_timeout_s": 0.2})
+    await seed_run(config)
+    adapter = CapableGateway()
+    entered = anyio.Event()
+
+    async def held() -> ProfileReport:
+        entered.set()
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(adapter, "preflight", held)
+    with anyio.fail_after(60):
+        report = await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+    assert entered.is_set()
+    assert report.keys[0].label == "estimated"
+    owner = read_owner(LocalStore(Path(config.run_root) / "r-reconcile"))
+    assert owner is not None
+    assert owner[0].expires_at < utc_now()
+
+
+async def test_reconcile_binding_check_includes_failure_only_history(tmp_path: Path) -> None:
+    from _fakes.journals import FakeRun
+
+    from swarm_arena._errors import ConfigError
+    from swarm_arena._gateway.reports import GatewayKeyFailure
+
+    config = config_at(tmp_path)
+    run = FakeRun(config.run_root, "r-reconcile")
+    run.commit(
+        EventDraft(type="run_config", payload={"config": config.model_dump()}),
+        EventDraft(
+            type="gateway_key",
+            payload=GatewayKeyFailure(
+                action="read_failed",
+                key_id="hash-1",
+                candidate_id="c-1",
+                error="gateway read incomplete",
+            ).model_dump(),
+        ),
+    )
+    run._lease.release()
+    changed = config.model_copy(update={"llm_gateway": GatewayConfig(url="http://different")})
+    before = run.store.read(OWNER_KEY).data
+    with pytest.raises(ConfigError, match=r"^llm_gateway$"):
+        await reconcile.reconcile_run(changed, "r-reconcile", CapableGateway(), executor())
+    assert run.store.read(OWNER_KEY).data == before
+
+
+async def test_reconcile_binding_check_does_not_apply_paid_budget_policy(tmp_path: Path) -> None:
+    config = config_at(tmp_path)
+    await seed_run(config)
+    changed = config.model_copy(update={"limits": config.limits.model_copy(update={"max_usd": 0})})
+    report = await reconcile.reconcile_run(changed, "r-reconcile", CapableGateway(), executor())
+    assert report.keys[0].label == "observed (completeness unverified)"
+
+
+async def test_reconcile_http_expiry_does_not_cancel_durable_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import anyio
+
+    adapter = CapableGateway()
+    adapter.rows = [spend("one", 0.03)]
+    original = reconcile._record_row
+    external = reconcile._external
+    deadlines: list[float] = []
+    offset = 0.0
+    entered, release = anyio.Event(), anyio.Event()
+
+    class ExternalClock:
+        def current_time(self) -> float:
+            return anyio.current_time() + offset
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(anyio, name)
+
+    async def capture(operation: Any, deadline: float) -> Any:
+        deadlines.append(deadline)
+        return await external(operation, deadline)
+
+    async def held_record(*args: Any, **kwargs: Any) -> Any:
+        assert deadlines
+        assert anyio.current_effective_deadline() > max(deadlines)
+        entered.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    async def expire_http() -> None:
+        nonlocal offset
+        await entered.wait()
+        offset = 3600
+        release.set()
+
+    monkeypatch.setattr(reconcile, "_record_row", held_record)
+    monkeypatch.setattr(reconcile, "_external", capture)
+    monkeypatch.setattr(reconcile, "anyio", ExternalClock())
+    async with open_llm_run(tmp_path) as run:
+        # Only the event-controlled clock advance is a behavior deadline. Setup
+        # and storage keep the outer safety guard, even on a heavily loaded host.
+        monkeypatch.setattr(run.journal, "_settle_timeout_s", 120)
+        run.journal.append(created(key_record(run.run_id)))
+        await run.journal.commit()
+        with anyio.fail_after(60):
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(expire_http)
+                report = await reconcile.reconcile_keys(
+                    run.events("gateway_key"),
+                    run_id=run.run_id,
+                    journal=run.journal,
+                    adapter=adapter,
+                    executor=executor(),
+                    gateway=GatewayConfig(url="http://gw"),
+                    profile=adapter.profile,
+                    now=lambda: T0 + timedelta(seconds=610),
+                )
+        assert report.keys[0].observed_usd == 0.03
+        assert not report.keys[0].deleted
+        assert report.keys[0].reasons == ["reconcile time allowance exhausted"]
+        await run.journal.commit()
+        assert len(run.calls()) == 1
+        assert run.calls()[0].cost_usd == 0.03
+        assert not run.events("settle")
+
+
+@pytest.mark.parametrize("takeover", [False, True])
+async def test_delete_requires_durable_observations_and_closure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, takeover: bool
+) -> None:
+    from _fakes.leases import force_take_over
+
+    from swarm_arena._gateway.adapter import VirtualKey
+    from swarm_arena._journal.writer import JournalWriter
+
+    config = config_at(tmp_path)
+    await seed_run(config)
+    adapter = CapableGateway()
+    adapter.rows = [spend("one", 0.03)]
+    real_delete = adapter.delete_key
+    successors: list[Lease] = []
+    durable: list[tuple[float, bool]] = []
+
+    async def delete(key: VirtualKey) -> None:
+        events = committed(config)
+        durable.append(
+            (
+                sum(e.payload["call"]["cost_usd"] for e in events if e.type == "llm_call"),
+                any(e.type == "gateway_key" and e.payload["action"] == "closed" for e in events),
+            )
+        )
+        await real_delete(key)
+        if takeover:
+            successors.append(
+                force_take_over(
+                    LocalStore(Path(config.run_root) / "r-reconcile"),
+                    owner_id="successor",
+                    host="h",
+                    ttl_s=60,
+                )
+            )
+
+    def writer(*args: Any, **kwargs: Any) -> JournalWriter:
+        return JournalWriter(*args, **kwargs, group_window_s=30)
+
+    monkeypatch.setattr(reconcile, "JournalWriter", writer)
+    monkeypatch.setattr(adapter, "delete_key", delete)
+    try:
+        if takeover:
+            with pytest.raises(Fenced):
+                await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+        else:
+            report = await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+            assert report.keys[0].deleted
+    finally:
+        for lease in successors:
+            lease.release()
+    if takeover:
+        adapter.rows = []
+        monkeypatch.setattr(adapter, "delete_key", real_delete)
+        later = await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+        assert later.keys[0].observed_usd == 0.03
+    assert durable == [(0.03, True)]
+
+
+@pytest.mark.parametrize("case", ["ok", "error", "occupied"])
+async def test_tool_gateway_ids_cannot_change_or_suppress_gateway_spend(
+    tmp_path: Path, case: str
+) -> None:
+    import json
+
+    from swarm_arena._tooling.llm_calls import parse_llm_calls, record_reported
+
+    adapter = CapableGateway()
+    adapter.rows = [spend("one", 0.03)]
+    identity = gateway_call_id("hash-1", "one") if case == "occupied" else "gw:" + "0" * 64
+    data = json.dumps(
+        {
+            "model": "openai/gpt-6",
+            "cost_usd": 5.0,
+            "status": "error" if case == "error" else "ok",
+            "litellm_call_id": identity,
+        }
+    ).encode()
+    async with open_llm_run(tmp_path) as run:
+        run.journal.append(created(key_record(run.run_id)))
+        rows, warnings = parse_llm_calls(data)
+        reported = await record_reported(
+            list(rows),
+            metadata={
+                "run_id": run.run_id,
+                "goal_id": "g",
+                "candidate_id": "c-1",
+                "owner_epoch": str(run.journal.epoch),
+            },
+        )
+        await run.journal.commit()
+        for instant in (T0, T0 + timedelta(seconds=610)):
+            await reconcile.reconcile_keys(
+                [*run.events("gateway_key"), *run.events("llm_call")],
+                run_id=run.run_id,
+                journal=run.journal,
+                adapter=adapter,
+                executor=executor(),
+                gateway=GatewayConfig(url="http://gw"),
+                profile=adapter.profile,
+                now=lambda instant=instant: instant,
+            )
+            await run.journal.commit()
+        row = run.state().gateway_reconcile[("c-1", "hash-1")]
+        assert row.observed_usd == 0.03
+        assert row.label == "observed (completeness unverified)"
+        assert row.deleted
+        assert len(run.calls()) == 1
+        assert reported == []
+        assert warnings == ["swarm/llm_calls.jsonl line 1: invalid row; line skipped"]
+
+
+@pytest.mark.parametrize("per_key", [False, True])
+async def test_slow_keys_converge_without_revisiting_deleted_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, per_key: bool
+) -> None:
+    from collections.abc import Awaitable, Callable
+
+    from _fakes.journals import FakeRun
+
+    config = config_at(tmp_path).model_copy(
+        update={
+            "settle_timeout_s": 10 if per_key else 1,
+            "llm_gateway": GatewayConfig(
+                url="http://gateway.invalid",
+                request_timeout_s=0.6 if per_key else 600,
+                require_hard_cap=False,
+            ),
+        }
+    )
+    run = FakeRun(config.run_root, "r-reconcile")
+    records = [key_record(run.run_id, key_id=f"hash-{n}", candidate_id=f"c-{n}") for n in range(14)]
+    run.commit(
+        EventDraft(type="run_config", payload={"config": config.model_dump()}),
+        *(created(record) for record in records),
+    )
+    run._lease.release()
+    clock = 0.0
+
+    def deadline(journal: Any, *, timeout_s: float | None = None) -> float:
+        return clock + min(journal._settle_timeout_s, timeout_s or float("inf"))
+
+    async def slow(operation: Callable[[], Awaitable[Any]], deadline: float) -> Any:
+        nonlocal clock
+        if clock + 0.1 > deadline:
+            clock = deadline
+            # Model a completed allowance without spending wall-clock time.
+            error = getattr(reconcile, "_AllowanceExpired", GatewayError)
+            raise error("reconcile time allowance exhausted")
+        clock += 0.1
+        return await operation()
+
+    monkeypatch.setattr(reconcile, "_gateway_deadline", deadline)
+    monkeypatch.setattr(reconcile, "_external", slow)
+    adapter = CapableGateway()
+    if per_key:
+        adapter.profile = adapter.profile.model_copy(
+            update={"request_timeout_s": 0.6, "batch_write_interval_s": 0}
+        )
+    for _ in range(1 if per_key else 12):
+        report = await reconcile.reconcile_run(config, run.run_id, adapter, executor())
+        if all(key.deleted for key in report.keys):
+            break
+    assert len(report.keys) == 14
+    assert all(
+        key.deleted and key.label == "observed (completeness unverified)" for key in report.keys
+    )
+    assert len(adapter.deleted) == 14
+    before = list(adapter.windows)
+    assert await reconcile.reconcile_run(config, run.run_id, adapter, executor()) == report
+    assert adapter.windows == before
+
+
+async def test_expired_allowance_does_not_blame_or_call_gateway(tmp_path: Path) -> None:
+    adapter = CapableGateway()
+    async with open_llm_run(tmp_path) as run:
+        run.journal.append(created(key_record(run.run_id)))
+        await run.journal.commit()
+        report = await reconcile.reconcile_keys(
+            run.events("gateway_key"),
+            run_id=run.run_id,
+            journal=run.journal,
+            adapter=adapter,
+            executor=executor(),
+            gateway=GatewayConfig(url="http://gw"),
+            profile=adapter.profile,
+            _deadline=float("-inf"),
+        )
+        await run.journal.commit()
+        assert report.keys[0].reasons == ["reconcile time allowance exhausted"]
+        assert not adapter.blocked
+        assert not adapter.windows
+        assert not adapter.deleted
+        assert not [e for e in run.events("gateway_key") if e.payload["action"].endswith("failed")]
+
+
+@pytest.mark.parametrize("aggregate", [False, True])
+async def test_unrepresentable_spend_commits_an_estimated_report(
+    tmp_path: Path, aggregate: bool
+) -> None:
+    from _fakes.journals import FakeRun
+
+    config = config_at(tmp_path)
+    run = FakeRun(config.run_root, "r-reconcile")
+    records = [
+        key_record(run.run_id, key_id=f"hash-{n}", candidate_id=f"c-{n}")
+        for n in range(11 if aggregate else 1)
+    ]
+    run.commit(
+        EventDraft(type="run_config", payload={"config": config.model_dump()}),
+        *(created(record) for record in records),
+    )
+    run._lease.release()
+    adapter = CapableGateway()
+    costs = [1_000_000_000.0] * 10 + [0.000001]
+    adapter.rows = [
+        spend(str(n), cost, key_id=records[n if aggregate else 0].key_id)
+        for n, cost in enumerate(costs)
+    ]
+    for _ in range(2):
+        report = await reconcile.reconcile_run(config, run.run_id, adapter, executor())
+        assert report.spend_usd() == (11 if aggregate else 1)
+        assert report.total_label == "estimated"
+        if aggregate:
+            assert report.total_reasons == ["unsupported gateway observation"]
+            assert [key.observed_usd for key in report.keys] == costs
+            assert all(key.deleted for key in report.keys)
+        else:
+            assert report.keys[0].observed_usd is None
+            assert report.keys[0].reasons == ["unsupported gateway observation"]
+            assert not adapter.deleted
+        snapshots = [event for event in committed(config) if event.type == "reconcile"]
+        assert snapshots[-1].payload == report.model_dump(mode="json")
+        assert not [event for event in committed(config) if event.type == "settle"]
+    assert len(snapshots) == 2
+
+
+@pytest.mark.parametrize("identity", ["foreign_run", "foreign_alias", "missing", "matching"])
+@pytest.mark.parametrize("closed", [False, True])
+async def test_reconcile_checks_authoritative_key_identity_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, identity: str, closed: bool
+) -> None:
+    from _fakes.gateway import FakeGateway, OfflineGatewayOpener
+    from _fakes.journals import FakeRun
+
+    from swarm_arena._gateway import litellm_proxy
+
+    config = config_at(tmp_path)
+    wire = FakeGateway()
+    proxy = litellm_proxy.LiteLLMProxy(
+        url="http://gateway.invalid", master_key=wire.master_key, request_timeout_s=600
+    )
+    monkeypatch.setattr(litellm_proxy, "build_opener", lambda *args: OfflineGatewayOpener(wire))
+    key, _ = await proxy.create_key(
+        alias="PRIVATE" if identity == "foreign_alias" else "cand-c-1",
+        max_budget_usd=1,
+        duration_s=86400,
+        metadata={}
+        if identity == "missing"
+        else {"run_id": "PRIVATE" if identity == "foreign_run" else "forged-run"},
+        default_estimated_output_tokens=4096,
+    )
+    run = FakeRun(config.run_root, "forged-run")
+    run.commit(
+        EventDraft(type="run_config", payload={"config": config.model_dump()}),
+        created(key_record(run.run_id, key_id=key.key_id)),
+        *(
+            [
+                EventDraft(
+                    type="gateway_key",
+                    payload={"action": "closed", "key_id": key.key_id, "closed_at": T0.isoformat()},
+                )
+            ]
+            if closed
+            else []
+        ),
+    )
+    run._lease.release()
+    monkeypatch.setattr(proxy, "preflight", AsyncMock(return_value=CapableGateway().profile))
+    wire.requests.clear()
+    report = await reconcile.reconcile_run(config, run.run_id, proxy, executor())
+    mutations = [path for method, path, _ in wire.requests if method == "POST"]
+    if identity == "matching":
+        assert mutations == (["/key/delete"] if closed else ["/key/block"])
+        assert report.keys[0].deleted is closed
+    else:
+        assert mutations == []
+        assert report.keys[0].label == "estimated"
+        assert report.keys[0].observed_usd is None
+        assert not report.keys[0].deleted
+        assert report.keys[0].reasons == [
+            "gateway key identity unavailable"
+            if identity == "missing"
+            else "gateway key identity mismatch"
+        ]
+        assert not wire.keys[key.key_id]["blocked"]
+        assert not wire.keys[key.key_id]["deleted"]
+    assert "PRIVATE" not in report.model_dump_json()
+    assert "PRIVATE" not in repr(committed(config, run.run_id))
+
+
+async def test_reconcile_refuses_history_from_another_address_before_takeover(
+    tmp_path: Path,
+) -> None:
+    from _fakes.journals import FakeRun
+
+    from swarm_arena._errors import ConfigError
+
+    config = config_at(tmp_path)
+    run = FakeRun(config.run_root, "different-run")
+    run.commit(
+        EventDraft(type="run_config", payload={"config": config.model_dump()}),
+        created(key_record(run.run_id)),
+    )
+    run._lease.release()
+    (Path(config.run_root) / run.run_id).rename(Path(config.run_root) / "r-reconcile")
+    store = LocalStore(Path(config.run_root) / "r-reconcile")
+    before = store.read(OWNER_KEY)
+    adapter = CapableGateway()
+    adapter.preflight = AsyncMock(return_value=adapter.profile)
+    with pytest.raises(ConfigError, match=r"^run_id$"):
+        await reconcile.reconcile_run(config, "r-reconcile", adapter, executor())
+    assert store.read(OWNER_KEY) == before
+    adapter.preflight.assert_not_awaited()
+    assert not adapter.blocked
+
+
+async def test_reconcile_requires_writer_identity_even_with_live_manager(tmp_path: Path) -> None:
+    from swarm_arena._errors import ConfigError
+    from swarm_arena._gateway.keys import KeyManager
+
+    adapter = CapableGateway()
+    gateway = GatewayConfig(url="http://gw")
+    async with open_llm_run(tmp_path) as run:
+        run.journal.append(created(key_record(run.run_id)))
+        await run.journal.commit()
+        manager = KeyManager(
+            adapter, gateway, cap="soft", journal=run.journal, settle_timeout_s=0, run_id=run.run_id
+        )
+        with pytest.raises(ConfigError, match=r"^run_id$"):
+            await reconcile.reconcile_keys(
+                run.events("gateway_key"),
+                run_id="different-run",
+                journal=run.journal,
+                adapter=adapter,
+                executor=executor(),
+                gateway=gateway,
+                profile=adapter.profile,
+                _manager=manager,
+            )
+        assert not adapter.blocked
+
+
+async def test_unclosed_tail_keys_progress_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Awaitable, Callable
+
+    from _fakes.journals import FakeRun
+
+    config = config_at(tmp_path).model_copy(update={"settle_timeout_s": 1})
+    run = FakeRun(config.run_root, "r-reconcile")
+    records = [key_record(run.run_id, key_id=f"hash-{n}", candidate_id=f"c-{n}") for n in range(14)]
+    run.commit(
+        EventDraft(type="run_config", payload={"config": config.model_dump()}),
+        *(created(record) for record in records),
+    )
+    run._lease.release()
+    clock = 0.0
+
+    def deadline(journal: Any, *, timeout_s: float | None = None) -> float:
+        return clock + min(journal._settle_timeout_s, timeout_s or float("inf"))
+
+    async def slow(operation: Callable[[], Awaitable[Any]], deadline: float) -> Any:
+        nonlocal clock
+        if clock + 0.1 > deadline:
+            clock = deadline
+            raise reconcile._AllowanceExpired("reconcile time allowance exhausted")
+        clock += 0.1
+        return await operation()
+
+    monkeypatch.setattr(reconcile, "_gateway_deadline", deadline)
+    monkeypatch.setattr(reconcile, "_external", slow)
+    adapter = CapableGateway()
+    adapter.errors["preflight"] = GatewayError("profile unverified")
+    identity = AsyncMock(wraps=adapter.key_matches)
+    monkeypatch.setattr(adapter, "key_matches", identity)
+    progress = []
+    for _ in range(12):
+        report = await reconcile.reconcile_run(config, run.run_id, adapter, executor())
+        progress.append(len(set(adapter.blocked)))
+    assert [key.key_id for key in report.keys] == [record.key_id for record in records]
+    assert progress[-1] == 14, progress
+    assert progress[7] == 14, progress
+    assert {
+        event.payload["key_id"]
+        for event in committed(config)
+        if event.type == "gateway_key" and event.payload["action"] == "closed"
+    } == {record.key_id for record in records}
+    assert all(key.label == "estimated" and not key.deleted for key in report.keys)
+    assert not adapter.windows
+    assert not adapter.deleted
+    before = identity.await_count
+    await reconcile.reconcile_run(config, run.run_id, adapter, executor())
+    assert identity.await_count == before
+
+
+async def test_closed_ineligible_key_skips_identity_and_death_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = CapableGateway()
+    identity = AsyncMock(wraps=adapter.key_matches)
+    monkeypatch.setattr(adapter, "key_matches", identity)
+    worker = executor()
+    async with open_llm_run(tmp_path) as run:
+        record = key_record(run.run_id).model_copy(update={"closed_at": T0})
+        run.journal.append(created(record))
+        run.journal.append(
+            EventDraft(
+                type="tool_dispatch",
+                payload={
+                    "candidate_id": record.candidate_id,
+                    "reservation_id": record.reservation_id,
+                    "started": Job.Started(
+                        kind="dispatch", job_id="c-1", task_name="c-1", ray_job_id="old"
+                    ).model_dump(),
+                },
+            )
+        )
+        await run.journal.commit()
+        report = await reconcile.reconcile_keys(
+            run.events("gateway_key") + run.events("tool_dispatch"),
+            run_id=run.run_id,
+            journal=run.journal,
+            adapter=adapter,
+            executor=worker,
+            gateway=GatewayConfig(url="http://gw"),
+            profile=None,
+        )
+        assert report.keys[0].label == "estimated"
+        identity.assert_not_awaited()
+        cast(AsyncMock, worker.confirm_dead).assert_not_awaited()
+        assert not adapter.blocked
+        assert not adapter.windows
+        assert not adapter.deleted
+
+
+async def test_death_confirmation_allowance_is_unknown_without_gateway_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = CapableGateway()
+    identity = AsyncMock(wraps=adapter.key_matches)
+    monkeypatch.setattr(adapter, "key_matches", identity)
+    worker = executor()
+    cast(AsyncMock, worker.confirm_dead).side_effect = reconcile._AllowanceExpired(
+        "reconcile time allowance exhausted"
+    )
+    async with open_llm_run(tmp_path) as run:
+        record = key_record(run.run_id).model_copy(update={"closed_at": T0})
+        started = Job.Started(kind="dispatch", job_id="c-1", task_name="c-1", ray_job_id="old")
+        run.journal.append(created(record))
+        run.journal.append(
+            EventDraft(
+                type="tool_dispatch",
+                payload={
+                    "candidate_id": "c-1",
+                    "reservation_id": "res-c-1",
+                    "started": started.model_dump(mode="json"),
+                },
+            )
+        )
+        await run.journal.commit()
+        report = await reconcile.reconcile_keys(
+            [*run.events("gateway_key"), *run.events("tool_dispatch")],
+            run_id=run.run_id,
+            journal=run.journal,
+            adapter=adapter,
+            executor=worker,
+            gateway=GatewayConfig(url="http://gw"),
+            profile=adapter.profile,
+            now=lambda: T0 + timedelta(seconds=610),
+        )
+        assert report.keys[0].reasons == ["reconcile time allowance exhausted"]
+        assert report.keys[0].label == "estimated"
+        assert not report.keys[0].deleted
+        cast(AsyncMock, worker.confirm_dead).assert_awaited_once_with(started)
+        identity.assert_not_awaited()
+        assert not adapter.blocked
+        assert not adapter.windows
+        assert not adapter.deleted
+
+
+async def test_unclosed_key_precedes_eligible_closed_key_without_rechecking_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = CapableGateway()
+    identity = AsyncMock(wraps=adapter.key_matches)
+    monkeypatch.setattr(adapter, "key_matches", identity)
+    async with open_llm_run(tmp_path) as run:
+        first = key_record(run.run_id).model_copy(update={"closed_at": T0})
+        tail = key_record(run.run_id, key_id="hash-tail", candidate_id="c-tail")
+        run.journal.append(created(first))
+        run.journal.append(created(tail))
+        await run.journal.commit()
+        report = await reconcile.reconcile_keys(
+            run.events("gateway_key"),
+            run_id=run.run_id,
+            journal=run.journal,
+            adapter=adapter,
+            executor=executor(),
+            gateway=GatewayConfig(url="http://gw"),
+            profile=adapter.profile,
+            now=lambda: T0 + timedelta(seconds=610),
+        )
+        assert [call.args[0].key_id for call in identity.await_args_list] == [
+            tail.key_id,
+            first.key_id,
+        ]
+        assert adapter.blocked == [tail.key_id]
+        assert adapter.deleted == [tail.key_id, first.key_id]
+        assert [key.key_id for key in report.keys] == [first.key_id, tail.key_id]
+        assert all(key.deleted for key in report.keys)
+
+
+@pytest.mark.parametrize("lookup", ["skipped", "expired", "error", "alive", "unknown", "dead"])
+async def test_death_lookup_gates_spend_read_and_delete(tmp_path: Path, lookup: str) -> None:
+    adapter = CapableGateway()
+    worker = executor({"alive": False, "unknown": None}.get(lookup, True))
+    confirm = cast(AsyncMock, worker.confirm_dead)
+    if lookup == "expired":
+        confirm.side_effect = reconcile._AllowanceExpired("reconcile time allowance exhausted")
+    elif lookup == "error":
+        confirm.side_effect = GatewayError("gateway operation failed")
+    async with open_llm_run(tmp_path) as run:
+        record = key_record(run.run_id).model_copy(update={"closed_at": T0})
+        run.journal.append(created(record))
+        run.journal.append(
+            EventDraft(
+                type="tool_dispatch",
+                payload={
+                    "candidate_id": record.candidate_id,
+                    "reservation_id": record.reservation_id,
+                    "started": Job.Started(
+                        kind="dispatch",
+                        job_id=record.candidate_id,
+                        task_name=record.candidate_id,
+                        ray_job_id="old",
+                    ).model_dump(mode="json"),
+                },
+            )
+        )
+        await run.journal.commit()
+        report = await reconcile.reconcile_keys(
+            [*run.events("gateway_key"), *run.events("tool_dispatch")],
+            run_id=run.run_id,
+            journal=run.journal,
+            adapter=adapter,
+            executor=worker,
+            gateway=GatewayConfig(url="http://gw"),
+            profile=None if lookup == "skipped" else adapter.profile,
+            now=lambda: T0 + timedelta(seconds=610),
+        )
+        if lookup == "skipped":
+            confirm.assert_not_awaited()
+        else:
+            confirm.assert_awaited_once()
+        if lookup == "dead":
+            assert len(adapter.windows) == 1
+            assert adapter.deleted == [record.key_id]
+            assert report.keys[0].deleted
+        else:
+            assert not adapter.windows
+            assert not adapter.deleted
+            assert not report.keys[0].deleted
+            assert report.keys[0].label == "estimated"
+            if lookup != "skipped":
+                assert report.keys[0].reasons == [
+                    "reconcile time allowance exhausted"
+                    if lookup == "expired"
+                    else "tool not confirmed dead"
+                ]
