@@ -21,10 +21,11 @@ async def run_sync_daemon(fn: Callable[..., T], *args: Any) -> T:
     daemon thread cannot keep the interpreter from exiting, unlike the worker
     threads of ``anyio.to_thread.run_sync``. When the awaiting task is
     cancelled, it stops waiting at once and the thread is dropped; the thread
-    runs on, and its outcome is discarded. The hand-back never waits for the
-    event loop: the thread ends as soon as ``fn`` returns, even while a loop
-    that is still open is not running. If the event loop has finished by the
-    time the thread ends, the hand-back is skipped.
+    runs on, and its outcome is discarded. On the asyncio and trio backends
+    the hand-back never waits for the event loop: the thread ends as soon as
+    ``fn`` returns, even while a loop that is still open is not running. If the
+    event loop has finished by the time the thread ends, the hand-back is
+    skipped.
 
     ``fn`` runs in a copy of the caller's context
     (``contextvars.copy_context()``), as with ``anyio.to_thread.run_sync``:

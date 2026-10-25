@@ -2774,6 +2774,55 @@ async def test_draft_spool_cleanup_after_failed_or_abandoned_preparation(
             await settle_tasks(task)
 
 
+def test_draft_offer_never_waits_for_an_idle_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, draft_spool_closed: threading.Event
+) -> None:
+    import asyncio
+
+    from swarm_arena._planning import validate
+    from swarm_arena._planning.validate import _draft_work
+
+    entered, go = threading.Event(), threading.Event()
+    workers: list[threading.Thread] = []
+    real_post = validate._post
+
+    def held_post(token: Any, callback: Any) -> None:
+        workers.append(threading.current_thread())
+        entered.set()
+        assert go.wait(180), "test did not release the offer"
+        real_post(token, callback)
+
+    monkeypatch.setattr(validate, "_post", held_post)
+    artifacts = ArtifactStore(open_store(str(tmp_path / "artifacts")))
+
+    def prepare(staging: ArtifactStore) -> Goal:
+        staging.put_bytes(b"snapshot")
+        return Goal(id="g", namespace="n")
+
+    async def start_and_abandon() -> None:
+        task = asyncio.ensure_future(_draft_work(prepare, artifacts))
+        assert await asyncio.to_thread(entered.wait, 60)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(start_and_abandon())
+        # The owner is gone and the loop is open but idle while the worker offers a file.
+        go.set()
+        worker = workers[0]
+        worker.join(60)
+        assert not worker.is_alive(), "the draft worker waited for an idle loop"
+        assert draft_spool_closed.wait(60)
+    finally:
+        go.set()
+        loop.run_until_complete(asyncio.sleep(0))
+        for worker in workers:
+            worker.join(60)
+        loop.close()
+
+
 def test_providers_without_gateway_warns() -> None:
     plan = _plan(tool=FunctionTool("_fakes.tools:add", providers=["openai"]))
     warnings = validate_plan(plan, RunConfig())

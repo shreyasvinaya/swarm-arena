@@ -22,7 +22,7 @@ from swarm_arena._errors import (
     _exception_type_name,
     _rebuild_core_signal,
 )
-from swarm_arena._exec.threads import _DaemonCall
+from swarm_arena._exec.threads import _DaemonCall, _post
 from swarm_arena._gateway.keys import unreplaced_provider_keys
 from swarm_arena._model.base import LLMRole, Origin
 from swarm_arena._model.canonical import canonical_json, sha256_hex
@@ -1233,7 +1233,16 @@ async def _draft_work(operation: Callable[[ArtifactStore], _T], artifacts: Artif
     sender, receiver = anyio.create_memory_object_stream[tuple[str, bytes] | None](1)
 
     def offer(item: tuple[str, bytes] | None) -> None:
-        anyio.from_thread.run_sync(sender.send_nowait, item, token=token)
+        # Never wait for the loop: an idle loop must not hold the worker and its spool.
+        def deliver() -> None:
+            try:
+                sender.send_nowait(item)
+            except Exception:
+                # The owner is gone; release the worker to stop and close its spool.
+                abandoned.set()
+                acknowledged.set()
+
+        _post(token, deliver)
 
     def prepare() -> _T:
         try:
