@@ -1006,6 +1006,28 @@ def test_page_blocks_run(title: str, pid: str, tmp_path: Path) -> None:
     )
 
 
+def test_no_stub_text() -> None:
+    files = [
+        path
+        for path in (REPO / "docs").rglob("*.md")
+        if "superpowers" not in path.parts and "_build" not in path.parts
+    ]
+    assert [
+        str(path.relative_to(REPO))
+        for path in files
+        if STUB_TEXT.search(path.read_text(encoding="utf-8"))
+    ] == []
+
+
+@pytest.mark.parametrize(
+    "title", [title for title, _ in PAGES if title not in {"Roadmap", "API reference"}]
+)
+def test_every_content_page_has_a_runnable_block(title: str, tmp_path: Path) -> None:
+    blocks = parse_blocks(page_path(title).read_text(encoding="utf-8"))
+    workdir = make_workdir(tmp_path, with_examples=False)
+    assert any(block_runs(block, workdir=workdir, bindir=docs_bindir()) for block in blocks), title
+
+
 def test_process_tree_snapshot_follows_parents_across_sessions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
