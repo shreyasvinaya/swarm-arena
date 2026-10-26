@@ -919,6 +919,18 @@ def test_release_triggers() -> None:
     assert on == {"push": {"tags": ["v*"]}, "pull_request": None, "workflow_dispatch": None}
 
 
+def _release_shell_lines(script: str) -> list[list[str]]:
+    """Tokenize continued shell lines without hiding control operators."""
+    commands = []
+    for line in script.replace("\\\n", "").splitlines():
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+        if tokens:
+            commands.append(tokens)
+    return commands
+
+
 def test_release_build_job_checks_the_wheel() -> None:
     wf = load_yaml(RELEASE)
     assert wf["permissions"] == {"contents": "read"}
@@ -960,13 +972,35 @@ def test_release_build_job_checks_the_wheel() -> None:
         ["uvx", "twine", "check", "--strict", "$RELEASE_DIR/dist/*"],
     ]
     [install] = [run for run in steps_run(job) if run.startswith("uv venv ")]
-    assert shlex.split(install.splitlines()[1], comments=True) == [
-        "uv",
-        "pip",
-        "install",
-        "--python",
-        "$RELEASE_DIR/venv/bin/python",
-        "$RELEASE_DIR/dist/*.whl",
+    assert _release_shell_lines(install) == [
+        ["uv", "venv", "$RELEASE_DIR/venv", "--python", "3.11"],
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            "$RELEASE_DIR/venv/bin/python",
+            "$RELEASE_DIR/dist/*.whl",
+        ],
+        ["mkdir", "$RELEASE_DIR/empty"],
+        ["cd", "$RELEASE_DIR/empty"],
+        ["$RELEASE_DIR/venv/bin/swarm-arena", "--help"],
+    ]
+    [readme] = [
+        s
+        for s in job["steps"]
+        if s.get("name") == "README quickstart from the wheel in an empty folder"
+    ]
+    assert _release_shell_lines(readme["run"]) == [
+        [
+            "SWARM_ARENA_DOCS_VENV=$RELEASE_DIR/venv",
+            "uv",
+            "run",
+            "--no-sync",
+            "pytest",
+            "tests/test_docs.py::test_readme_quickstart",
+            "-v",
+        ],
     ]
     upload = job["steps"][-1]
     assert upload["with"] == {
@@ -988,7 +1022,54 @@ def test_release_checks_tag_against_version() -> None:
     assert '--tag "$tag"' in guard["run"]
     assert '--commit "$GITHUB_SHA"' in guard["run"]
     assert '--wheel-python "$RELEASE_DIR/venv/bin/python"' in guard["run"]
+    assert guard["run"].splitlines()[:4] == [
+        'tag="v$(uv version --short)"',
+        'if [ "$GITHUB_REF_TYPE" = tag ]; then',
+        '  tag="$GITHUB_REF_NAME"',
+        "fi",
+    ]
+    assert _release_shell_lines("\n".join(guard["run"].splitlines()[4:])) == [
+        [
+            "uv",
+            "run",
+            "--no-sync",
+            "python",
+            "tests/test_ci_config.py",
+            "--check-release",
+            "--dist",
+            "$RELEASE_DIR/dist",
+            "--tag",
+            "$tag",
+            "--commit",
+            "$GITHUB_SHA",
+            "--wheel-python",
+            "$RELEASE_DIR/venv/bin/python",
+            "--record",
+            "$RELEASE_DIR/release.json",
+        ],
+    ]
     assert steps.index(guard) < len(steps) - 1
+
+
+def test_release_does_not_dump_secrets() -> None:
+    workflow = load_yaml(RELEASE)
+    assert re.search(r"github\s*\.\s*token\b", json.dumps(workflow)) is None
+    for job in workflow["jobs"].values():
+        for run in steps_run(job):
+            for tokens in _release_shell_lines(run):
+                assert not any(Path(token).name in {"env", "printenv"} for token in tokens)
+                assert tokens != ["set"]
+                assert tokens[:2] not in [["export", "-p"], ["declare", "-p"]]
+    [bundle] = [
+        step
+        for step in workflow["jobs"]["build"]["steps"]
+        if step.get("name") == "Bundle the checked files without rebuilding"
+    ]
+    assert _release_shell_lines(bundle["run"]) == [
+        ["mkdir", "$RELEASE_DIR/bundle"],
+        ["mv", "$RELEASE_DIR/dist", "$RELEASE_DIR/release.json", "$RELEASE_DIR/bundle/"],
+        ["cat", "$RELEASE_DIR/bundle/release.json", ">>", "$GITHUB_STEP_SUMMARY"],
+    ]
 
 
 def test_publish_job_is_least_privilege() -> None:
@@ -1085,6 +1166,8 @@ def test_release_guard_accepts_exact_versions_and_records_hashes(tmp_path: Path)
     "tag",
     [
         "v0.2.0",
+        "v0.1.1",
+        "v1.1.0",
         "0.1.0",
         "v0x1y0",
         "v0.1.0rc1",
@@ -1176,12 +1259,30 @@ def test_release_guard_rejects_artifact_set(tmp_path: Path, mutation: str) -> No
         )
 
 
-@pytest.mark.parametrize("mutation", ["none", "bytes", "extra", "missing", "commit", "tag", "hash"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "none",
+        "bytes",
+        "extra",
+        "missing",
+        "commit",
+        "tag",
+        "hash",
+        "tag-matches-ref-only",
+        "tag-matches-version-only",
+        "version-lookalike",
+        "version-leading-zero",
+        "version-prerelease",
+        "version-trailing-newline",
+    ],
+)
 def test_release_downloaded_hash_guard(tmp_path: Path, mutation: str) -> None:
     bundle = tmp_path / "release"
     dist = _release_fixture(bundle)
     record = _release_record(bundle, dist, "v0.1.0", "a" * 40, "0.1.0", "0.1.0", "0.1.0")
     wheel = next(dist.glob("*.whl"))
+    ref = "v0.1.0"
     if mutation == "bytes":
         wheel.write_bytes(wheel.read_bytes() + b"tampered")
     elif mutation == "extra":
@@ -1192,6 +1293,24 @@ def test_release_downloaded_hash_guard(tmp_path: Path, mutation: str) -> None:
         record[mutation] = "different"
     elif mutation == "hash":
         record["sha256"][wheel.name] = "0" * 64
+    elif mutation == "tag-matches-ref-only":
+        record["tag"] = ref = "v0.1.1"
+    elif mutation == "tag-matches-version-only":
+        ref = "v0.1.1"
+    elif mutation.startswith("version-"):
+        version = {
+            "version-lookalike": "0x1y0",
+            "version-leading-zero": "00.1.0",
+            "version-prerelease": "0.1.0rc1",
+            "version-trailing-newline": "0.1.0\n",
+        }[mutation]
+        record["version"] = version
+        record["tag"] = ref = "v" + version
+        # Keep every other verifier condition valid to isolate its version regex.
+        for path in list(dist.iterdir()):
+            renamed = path.with_name(path.name.replace("0.1.0", version))
+            path.rename(renamed)
+            record["sha256"][renamed.name] = record["sha256"].pop(path.name)
     (bundle / "release.json").write_text(json.dumps(record), encoding="utf-8")
     [command] = steps_run(load_yaml(RELEASE)["jobs"]["publish"])
     # Execute only the embedded local verifier, never the publish action.
@@ -1201,29 +1320,51 @@ def test_release_downloaded_hash_guard(tmp_path: Path, mutation: str) -> None:
     result = subprocess.run(
         [sys.executable, "-I", "-c", code],
         cwd=tmp_path,
-        env={"GITHUB_SHA": "a" * 40, "GITHUB_REF_NAME": "v0.1.0"},
+        env={"GITHUB_SHA": "a" * 40, "GITHUB_REF_NAME": ref},
         capture_output=True,
         encoding="utf-8",
         timeout=30,
         check=False,
     )
     assert (result.returncode == 0) == (mutation == "none"), result.stdout + result.stderr
+    if mutation.startswith("version-"):
+        assert "invalid release version" in result.stderr
+    elif mutation.startswith("tag-matches-"):
+        assert "release tag mismatch" in result.stderr
 
 
-@pytest.mark.parametrize("tag", ["v0.1.0", "v0.2.0", "v0x1y0"])
-def test_release_guard_cli(tmp_path: Path, tag: str) -> None:
+@pytest.mark.parametrize(
+    ("tag", "runtime_version", "docs_version"),
+    [
+        ("v0.1.0", "0.1.0", "0.1.0"),
+        ("v0.2.0", "0.1.0", "0.1.0"),
+        ("v0.1.1", "0.1.0", "0.1.0"),
+        ("v1.1.0", "0.1.0", "0.1.0"),
+        ("v0x1y0", "0.1.0", "0.1.0"),
+        ("v0.1.0", "0.2.0", "0.1.0"),
+        ("v0.1.0", "0.1.0", "0.2.0"),
+    ],
+)
+def test_release_guard_cli(
+    tmp_path: Path,
+    tag: str,
+    runtime_version: str,
+    docs_version: str,
+) -> None:
     dist = _release_fixture(tmp_path)
     (tmp_path / "tests").mkdir()
     script = tmp_path / "tests/test_ci_config.py"
     script.write_text(Path(__file__).read_text(encoding="utf-8"), encoding="utf-8")
     (tmp_path / "docs").mkdir()
-    (tmp_path / "docs/conf.py").write_text('release = "0.1.0"\n', encoding="utf-8")
+    (tmp_path / "docs/conf.py").write_text(f'release = "{docs_version}"\n', encoding="utf-8")
     # A synthetic installed distribution tests the CLI without a resolver or network.
     target = tmp_path / "venv"
     venv.EnvBuilder(with_pip=False, symlinks=True).create(target)
     [site] = target.glob("lib/python*/site-packages")
     (site / "swarm_arena").mkdir()
-    (site / "swarm_arena/__init__.py").write_text('__version__ = "0.1.0"\n', encoding="utf-8")
+    (site / "swarm_arena/__init__.py").write_text(
+        f'__version__ = "{runtime_version}"\n', encoding="utf-8"
+    )
     info = site / "swarm_arena-0.1.0.dist-info"
     info.mkdir()
     (info / "METADATA").write_text("Name: swarm-arena\nVersion: 0.1.0\n", encoding="utf-8")
@@ -1252,12 +1393,15 @@ def test_release_guard_cli(tmp_path: Path, tag: str) -> None:
         timeout=30,
         check=False,
     )
-    assert (result.returncode == 0) == (tag == "v0.1.0"), result.stdout + result.stderr
-    assert record.exists() == (tag == "v0.1.0")
+    valid = tag == "v0.1.0" and runtime_version == docs_version == "0.1.0"
+    assert (result.returncode == 0) == valid, result.stdout + result.stderr
+    assert record.exists() == valid
     if record.exists():
         assert json.loads(record.read_text(encoding="utf-8"))["tag"] == tag
-    else:
+    elif tag != "v0.1.0":
         assert "release tag must exactly match" in result.stderr
+    else:
+        assert "release installed, runtime and docs versions must agree" in result.stderr
 
 
 @pytest.mark.parametrize("wrong_path", [None, "prefix", "module", "metadata_root", "failure"])
@@ -1336,6 +1480,80 @@ def test_releasing_checklist() -> None:
         "--check-release",
     ):
         assert phrase.lower() in text
+
+
+def _releasing_step(number: int) -> str:
+    """Read one numbered checklist step, excluding every neighboring step."""
+    text = (REPO / "RELEASING.md").read_text(encoding="utf-8")
+    [section] = re.findall(rf"^{number}\. (.*?)(?=^\d+\. |\Z)", text, re.M | re.S)
+    return section
+
+
+def test_releasing_requires_exact_commit_ci() -> None:
+    step = " ".join(_releasing_step(3).lower().replace("**", "").replace("`", "").split())
+    for phrase in (
+        "before tagging, verify required ci success for the exact commit to be tagged, "
+        "including all required matrix jobs.",
+        "record the run url, headsha, status: completed and conclusion: success.",
+        "a successful run on an earlier sha or a pr merge sha that differs from the "
+        "candidate does not qualify.",
+        "if the candidate changes, obtain new matching evidence before continuing.",
+        "before approving the waiting pypi environment run, verify again that the tag "
+        "resolves to the owner-approved commit with successful exact-head ci.",
+    ):
+        assert phrase in step
+
+
+def test_releasing_candidate_commands() -> None:
+    [code] = re.findall(r"```sh\n(.*?)```", _releasing_step(2), re.S)
+    lines = [line.strip() for line in code.splitlines() if line.strip()]
+    assert lines[:3] == [
+        "RELEASE_TMP=$(mktemp -d)",
+        "RELEASE_VERSION=X.Y.Z",
+        "RELEASE_COMMIT=$(git rev-parse HEAD)",
+    ]
+    assert _release_shell_lines("\n".join(lines[3:])) == [
+        ["uv", "build", "--out-dir", "$RELEASE_TMP/dist", "--no-create-gitignore"],
+        ["uvx", "twine", "check", "--strict", "$RELEASE_TMP/dist/*"],
+        ["uv", "venv", "$RELEASE_TMP/venv", "--python", "3.11"],
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            "$RELEASE_TMP/venv/bin/python",
+            "$RELEASE_TMP/dist/*.whl",
+        ],
+        ["mkdir", "$RELEASE_TMP/empty"],
+        ["(", "cd", "$RELEASE_TMP/empty", "&&", "$RELEASE_TMP/venv/bin/swarm-arena", "--help", ")"],
+        [
+            "uv",
+            "run",
+            "--no-sync",
+            "python",
+            "tests/test_ci_config.py",
+            "--check-release",
+            "--dist",
+            "$RELEASE_TMP/dist",
+            "--tag",
+            "v$RELEASE_VERSION",
+            "--commit",
+            "$RELEASE_COMMIT",
+            "--wheel-python",
+            "$RELEASE_TMP/venv/bin/python",
+            "--record",
+            "$RELEASE_TMP/release.json",
+        ],
+        [
+            "SWARM_ARENA_DOCS_VENV=$RELEASE_TMP/venv",
+            "uv",
+            "run",
+            "--no-sync",
+            "pytest",
+            "tests/test_docs.py::test_readme_quickstart",
+            "-v",
+        ],
+    ]
 
 
 if __name__ == "__main__":
