@@ -571,6 +571,10 @@ The example commands locate each program beside its connector module with
 `Path(__file__).with_name(...)`. The program still runs in the executor's
 workspace, where its request and result paths resolve. Package those scripts
 with the connector, and install it on each worker for remote execution.
+A tool's `command()` runs on the worker, so its path is the worker's own. A
+check's `check()` runs in the arena process, so its path names the driver's
+copy: for remote execution, install the connector at the same path on each
+worker, or use the `python -m` form below.
 A command written instead as `python -m my_connector.route` requires an
 installed connector: a source checkout or pytest's import path alone is
 insufficient because the workspace has no inherited `PYTHONPATH`.
