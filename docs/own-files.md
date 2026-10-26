@@ -6,7 +6,7 @@ Run tools, checks, and judges locally with your existing scripts. Start with
 The workspace contract below is a **stable format**: scripts exchange versioned
 JSON files with the core without importing swarm-arena. The tool workspace,
 the check/judge workspace, and their reserved paths form that contract; see
-[Versioning policy](versioning.md) for the compatibility promise.
+[Versioning policy](versioning.md) for how versioned formats change.
 
 ## File snapshots
 
