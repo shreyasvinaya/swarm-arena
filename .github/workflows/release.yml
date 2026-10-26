@@ -1,0 +1,105 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.11"
+      - run: uv sync --locked --all-groups
+      - name: Offline release and version regressions
+        run: uv run --no-sync pytest -q tests/test_ci_config.py tests/test_packaging.py
+      - name: Allocate owned candidate paths
+        run: echo "RELEASE_DIR=$(mktemp -d)" >> "$GITHUB_ENV"
+      - name: Build the sdist, then the publication wheel from that sdist
+        run: uv build --out-dir "$RELEASE_DIR/dist" --no-create-gitignore
+      - run: uvx twine check --strict "$RELEASE_DIR"/dist/*
+      - name: Install only the candidate wheel and core dependencies
+        run: |
+          uv venv "$RELEASE_DIR/venv" --python 3.11
+          uv pip install --python "$RELEASE_DIR/venv/bin/python" "$RELEASE_DIR"/dist/*.whl
+          mkdir "$RELEASE_DIR/empty"
+          cd "$RELEASE_DIR/empty"
+          "$RELEASE_DIR/venv/bin/swarm-arena" --help
+      - name: Guard exact tag, CHANGELOG.md, project, artifact and installed versions
+        run: |
+          tag="v$(uv version --short)"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="$GITHUB_REF_NAME"
+          fi
+          uv run --no-sync python tests/test_ci_config.py --check-release \
+            --dist "$RELEASE_DIR/dist" --tag "$tag" --commit "$GITHUB_SHA" \
+            --wheel-python "$RELEASE_DIR/venv/bin/python" --record "$RELEASE_DIR/release.json"
+      - name: README quickstart from the wheel in an empty folder
+        run: |
+          SWARM_ARENA_DOCS_VENV="$RELEASE_DIR/venv" uv run --no-sync pytest \
+            tests/test_docs.py::test_readme_quickstart -v
+      - name: Bundle the checked files without rebuilding
+        run: |
+          mkdir "$RELEASE_DIR/bundle"
+          mv "$RELEASE_DIR/dist" "$RELEASE_DIR/release.json" "$RELEASE_DIR/bundle/"
+          cat "$RELEASE_DIR/bundle/release.json" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-dist
+          path: ${{ env.RELEASE_DIR }}/bundle/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/swarm-arena
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-dist
+          path: release
+      - name: Verify downloaded artifact hashes and tag commit
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          record = json.loads(Path("release/release.json").read_text(encoding="utf-8"))
+          if record["schema_version"] != 1 or record["commit"] != os.environ["GITHUB_SHA"]:
+              raise SystemExit("release commit mismatch")
+          version = record["version"]
+          if re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version) is None:
+              raise SystemExit("invalid release version")
+          if record["tag"] != os.environ["GITHUB_REF_NAME"] or record["tag"] != "v" + version:
+              raise SystemExit("release tag mismatch")
+          dist = Path("release/dist")
+          expected = {f"swarm_arena-{version}-py3-none-any.whl", f"swarm_arena-{version}.tar.gz"}
+          if set(record["sha256"]) != expected or {p.name for p in dist.iterdir()} != expected:
+              raise SystemExit("release artifact inventory mismatch")
+          for name in expected:
+              path = dist / name
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit("release artifact must be a regular file")
+              if hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"][name]:
+                  raise SystemExit("release artifact hash mismatch")
+          PY
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: release/dist/

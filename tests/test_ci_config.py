@@ -1,15 +1,25 @@
 """Offline checks for documentation and workflow configuration."""
 
 import argparse
+import copy
+import email.parser
+import hashlib
 import importlib.metadata
+import io
 import json
 import os
 import re
+import runpy
 import shlex
 import subprocess
 import sys
+import tarfile
+import tempfile
 import tomllib
 import traceback
+import venv
+import zipfile
+from datetime import date
 from pathlib import Path
 from typing import Any, cast
 
@@ -781,7 +791,570 @@ def test_canary_executes_all_upstream_facts_without_skips(tmp_path: Path) -> Non
     assert passed_counts[0] == passed_counts[1]
 
 
+RELEASE = REPO / ".github/workflows/release.yml"
+
+
+def _release_record(
+    root: Path,
+    dist: Path,
+    tag: str,
+    commit: str,
+    installed_version: str,
+    runtime_version: str,
+    docs_version: str,
+) -> dict[str, Any]:
+    """Validate the candidate and return its exact commit and artifact hashes."""
+    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    version = project["version"]
+    stable = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    if re.fullmatch("v" + stable, tag) is None or tag != f"v{version}":
+        raise ValueError("release tag must exactly match the stable project version")
+    if project["name"] != "swarm-arena" or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise ValueError("release project or commit is invalid")
+    headings = re.findall(r"^## (.+)$", (root / "CHANGELOG.md").read_text(encoding="utf-8"), re.M)
+    if not headings or headings[0] != "[Unreleased]":
+        raise ValueError("release changelog requires a leading Unreleased heading")
+    released = []
+    for heading in headings[1:]:
+        match = re.fullmatch(r"\[(" + stable + r")\] - ([0-9]{4}-[0-9]{2}-[0-9]{2})", heading)
+        if match is None:
+            raise ValueError("release changelog heading is malformed")
+        release_version, day = match.groups()
+        try:
+            released_on = date.fromisoformat(day)
+        except ValueError:
+            raise ValueError("release changelog date is invalid") from None
+        if released_on > date.today() or release_version in released:
+            raise ValueError("release changelog date or duplicate version is invalid")
+        released.append(release_version)
+    if not released or released[0] != version:
+        raise ValueError("release changelog must begin with the project version")
+    if (installed_version, runtime_version, docs_version) != (version, version, version):
+        raise ValueError("release installed, runtime and docs versions must agree")
+    wheel = dist / f"swarm_arena-{version}-py3-none-any.whl"
+    sdist = dist / f"swarm_arena-{version}.tar.gz"
+    if set(dist.iterdir()) != {wheel, sdist} or any(
+        p.is_symlink() or not p.is_file() for p in (wheel, sdist)
+    ):
+        raise ValueError("release artifacts must be exactly one wheel and one sdist")
+    with zipfile.ZipFile(wheel) as archive:
+        metadata_path = f"swarm_arena-{version}.dist-info/METADATA"
+        if [n for n in archive.namelist() if n.endswith(".dist-info/METADATA")] != [metadata_path]:
+            raise ValueError("release wheel metadata inventory is invalid")
+        wheel_metadata = archive.read(metadata_path).decode("utf-8")
+    with tarfile.open(sdist) as archive:
+        prefix = f"swarm_arena-{version}/"
+        if [n for n in archive.getnames() if n.endswith("/PKG-INFO")] != [prefix + "PKG-INFO"]:
+            raise ValueError("release sdist metadata inventory is invalid")
+        info = archive.extractfile(prefix + "PKG-INFO")
+        project_file = archive.extractfile(prefix + "pyproject.toml")
+        if info is None or project_file is None:
+            raise ValueError("release sdist metadata is missing")
+        with info, project_file:
+            sdist_metadata = info.read().decode("utf-8")
+            sdist_project = tomllib.loads(project_file.read().decode("utf-8"))["project"]
+        if (sdist_project["name"], sdist_project["version"]) != ("swarm-arena", version):
+            raise ValueError("release sdist project metadata does not match")
+    for content in (wheel_metadata, sdist_metadata):
+        metadata = email.parser.Parser().parsestr(content)
+        if metadata.get_all("Name") != ["swarm-arena"] or metadata.get_all("Version") != [version]:
+            raise ValueError("release artifact metadata does not match")
+    return {
+        "schema_version": 1,
+        "commit": commit,
+        "tag": tag,
+        "version": version,
+        "sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in (wheel, sdist)},
+    }
+
+
+def _installed_release(python: Path) -> tuple[str, str]:
+    """Probe the wheel interpreter from an empty directory without ambient keys."""
+    code = """
+import importlib.metadata
+import json
+import sys
+from pathlib import Path
+import swarm_arena
+distribution = importlib.metadata.distribution("swarm-arena")
+print(json.dumps({
+    "installed": distribution.version,
+    "runtime": swarm_arena.__version__,
+    "module": str(Path(swarm_arena.__file__).resolve()),
+    "metadata_root": str(Path(distribution.locate_file("")).resolve()),
+    "prefix": sys.prefix,
+}))
+"""
+    with tempfile.TemporaryDirectory(prefix="swarm-release-probe-") as empty:
+        result = subprocess.run(
+            [str(python.absolute()), "-I", "-c", code],
+            cwd=empty,
+            env={"PATH": str(python.absolute().parent), "PYTHONUTF8": "1"},
+            capture_output=True,
+            encoding="utf-8",
+            timeout=30,
+            check=False,
+        )
+    if result.returncode:
+        raise ValueError("release wheel interpreter probe failed")
+    probe = json.loads(result.stdout)
+    prefix = python.absolute().parent.parent.resolve()
+    if Path(probe["prefix"]).resolve() != prefix or any(
+        not Path(probe[key]).is_relative_to(prefix) for key in ("module", "metadata_root")
+    ):
+        raise ValueError("release imports must resolve inside the wheel environment")
+    return probe["installed"], probe["runtime"]
+
+
+def _check_release(dist: Path, tag: str, commit: str, python: Path, record: Path) -> None:
+    """Run the shared release guard and persist only successful candidate evidence."""
+    installed, runtime = _installed_release(python)
+    docs_version = runpy.run_path(str(REPO / "docs/conf.py"))["release"]
+    evidence = _release_record(REPO, dist, tag, commit, installed, runtime, docs_version)
+    record.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def test_release_triggers() -> None:
+    on = triggers(load_yaml(RELEASE))
+    assert on == {"push": {"tags": ["v*"]}, "pull_request": None, "workflow_dispatch": None}
+
+
+def test_release_build_job_checks_the_wheel() -> None:
+    wf = load_yaml(RELEASE)
+    assert wf["permissions"] == {"contents": "read"}
+    job = wf["jobs"]["build"]
+    runs = "\n".join(steps_run(job))
+    for needed in (
+        "uv build --out-dir",
+        'uvx twine check --strict "$RELEASE_DIR"/dist/*',
+        'uv venv "$RELEASE_DIR/venv" --python 3.11',
+        '"$RELEASE_DIR/venv/bin/swarm-arena" --help',
+        'SWARM_ARENA_DOCS_VENV="$RELEASE_DIR/venv"',
+        "tests/test_docs.py::test_readme_quickstart",
+        "tests/test_ci_config.py tests/test_packaging.py",
+        "mktemp -d",
+    ):
+        assert needed in runs
+    assert steps_uses(job) == [
+        "actions/checkout@v7",
+        "astral-sh/setup-uv@v10",
+        "actions/upload-artifact@v7",
+    ]
+    commands = [shell_command(s) for s in steps_run(job) if s.startswith("uv sync ")]
+    assert commands == [["uv", "sync", "--locked", "--all-groups"]]
+    assert [
+        shlex.split(run, comments=True)
+        for run in steps_run(job)
+        if run.startswith(("uv build ", "uvx twine ", "uv run --no-sync pytest "))
+    ] == [
+        [
+            "uv",
+            "run",
+            "--no-sync",
+            "pytest",
+            "-q",
+            "tests/test_ci_config.py",
+            "tests/test_packaging.py",
+        ],
+        ["uv", "build", "--out-dir", "$RELEASE_DIR/dist", "--no-create-gitignore"],
+        ["uvx", "twine", "check", "--strict", "$RELEASE_DIR/dist/*"],
+    ]
+    [install] = [run for run in steps_run(job) if run.startswith("uv venv ")]
+    assert shlex.split(install.splitlines()[1], comments=True) == [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        "$RELEASE_DIR/venv/bin/python",
+        "$RELEASE_DIR/dist/*.whl",
+    ]
+    upload = job["steps"][-1]
+    assert upload["with"] == {
+        "name": "release-dist",
+        "path": "${{ env.RELEASE_DIR }}/bundle/",
+        "if-no-files-found": "error",
+    }
+    assert not any(step.get("continue-on-error") or step.get("if") for step in job["steps"])
+
+
+def test_release_checks_tag_against_version() -> None:
+    steps = load_yaml(RELEASE)["jobs"]["build"]["steps"]
+    [guard] = [s for s in steps if "--check-release" in s.get("run", "")]
+    # The shared executable guard runs for PRs/dispatches as well as tags.
+    assert "if" not in guard
+    assert '"$GITHUB_REF_TYPE" = tag' in guard["run"]
+    assert 'tag="$GITHUB_REF_NAME"' in guard["run"]
+    assert "uv version --short" in guard["run"]
+    assert '--tag "$tag"' in guard["run"]
+    assert '--commit "$GITHUB_SHA"' in guard["run"]
+    assert '--wheel-python "$RELEASE_DIR/venv/bin/python"' in guard["run"]
+    assert steps.index(guard) < len(steps) - 1
+
+
+def test_publish_job_is_least_privilege() -> None:
+    wf = load_yaml(RELEASE)
+    job = wf["jobs"]["publish"]
+    assert job["needs"] == "build"
+    assert job["if"] == "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
+    assert job["environment"] == {"name": "pypi", "url": "https://pypi.org/p/swarm-arena"}
+    assert job["permissions"] == {"id-token": "write"}
+    assert steps_uses(job) == [
+        "actions/download-artifact@v8",
+        "pypa/gh-action-pypi-publish@release/v1",
+    ]
+    assert job["steps"][0]["with"] == {"name": "release-dist", "path": "release"}
+    assert job["steps"][-1]["with"] == {"packages-dir": "release/dist/"}
+    assert "id-token" not in json.dumps(wf["jobs"]["build"])
+    assert "secrets." not in RELEASE.read_text(encoding="utf-8")
+    assert not any(s.get("if") or s.get("continue-on-error") for s in job["steps"])
+    assert len(job["steps"]) == 3
+
+
+@pytest.mark.parametrize(
+    "mutation", ["manual", "pr", "permission", "environment", "artifact", "skip"]
+)
+def test_release_publish_boundary_rejects_weakened_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    wf = copy.deepcopy(load_yaml(RELEASE))
+    job = wf["jobs"]["publish"]
+    if mutation in {"manual", "pr"}:
+        job["if"] = "startsWith(github.ref, 'refs/tags/v')" if mutation == "manual" else "true"
+    elif mutation == "permission":
+        wf["jobs"]["build"]["permissions"] = {"id-token": "write"}
+    elif mutation == "environment":
+        job["environment"]["name"] = "unprotected"
+    elif mutation == "artifact":
+        job["steps"][0]["with"]["name"] = "other"
+    else:
+        job["steps"][1]["continue-on-error"] = True
+    monkeypatch.setitem(globals(), "load_yaml", lambda _: wf)
+    with pytest.raises(AssertionError):
+        test_publish_job_is_least_privilege()
+
+
+def _release_fixture(
+    root: Path,
+    *,
+    wheel_version: str = "0.1.0",
+    sdist_version: str = "0.1.0",
+    sdist_project_version: str = "0.1.0",
+) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "swarm-arena"\nversion = "0.1.0"\n', encoding="utf-8"
+    )
+    (root / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-10-27\n\n- Release.\n",
+        encoding="utf-8",
+    )
+    dist = root / "dist"
+    dist.mkdir(exist_ok=True)
+    with zipfile.ZipFile(dist / "swarm_arena-0.1.0-py3-none-any.whl", "w") as wheel:
+        wheel.writestr(
+            "swarm_arena-0.1.0.dist-info/METADATA", f"Name: swarm-arena\nVersion: {wheel_version}\n"
+        )
+    with tarfile.open(dist / "swarm_arena-0.1.0.tar.gz", "w:gz") as sdist:
+        for name, value in {
+            "PKG-INFO": f"Name: swarm-arena\nVersion: {sdist_version}\n",
+            "pyproject.toml": (
+                f'[project]\nname = "swarm-arena"\nversion = "{sdist_project_version}"\n'
+            ),
+        }.items():
+            payload = value.encode("utf-8")
+            info = tarfile.TarInfo(f"swarm_arena-0.1.0/{name}")
+            info.size = len(payload)
+            sdist.addfile(info, io.BytesIO(payload))
+    return dist
+
+
+def test_release_guard_accepts_exact_versions_and_records_hashes(tmp_path: Path) -> None:
+    dist = _release_fixture(tmp_path)
+    record = _release_record(tmp_path, dist, "v0.1.0", "a" * 40, "0.1.0", "0.1.0", "0.1.0")
+    assert record == {
+        "schema_version": 1,
+        "commit": "a" * 40,
+        "tag": "v0.1.0",
+        "version": "0.1.0",
+        "sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in dist.iterdir()},
+    }
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        "v0.2.0",
+        "0.1.0",
+        "v0x1y0",
+        "v0.1.0rc1",
+        "v0.1.0.dev0",
+        "v0.1.0+local",
+        "v00.1.0",
+        "v0.1.0\n",
+        "refs/tags/v0.1.0",
+    ],
+)
+def test_release_guard_rejects_tag(tmp_path: Path, tag: str) -> None:
+    dist = _release_fixture(tmp_path)
+    with pytest.raises(ValueError, match="release tag"):
+        _release_record(tmp_path, dist, tag, "a" * 40, "0.1.0", "0.1.0", "0.1.0")
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "## [0.1.0] - Unreleased",
+        "## [0x1y0] - 2026-10-27",
+        "## [0.1.0rc1] - 2026-10-27",
+        "## [0.1.0] - 2026-02-30",
+        "## [0.1.0] - 2026-13-01",
+        "## [0.1.0] - 2026-1-1",
+        "## [0.1.0] - 2026-10-27 extra",
+        "## [0.1.0] - 9999-01-01",
+        "## [0.2.0] - 2026-10-27",
+        "",
+        "## [0.1.0] - 2026-10-27\n## [0.1.0] - 2026-10-27",
+        "## [0.1.0] - 2026-10-27\n## [0x1y0] - 2026-10-27",
+    ],
+)
+def test_release_guard_rejects_changelog(tmp_path: Path, heading: str) -> None:
+    dist = _release_fixture(tmp_path)
+    (tmp_path / "CHANGELOG.md").write_text(
+        f"# Changelog\n## [Unreleased]\n{heading}\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="changelog"):
+        _release_record(tmp_path, dist, "v0.1.0", "a" * 40, "0.1.0", "0.1.0", "0.1.0")
+
+
+@pytest.mark.parametrize(
+    "field", ["project", "wheel", "sdist", "sdist-project", "installed", "runtime", "docs"]
+)
+def test_release_guard_rejects_version_mismatch(tmp_path: Path, field: str) -> None:
+    dist = _release_fixture(
+        tmp_path,
+        wheel_version="0.2.0" if field == "wheel" else "0.1.0",
+        sdist_version="0.2.0" if field == "sdist" else "0.1.0",
+        sdist_project_version="0.2.0" if field == "sdist-project" else "0.1.0",
+    )
+    if field == "project":
+        project = tmp_path / "pyproject.toml"
+        project.write_text(
+            project.read_text(encoding="utf-8").replace("0.1.0", "0.2.0"), encoding="utf-8"
+        )
+    with pytest.raises(ValueError, match="release"):
+        _release_record(
+            tmp_path,
+            dist,
+            "v0.1.0",
+            "a" * 40,
+            "0.2.0" if field == "installed" else "0.1.0",
+            "0.2.0" if field == "runtime" else "0.1.0",
+            "0.2.0" if field == "docs" else "0.1.0",
+        )
+
+
+@pytest.mark.parametrize("mutation", ["extra", "missing", "name", "commit"])
+def test_release_guard_rejects_artifact_set(tmp_path: Path, mutation: str) -> None:
+    dist = _release_fixture(tmp_path)
+    if mutation == "extra":
+        (dist / "unexpected.whl").write_bytes(b"other")
+    elif mutation == "missing":
+        next(dist.glob("*.whl")).unlink()
+    elif mutation == "name":
+        wheel = next(dist.glob("*.whl"))
+        wheel.rename(dist / "swarm_arena-0.2.0-py3-none-any.whl")
+    with pytest.raises(ValueError, match="release"):
+        _release_record(
+            tmp_path,
+            dist,
+            "v0.1.0",
+            "bad" if mutation == "commit" else "a" * 40,
+            "0.1.0",
+            "0.1.0",
+            "0.1.0",
+        )
+
+
+@pytest.mark.parametrize("mutation", ["none", "bytes", "extra", "missing", "commit", "tag", "hash"])
+def test_release_downloaded_hash_guard(tmp_path: Path, mutation: str) -> None:
+    bundle = tmp_path / "release"
+    dist = _release_fixture(bundle)
+    record = _release_record(bundle, dist, "v0.1.0", "a" * 40, "0.1.0", "0.1.0", "0.1.0")
+    wheel = next(dist.glob("*.whl"))
+    if mutation == "bytes":
+        wheel.write_bytes(wheel.read_bytes() + b"tampered")
+    elif mutation == "extra":
+        (dist / "extra.whl").write_bytes(b"extra")
+    elif mutation == "missing":
+        wheel.unlink()
+    elif mutation in {"commit", "tag"}:
+        record[mutation] = "different"
+    elif mutation == "hash":
+        record["sha256"][wheel.name] = "0" * 64
+    (bundle / "release.json").write_text(json.dumps(record), encoding="utf-8")
+    [command] = steps_run(load_yaml(RELEASE)["jobs"]["publish"])
+    # Execute only the embedded local verifier, never the publish action.
+    assert command.startswith("python3 - <<'PY'\n")
+    assert command.endswith("\nPY\n")
+    code = command.removeprefix("python3 - <<'PY'\n").removesuffix("\nPY\n")
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        cwd=tmp_path,
+        env={"GITHUB_SHA": "a" * 40, "GITHUB_REF_NAME": "v0.1.0"},
+        capture_output=True,
+        encoding="utf-8",
+        timeout=30,
+        check=False,
+    )
+    assert (result.returncode == 0) == (mutation == "none"), result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("tag", ["v0.1.0", "v0.2.0", "v0x1y0"])
+def test_release_guard_cli(tmp_path: Path, tag: str) -> None:
+    dist = _release_fixture(tmp_path)
+    (tmp_path / "tests").mkdir()
+    script = tmp_path / "tests/test_ci_config.py"
+    script.write_text(Path(__file__).read_text(encoding="utf-8"), encoding="utf-8")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs/conf.py").write_text('release = "0.1.0"\n', encoding="utf-8")
+    # A synthetic installed distribution tests the CLI without a resolver or network.
+    target = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(target)
+    [site] = target.glob("lib/python*/site-packages")
+    (site / "swarm_arena").mkdir()
+    (site / "swarm_arena/__init__.py").write_text('__version__ = "0.1.0"\n', encoding="utf-8")
+    info = site / "swarm_arena-0.1.0.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Name: swarm-arena\nVersion: 0.1.0\n", encoding="utf-8")
+    record = tmp_path / "release.json"
+    environment = dict(os.environ, GITHUB_REF_NAME=tag)
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--check-release",
+            "--dist",
+            str(dist),
+            "--tag",
+            environment["GITHUB_REF_NAME"],
+            "--commit",
+            "a" * 40,
+            "--wheel-python",
+            str(target / "bin/python"),
+            "--record",
+            str(record),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        encoding="utf-8",
+        timeout=30,
+        check=False,
+    )
+    assert (result.returncode == 0) == (tag == "v0.1.0"), result.stdout + result.stderr
+    assert record.exists() == (tag == "v0.1.0")
+    if record.exists():
+        assert json.loads(record.read_text(encoding="utf-8"))["tag"] == tag
+    else:
+        assert "release tag must exactly match" in result.stderr
+
+
+@pytest.mark.parametrize("wrong_path", [None, "prefix", "module", "metadata_root", "failure"])
+def test_release_wheel_probe_requires_isolated_imports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wrong_path: str | None,
+) -> None:
+    prefix = tmp_path / "venv"
+    python = prefix / "bin/python"
+    probe = {
+        "installed": "0.1.0",
+        "runtime": "0.1.0",
+        "prefix": str(prefix),
+        "module": str(prefix / "lib/site-packages/swarm_arena/__init__.py"),
+        "metadata_root": str(prefix / "lib/site-packages"),
+    }
+    if wrong_path in probe:
+        probe[wrong_path] = str(tmp_path / "checkout")
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert command[:3] == [str(python), "-I", "-c"]
+        assert list(Path(kwargs["cwd"]).iterdir()) == []
+        assert kwargs["env"] == {"PATH": str(python.parent), "PYTHONUTF8": "1"}
+        return subprocess.CompletedProcess(command, int(wrong_path == "failure"), json.dumps(probe))
+
+    monkeypatch.setattr(subprocess, "run", run)
+    if wrong_path is None:
+        assert _installed_release(python) == ("0.1.0", "0.1.0")
+    else:
+        with pytest.raises(ValueError, match="release"):
+            _installed_release(python)
+
+
+def test_release_guard_errors_do_not_echo_values(tmp_path: Path) -> None:
+    dist = _release_fixture(tmp_path)
+    secret = "sentinel-private-release-input"
+    with pytest.raises(ValueError, match="release tag") as caught:
+        _release_record(tmp_path, dist, secret, "a" * 40, "0.1.0", "0.1.0", "0.1.0")
+    error = caught.value
+    assert secret not in str(error)
+    assert secret not in repr(error)
+    assert secret not in repr(error.args)
+    assert secret not in repr(getattr(error, "__notes__", []))
+    assert error.__cause__ is None
+    assert secret not in "".join(traceback.format_exception(error))
+
+
+def test_releasing_checklist() -> None:
+    text = (REPO / "RELEASING.md").read_text(encoding="utf-8").lower()
+    for phrase in (
+        "trusted publisher",
+        "release.yml",
+        "environment `pypi`",
+        "uv version",
+        "CHANGELOG.md",
+        "uv build",
+        "twine check",
+        "git tag -a v",
+        "git push origin v",
+        "go-ahead",
+        "yank",
+        "required reviewer",
+        "v*",
+        "exact commit",
+        "headsha",
+        "conclusion",
+        "sha256",
+        "already-prepared",
+        "second 0.1.0",
+        "fallback",
+        "sees 0.1.0 on pypi",
+        "test_readme_quickstart",
+        "sdist",
+        "empty",
+        "--check-release",
+    ):
+        assert phrase.lower() in text
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Record the installed canary versions")
-    parser.add_argument("--record-upstream", type=Path, required=True)
-    _record_upstream_versions(parser.parse_args().record_upstream)
+    parser = argparse.ArgumentParser(description="Offline workflow validation helpers")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--record-upstream", type=Path)
+    mode.add_argument("--check-release", action="store_true")
+    parser.add_argument("--dist", type=Path)
+    parser.add_argument("--tag")
+    parser.add_argument("--commit")
+    parser.add_argument("--wheel-python", type=Path)
+    parser.add_argument("--record", type=Path)
+    args = parser.parse_args()
+    if args.record_upstream is not None:
+        _record_upstream_versions(args.record_upstream)
+    else:
+        if any(
+            value is None
+            for value in (args.dist, args.tag, args.commit, args.wheel_python, args.record)
+        ):
+            parser.error("release checks require dist, tag, commit, wheel-python and record")
+        _check_release(args.dist, args.tag, args.commit, args.wheel_python, args.record)
