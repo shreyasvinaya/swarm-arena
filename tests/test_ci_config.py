@@ -245,6 +245,40 @@ def steps_uses(job: dict[str, Any]) -> list[str]:
     return [step["uses"] for step in job["steps"] if "uses" in step]
 
 
+def shell_words(line: str) -> list[str]:
+    """
+    Split one shell line into words, with comments as bash reads them.
+
+    Bash starts a comment only at the start of a word, so ``a#||b`` still runs
+    ``b``. Control operators become separate words so callers can reject them.
+
+    Parameters
+    ----------
+    line : str
+        One shell line.
+
+    Returns
+    -------
+    list of str
+        The words before the first comment.
+
+    Examples
+    --------
+    >>> shell_words("uv sync --locked # install")
+    ['uv', 'sync', '--locked']
+    >>> shell_words("cmd --help#||true")
+    ['cmd', '--help#', '||', 'true']
+    """
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    words = list(lexer)
+    for index, word in enumerate(words):
+        if word.startswith("#"):
+            return words[:index]
+    return words
+
+
 def shell_command(run: str) -> list[str]:
     """
     Parse one simple command line, discarding shell comments.
@@ -277,9 +311,7 @@ def shell_command(run: str) -> list[str]:
     """
     if "\n" in run.strip() or "\r" in run.strip():
         raise ValueError("expected one simple shell command")
-    lexer = shlex.shlex(run, posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
-    command = list(lexer)
+    command = shell_words(run)
     if any(set(argument) & set(";&|<>()$`{}") for argument in command):
         raise ValueError("unsupported shell syntax")
     return command
@@ -914,6 +946,24 @@ def _check_release(dist: Path, tag: str, commit: str, python: Path, record: Path
     record.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+@pytest.mark.parametrize(
+    ("line", "words"),
+    [
+        ("uv sync --locked # install", ["uv", "sync", "--locked"]),
+        ("cmd --help#||true", ["cmd", "--help#", "||", "true"]),
+        ("cmd -v#;true", ["cmd", "-v#", ";", "true"]),
+    ],
+)
+def test_shell_words_start_comments_only_at_a_word(line: str, words: list[str]) -> None:
+    # Bash starts a comment only at the start of a word, so `a#||b` still runs `b`.
+    assert shell_words(line) == words
+
+
+def test_shell_command_rejects_operators_after_a_hash_in_a_word() -> None:
+    with pytest.raises(ValueError, match="unsupported shell syntax"):
+        shell_command("uv sync --locked --group docs#||true")
+
+
 def test_release_triggers() -> None:
     on = triggers(load_yaml(RELEASE))
     assert on == {"push": {"tags": ["v*"]}, "pull_request": None, "workflow_dispatch": None}
@@ -923,9 +973,7 @@ def _release_shell_lines(script: str) -> list[list[str]]:
     """Tokenize continued shell lines without hiding control operators."""
     commands = []
     for line in script.replace("\\\n", "").splitlines():
-        lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        tokens = list(lexer)
+        tokens = shell_words(line)
         if tokens:
             commands.append(tokens)
     return commands
@@ -955,7 +1003,7 @@ def test_release_build_job_checks_the_wheel() -> None:
     commands = [shell_command(s) for s in steps_run(job) if s.startswith("uv sync ")]
     assert commands == [["uv", "sync", "--locked", "--all-groups"]]
     assert [
-        shlex.split(run, comments=True)
+        shell_words(run)
         for run in steps_run(job)
         if run.startswith(("uv build ", "uvx twine ", "uv run --no-sync pytest "))
     ] == [
