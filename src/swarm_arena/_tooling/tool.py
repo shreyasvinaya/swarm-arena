@@ -415,7 +415,22 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        >>> output = tool.collect(request, workspace, run)  # doctest: +SKIP
+        >>> from datetime import UTC, datetime
+        >>> from pathlib import Path
+        >>> from swarm_arena.tool import Command, CompletedRun, Tool, ToolOutput, ToolRequest
+        >>> class ExampleTool(Tool):
+        ...     def command(self, request: ToolRequest, workspace: Path) -> Command:
+        ...         return Command(argv=["echo", "example"])
+        ...     def collect(self, request: ToolRequest, workspace: Path,
+        ...                 run: CompletedRun) -> ToolOutput:
+        ...         return ToolOutput(status=run.status, data={"returncode": run.returncode})
+        >>> now = datetime(2026, 10, 18, tzinfo=UTC)
+        >>> run = CompletedRun(returncode=0, status="ok",
+        ...     stdout_path=Path("stdout"), stderr_path=Path("stderr"),
+        ...     started_at=now, ended_at=now)
+        >>> output = ExampleTool().collect(ToolRequest(), Path("."), run)
+        >>> output.status.value, output.data
+        ('ok', {'returncode': 0})
         """
 
     def _own_files(self) -> dict[str, str]:
