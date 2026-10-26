@@ -44,7 +44,7 @@ def test_required_facts() -> None:
 def test_arena_has_no_stale_milestone_or_install_promises() -> None:
     text = page_path("The arena").read_text(encoding="utf-8")
     assert "for M3/M4" not in text
-    assert "swarm-arena[s3] @ git+https://github.com/shreyasvinaya/swarm-arena" in text
+    assert "swarm-arena[s3]" in text
 
 
 def test_board_serve_is_not_executed(tmp_path: Path) -> None:

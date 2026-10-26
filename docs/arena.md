@@ -249,8 +249,11 @@ Each of `run_root`, `arena_root`, and `artifact_root` can be a local path or an
 `s3://bucket/prefix` root. Install S3 support with:
 
 ```console
-uv add 'swarm-arena[s3] @ git+https://github.com/shreyasvinaya/swarm-arena'
+uv add "swarm-arena[s3]"
 ```
+
+See the [installation fallback](https://github.com/shreyasvinaya/swarm-arena#install)
+until 0.1.0 is on PyPI.
 
 For example, set the roots in your run configuration:
 
@@ -396,7 +399,7 @@ paid curation. Curation does not change join-retry or pending-replan state.
 ### LLM curator
 
 Install the optional integration with
-`uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`,
+`uv add "swarm-arena[llm]"`,
 then configure an approved model with the `curator` role:
 
 <!-- docs-test: requires llm -->

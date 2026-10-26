@@ -688,8 +688,10 @@ worker-image and module-path setup.
 In a separate connector repository, provide an equivalent cluster fixture
 (the test fixtures are not a public installed API), or connect to a cluster
 your CI already owns. Put the connector in the uv project's dependencies;
-until the first release, add the package with
-`uv add "swarm-arena[ray,llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`.
+add the package with
+`uv add "swarm-arena[ray,llm]"`.
+See the [installation fallback](https://github.com/shreyasvinaya/swarm-arena#install)
+until 0.1.0 is on PyPI.
 Use your connector test paths in the job. A Ray tool case takes this form,
 using the `RouteTool` from this guide:
 
@@ -752,7 +754,7 @@ record which environment was exercised.
 ### Testing managers and judges offline
 
 Install the optional SDK with
-`uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`. Importing
+`uv add "swarm-arena[llm]"`. Importing
 `swarm_arena.testing` itself does not load the SDK; accessing `FakeModel` or
 `FakeTurn` loads it. No API key is needed for scripted calls:
 

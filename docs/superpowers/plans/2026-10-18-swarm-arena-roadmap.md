@@ -439,6 +439,7 @@ M3 invocation and integration additions to R3.1 (these extend the existing modul
 | `tests/test_compat.py` | §9 rules 2, 3: frozen abstract methods, no I/O in `__init__`, newer `schema_version` refused | M5 |
 | `tests/test_ci_config.py` | Shared safe YAML/workflow helpers and Read the Docs configuration parity with the locked docs CI job | M5 |
 | `tests/_docs.py` | Shared docs block parser/runner, target-interpreter dependency probes (complete LLM dependencies), minimal no-key environment, per-worker Sphinx fixture, required-facts helper and stub pattern | M5 |
+| `tests/test_packaging.py` | Wheel contents and metadata, version agreement, changelog format, M5 | M5 |
 | `tests/test_docs.py` | Existing documentation regressions plus docs code-block harness, site structure, required facts, README quickstart, M5 | M1b (+M2 +M3 +M4 +M5) |
 | `tests/test_docs_getting_started.py` | Page-specific required facts and executable documentation regressions for `getting-started` | M5 |
 | `tests/test_docs_concepts.py` | Page-specific required facts and executable documentation regressions for `concepts` | M5 |
@@ -3152,9 +3153,9 @@ These artifact models are distinct from
 
 - **Python:** 3.11 or newer, **POSIX** only (no Windows). `requires-python = ">=3.11"`.
 - **Async:** the anyio API on the **asyncio backend only** (§4.8). Tests pin `anyio_backend = "asyncio"`. `Swarm` raises on another backend. The CLI uses `anyio.run(..., backend="asyncio")`.
-- **Core dependencies:** `anyio>=4.15,<5`, `pydantic>=2`, `typing-extensions`. [plan] lower bounds: `pydantic>=2.11,<3`, `typing-extensions>=4.12`. `fsspec` (§7, §11) is not a direct core dependency; it comes with the `s3` extra through `s3fs` (deviation, R5.4 item 13).
+- **Core dependencies:** `anyio>=4.15,<5`, `pydantic>=2`, `typing-extensions`. Tested lower bounds: `pydantic>=2.14.0,<3`, `typing-extensions>=4.16.0`. `fsspec` (§7, §11) is not a direct core dependency; it comes with the `s3` extra through `s3fs` (deviation, R5.4 item 13).
 - **Extras:** `llm`: `openai-agents[litellm]>=0.24,<0.25` and `litellm>=1.107.0rc2,<1.108` (Ruling P39; R5.4 item 20; with `!=` pins for bad releases; an upper bound is raised only after the weekly upstream job passes on the newer release). `cache`: `litellm[caching,proxy]>=1.107.0rc2,<1.108`. `ray`: `ray[default]>=2.59,<3`. `s3`: `s3fs>=2023.12.1`, `aiobotocore>=2.16.0` (floors from M2 task 1). `langfuse`: `langfuse>=5,<6`, `openinference-instrumentation-openai-agents`. `a2a`: v2 (not declared in v1). The gateway client uses only the stdlib (`urllib`).
-- **Docs:** sphinx, sphinx-rtd-theme, numpydoc, myst-parser. [plan] `sphinx>=9.0,<10` (the 3.11 floor locks 9.0.x; RTD builds on 3.13), `sphinx-rtd-theme>=3.1`, `numpydoc>=1.11`, `myst-parser>=4`.
+- **Docs:** sphinx, sphinx-rtd-theme, numpydoc, myst-parser. [plan] `sphinx>=9.0,<10` (the 3.11 floor locks 9.0.x; RTD builds on 3.13), `sphinx-rtd-theme>=3.1`, `numpydoc>=1.11`, `myst-parser>=5.0.0`.
 - **Tooling:** uv (`uv init --lib`, src layout, `py.typed`, build backend `uv_build>=0.13.1,<0.14`), ruff with numpy docstring rules, ty pinned exactly, pytest 9 with anyio's plugin and `anyio_mode = "auto"`, `-W error::DeprecationWarning`, an `__all__` snapshot test per public module.
 - **The core never imports** `agents`, `litellm`, `ray`, `s3fs`, `langfuse`, or `a2a`. A tool program is never imported by the core or the driver, except a `FunctionTool` function (R5.4 item 12). Managers, judges, planners, and the board run in the driver; only tool runs and `ctx.execute` go to the executor.
 - **Never use `uv run`** to start a tool (it cannot forward SIGKILL). Call the venv's Python directly.

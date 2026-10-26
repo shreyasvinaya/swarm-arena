@@ -13,7 +13,8 @@ LLM gateway gives tool runs virtual keys and supports post-run reconciliation;
 the pinned LiteLLM profile provides
 [soft caps and estimated spend only](limits-and-safety.md#llm-gateway-hard-and-soft-caps).
 
-Keep using the documented GitHub installation until the first release. The
+Use the [installation guidance](getting-started.md#install), including its
+source fallback until 0.1.0 is on PyPI. The
 [offline kit](own-files.md#try-it-offline) remains available without model or
 cluster integrations.
 

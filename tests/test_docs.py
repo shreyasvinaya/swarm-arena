@@ -53,47 +53,99 @@ GUIDES = sorted(
     path for path in (ROOT / "docs").glob("*.md") if path.name != "writing-a-connector.md"
 )
 ROADMAP = Path("docs/superpowers/plans/2026-10-18-swarm-arena-roadmap.md")
-BARE_OPTIONAL_INSTALL = re.compile(
-    r"\b(?:uv\s+add|(?:uv\s+)?pip(?:3)?\s+install)\s+[\"']?"
-    r"swarm-arena\[(?:llm|cache|langfuse|ray)[^\]]*\](?!\s+@\s+git\+)"
+INSTALL_COMMAND = re.compile(
+    r"(?P<command>uv\s+add|(?:uv\s+)?pip3?\s+install|--pip)\s+"
+    r"(?P<upgrade>--upgrade\s+)?(?P<quote>[\"']?)"
+    r"(?P<requirement>swarm-arena(?:\[[^\]]+\])?(?:\s+@\s+[^\s\"'`]+)?)"
+    r"(?P=quote)"
+)
+INSTALL_GUIDANCE = "https://github.com/shreyasvinaya/swarm-arena#install"
+FALLBACK = (
+    "If 0.1.0 is not on PyPI yet, use "
+    '`uv add "swarm-arena @ git+https://github.com/shreyasvinaya/swarm-arena"`'
+    " (add the desired extras inside the quoted requirement)."
 )
 
 
-def test_optional_install_examples_use_prerelease_uv() -> None:
-    source = "git+https://github.com/shreyasvinaya/swarm-arena"
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    for extra in ("llm", "cache", "langfuse"):
-        assert f'uv add "swarm-arena[{extra}] @ {source}"' in readme
-    assert f"uv add 'swarm-arena[ray] @ {source}'" in readme
-    concepts = re.sub(r"\s+", " ", (ROOT / "docs/concepts.md").read_text(encoding="utf-8"))
-    for extras in ("llm", "llm,cache"):
-        assert f'uv add "swarm-arena[{extras}] @ {source}"' in concepts
-    stale: list[str] = []
-    for directory in (ROOT / "docs", ROOT / "src"):
-        for path in sorted(directory.rglob("*")):
-            if path.suffix not in {".md", ".rst", ".py"}:
-                continue
-            if ROOT / "docs/superpowers" in path.parents:
-                continue
-            text = path.read_text(encoding="utf-8")
-            for match in BARE_OPTIONAL_INSTALL.finditer(text):
-                line = text.count("\n", 0, match.start()) + 1
-                stale.append(f"{path.relative_to(ROOT)}:{line}")
-    assert not stale, "Bare optional install commands: " + ", ".join(stale)
+def _install_violations(text: str, *, python: bool = False) -> list[str]:
+    # AST constants fold adjacent string literals, including multiline hints.
+    if python:
+        text = "\n".join(
+            node.value
+            for node in ast.walk(ast.parse(text))
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        )
+    violations = []
+    for match in INSTALL_COMMAND.finditer(text):
+        requirement = match["requirement"]
+        command = " ".join(match["command"].split())
+        if (
+            command not in {"uv add", "--pip"}
+            or "@" in requirement
+            or ("[" in requirement and match["quote"] != '"')
+            or ("[" not in requirement and bool(match["quote"]))
+        ):
+            violations.append(match.group())
+    # Catch old requirements even without a command in the same literal.
+    if re.search(r"swarm-arena(?:\[[^\]]+\])?\s+@\s+git\+", text):
+        violations.append("GitHub requirement")
+    return violations
 
 
-@pytest.mark.parametrize("command", ["pip install", "pip3 install", "uv pip install", "uv add"])
+def test_install_examples_and_hints_use_one_release_form() -> None:
+    readme = README.read_text(encoding="utf-8")
+    assert readme.count(FALLBACK) == 1
+    for extra in ("llm", "cache", "ray", "s3", "langfuse"):
+        assert f'uv add "swarm-arena[{extra}]"' in readme
+    paths = [
+        README,
+        *(ROOT / "docs").rglob("*.md"),
+        *(ROOT / "docs").rglob("*.rst"),
+        *(ROOT / "src").rglob("*.py"),
+    ]
+    stale: dict[str, list[str]] = {}
+    for path in paths:
+        if {"superpowers", "_build"} & set(path.relative_to(ROOT).parts):
+            continue
+        text = path.read_text(encoding="utf-8")
+        if path == README:
+            text = text.replace(FALLBACK, "", 1)
+        violations = _install_violations(text, python=path.suffix == ".py")
+        if violations:
+            stale[str(path.relative_to(ROOT))] = violations
+    assert not stale, stale
+
+
+@pytest.mark.parametrize(
+    "extras", ["", "llm", "cache", "ray", "s3", "langfuse", "llm,cache", "ray,llm"]
+)
 @pytest.mark.parametrize("quote", ["", "'", '"'])
-@pytest.mark.parametrize("extras", ["ray", "llm", "llm,cache", "langfuse"])
-def test_bare_optional_install_guard_matches_quoted_extras(
-    command: str, quote: str, extras: str
-) -> None:
-    assert BARE_OPTIONAL_INSTALL.search(f"{command} {quote}swarm-arena[{extras}]{quote}")
+@pytest.mark.parametrize("command", ["uv add", "pip install", "pip3 install", "uv pip install"])
+def test_install_guard_rejects_mixed_forms(command: str, quote: str, extras: str) -> None:
+    requirement = "swarm-arena" + (f"[{extras}]" if extras else "")
     source = "git+https://github.com/shreyasvinaya/swarm-arena"
-    assert not BARE_OPTIONAL_INSTALL.search(f'{command} "swarm-arena[{extras}] @ {source}"')
+    assert _install_violations(f"{command} {quote}{requirement} @ {source}{quote}")
+    violations = _install_violations(f"{command} {quote}{requirement}{quote}")
+    valid = command == "uv add" and quote == ('"' if extras else "")
+    assert bool(violations) is not valid
 
 
-def test_ray_missing_extra_hint_uses_prerelease_uv(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("upgrade", ["", "--upgrade "])
+def test_install_guard_accepts_release_and_upgrade_forms(upgrade: str) -> None:
+    assert not _install_violations(f'uv add {upgrade}"swarm-arena[s3]"')
+    assert not _install_violations('--pip "swarm-arena[ray]"')
+
+
+def test_install_guard_folds_multiline_python_literals() -> None:
+    source = "git+https://github.com/shreyasvinaya/swarm-arena"
+    stale = f"HINT = ('uv add ' \n    '\"swarm-arena[llm,cache] @ {source}\"')"
+    assert _install_violations(stale, python=True)
+    assert not _install_violations(stale.replace(f" @ {source}", ""), python=True)
+    assert _install_violations('uv add\n"swarm-arena[ray] @ ' + source + '"')
+    assert _install_violations('uv add "swarm-arena[llm]"; pip install swarm-arena')
+
+
+def test_ray_missing_extra_hint_uses_release_uv(monkeypatch: pytest.MonkeyPatch) -> None:
     def missing(name: str) -> str:
         assert name == "ray"
         raise importlib.metadata.PackageNotFoundError(name)
@@ -104,7 +156,7 @@ def test_ray_missing_extra_hint_uses_prerelease_uv(monkeypatch: pytest.MonkeyPat
     assert caught.value.name == "ray"
     assert str(caught.value) == (
         "swarm_arena.ray needs the 'ray' extra: uv add "
-        '"swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena"'
+        '"swarm-arena[ray]"; see https://github.com/shreyasvinaya/swarm-arena#install'
     )
     assert caught.value.__cause__ is None
 
@@ -190,7 +242,8 @@ def test_registry_describes_default_files_and_callback_ownership() -> None:
 
 def test_changelog_describes_one_initial_release() -> None:
     text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert re.findall(r"^## .+$", text, re.MULTILINE) == ["## [0.1.0] - Unreleased"]
+    assert re.findall(r"^## \[([^\]]+)\]", text, re.MULTILINE) == ["Unreleased", "0.1.0"]
+    assert re.search(r"^## \[0\.1\.0\] - \d{4}-\d{2}-\d{2}$", text, re.MULTILINE)
     assert re.findall(r"^### .+$", text, re.MULTILINE) == ["### Added"]
     assert "swarm_arena._" not in text
 
@@ -204,13 +257,16 @@ def test_quickstarts_distinguish_release_and_source_installs(
 ) -> None:
     text = (ROOT / relative_path).read_text(encoding="utf-8")
     section = text.split(f"## {heading}\n", 1)[1].split("\n## ", 1)[0]
-    release, prerelease = section.split("Before the first release", 1)
-    assert "For releases" in release
-    assert "```sh\nuv add swarm-arena\n```" in release
-    assert 'uv add "swarm-arena @ git+https://github.com/shreyasvinaya/swarm-arena"' in prerelease
+    assert "```sh\nuv add swarm-arena\n```" in section
+    if relative_path == "README.md":
+        assert FALLBACK in section
+        assert "name-reservation placeholder" in section
+    else:
+        assert INSTALL_GUIDANCE in section
+        assert "until 0.1.0 is on PyPI" in section
     assert (
         "git clone https://github.com/shreyasvinaya/swarm-arena && cd swarm-arena && uv sync"
-        in prerelease
+        in section
     )
 
 

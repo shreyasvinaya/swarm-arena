@@ -12,7 +12,8 @@ goals, each on its own goal → teams → agents tree, and returns the best answ
                                         (survivors) ──┘
 ```
 
-Install from source before the first release: `uv add "swarm-arena @ git+https://github.com/shreyasvinaya/swarm-arena"`.
+Install with `uv add swarm-arena`; see [Getting started](getting-started.md#install)
+for the source-install fallback until 0.1.0 is on PyPI.
 
 ```{toctree}
 :maxdepth: 2
