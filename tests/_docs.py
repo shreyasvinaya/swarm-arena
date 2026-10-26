@@ -301,7 +301,9 @@ def _execute(
                 observer.join(60)
                 assert not observer.is_alive(), "docs-test exit observer did not finish"
             try:
-                recorded.update(snapshot_process_tree(process.pid))
+                # A reaped driver's pid may already belong to an unrelated tree.
+                if process.returncode is None:
+                    recorded.update(snapshot_process_tree(process.pid))
             finally:
                 try:
                     reap_process_tree(process, started, recorded)

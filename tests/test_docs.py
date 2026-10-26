@@ -1082,3 +1082,77 @@ def test_connector_executable_examples_do_not_require_pytest() -> None:
         if (isinstance(node, ast.Import) and any(n.name == "pytest" for n in node.names))
         or (isinstance(node, ast.ImportFrom) and node.module == "pytest")
     ] == []
+
+
+def test_execute_does_not_adopt_reused_root_after_driver_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from io import StringIO
+    from unittest.mock import Mock
+
+    import _docs
+    from _fakes import process_cleanup
+    from _fakes.process_cleanup import ProcessIdentity
+
+    original = ProcessIdentity(6000, 1, 6000, "original driver")
+    replacement = {
+        6000: ProcessIdentity(6000, 1, 6000, "unrelated replacement"),
+        6001: ProcessIdentity(6001, 6000, 6001, "unrelated child"),
+    }
+    table = {original.pid: original}
+    process = Mock(spec=subprocess.Popen)
+    process.pid = original.pid
+    process.returncode = None
+    process.stdout, process.stderr = StringIO(), StringIO()
+    gates: list[Path] = []
+    signals: list[int] = []
+    snapshots: list[str] = []
+
+    def command_gate(command: list[str], ready: Path, release: Path) -> list[str]:
+        gates.extend((ready, release))
+        return command
+
+    def communicate(*, timeout: float) -> tuple[str, str]:
+        assert timeout == 60
+        ready, release = gates
+        ready.touch()
+        deadline = time.monotonic() + 60
+        while not release.exists():
+            assert time.monotonic() < deadline, "exit observer did not release the fake driver"
+            time.sleep(0.01)
+        # communicate reaps the original; its pid is now owned by an unrelated tree.
+        process.returncode = 0
+        table.clear()
+        table.update(replacement)
+        return "driver output", ""
+
+    def snapshot(pid: int) -> dict[int, ProcessIdentity]:
+        snapshots.append(table[pid].started)
+        return process_cleanup.snapshot_process_tree(pid)
+
+    def signal_group(pgid: int, sig: int) -> None:
+        assert sig == signal.SIGKILL
+        signals.append(pgid)
+        for pid in list(table):
+            if table[pid].pgid == pgid:
+                del table[pid]
+
+    process.communicate.side_effect = communicate
+    monkeypatch.setattr(_docs, "_exit_gate", command_gate)
+    monkeypatch.setattr(_docs.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(_docs, "process_start_time", lambda pid: original.started)
+    monkeypatch.setattr(_docs, "snapshot_process_tree", snapshot)
+    monkeypatch.setattr(process_cleanup, "process_table", lambda: dict(table))
+    monkeypatch.setattr(process_cleanup, "reap_children", lambda children: [])
+    monkeypatch.setattr(process_cleanup.os, "getpgrp", lambda: 0)
+    monkeypatch.setattr(process_cleanup.os, "killpg", signal_group)
+
+    assert _docs._execute(
+        [str(docs_bindir() / "python"), "-c", "pass"],
+        workdir=tmp_path,
+        env=block_env(tmp_path, docs_bindir()),
+        timeout_s=60,
+    ) == (0, "driver output", "")
+    assert signals == []
+    assert snapshots == [original.started]
+    assert table == replacement
