@@ -65,9 +65,8 @@ async def test_review_roundtrip(finished_run: FinishedRun, tmp_path: Path) -> No
     assert _ids(ordinary) == exported
 
 
-@pytest.mark.parametrize(
-    ("document", "heading"), [("README.md", "The arena"), ("docs/arena.md", "Command line")]
-)
+# The README's run/view/share quickstart is covered by tests/test_docs.py::test_readme_quickstart.
+@pytest.mark.parametrize(("document", "heading"), [("docs/arena.md", "Command line")])
 def test_documented_arena_commands_run_as_written(
     tmp_path: Path, document: str, heading: str
 ) -> None:
@@ -77,14 +76,16 @@ def test_documented_arena_commands_run_as_written(
     from contextlib import suppress
 
     root = Path(__file__).resolve().parents[2]
-    section = (root / document).read_text().split(f"## {heading}\n", 1)[1]
-    block = section.split("```sh\n", 1)[1].split("```", 1)[0]
+    section = (root / document).read_text(encoding="utf-8").split(f"## {heading}\n", 1)[1]
+    fence = re.search(r"^```(sh|bash)\n(.*?)^```", section, flags=re.MULTILINE | re.DOTALL)
+    assert fence is not None, f"{document}: no sh or bash block under {heading}"
+    shell, block = fence.group(1), fence.group(2)
     example = tmp_path / "examples" / "rosenbrock"
     shutil.copytree(root / "examples" / "rosenbrock", example)
     environment = dict(os.environ, UV_PROJECT=str(root), UV_NO_SYNC="1")
     environment.pop("PYTHONPATH", None)
     process = subprocess.Popen(
-        ["sh", "-eu", "-c", block],
+        [shell, "-eu", "-c", block],
         cwd=tmp_path,
         env=environment,
         stdout=subprocess.PIPE,
