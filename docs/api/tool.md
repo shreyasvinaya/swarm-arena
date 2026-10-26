@@ -23,6 +23,7 @@ The staged request contains `schema_version`, `params` (the tool request's input
 `round`, `round_overrides`, and `replicate`. A script writes its result to the path
 in `SWARM_ARENA_RESULT`, normally `swarm/result.json`:
 
+<!-- docs-test: file write_result.py -->
 ```python
 import json
 import os

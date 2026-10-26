@@ -102,12 +102,26 @@ Use the run directory printed by the CLI. Its
 with a `candidate` and its recorded `scores`. For this deterministic objective,
 read the objective from the candidate's output data:
 
+<!-- docs-test: run -->
+```bash
+swarm-arena run --yes examples/rosenbrock/run.toml examples/rosenbrock/plan.toml > run-output.txt
+cat run-output.txt
+```
+
 ```python
 import json
 from pathlib import Path
 
-run_dir = Path(".swarm-arena/runs/<run-id>")  # replace with the printed directory
-solution = json.loads((run_dir / "goals/rosenbrock/solution.json").read_text())
+run_line = next(
+    line
+    for line in Path("run-output.txt").read_text(encoding="utf-8").splitlines()
+    if line.startswith("run ") and " at " in line
+)
+run_dir = Path(run_line.split(" at ", 1)[1])
+solution_path = run_dir / "goals/rosenbrock/solution.json"
+solution = json.loads(solution_path.read_text(encoding="utf-8"))
+assert solution["status"] == "ok"
+assert solution["finalists"]
 print(solution["status"])
 for finalist in solution["finalists"]:
     candidate = finalist["candidate"]
