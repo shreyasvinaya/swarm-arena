@@ -4,7 +4,7 @@
 
 Install the optional runtime with uv:
 
-```sh
+```bash
 uv add "swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena"
 ```
 
@@ -22,7 +22,7 @@ Cluster authentication and worker dependency provisioning are separate setup ste
 
 ## Worker environments and nodes
 
-Every worker needs `swarm-arena[ray]`, the connector package, and the tool's
+All worker nodes need `swarm-arena[ray]`, the connector package, and the tool's
 own environment. Bake these into the worker image or install them on each VM.
 The tool's configured Python interpreter runs as a **subprocess** of the Ray
 worker; `runtime_env.py_executable` is not used. Its interpreter path and
@@ -38,7 +38,7 @@ arbitrary absolute driver import root exists on every node.
 
 With dependencies and authentication provisioned, start a head and join VMs:
 
-```sh
+```bash
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 uv run ray start --head --include-dashboard=true --disable-usage-stats
 # On each worker VM (replace <head> with the head node's hostname):
@@ -48,7 +48,7 @@ uv run ray start --address=<head>:6379 --disable-usage-stats
 The dashboard defaults to localhost. For submission from a laptop, keep an SSH
 forward open in a separate terminal (replace `<head>` with your SSH host):
 
-```sh
+```bash
 ssh -N -L 8265:127.0.0.1:8265 <head>
 ```
 
@@ -71,7 +71,7 @@ environment. Alternatively, provide `secrets.file` at the configured path on
 each node. Restrict secret-using jobs
 to nodes carrying a named resource:
 
-```sh
+```bash
 uv run ray start --address=<head>:6379 --resources='{"llm_keys": 1}' --disable-usage-stats
 ```
 
@@ -86,7 +86,7 @@ Ray Job. The Ray executor connects from that driver with
 `ray.init(address="auto")`; Ray Client (`ray://`) is not used. Check the
 estimate locally before approving unattended execution:
 
-```sh
+```bash
 swarm-arena plan run.toml plan.toml
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 swarm-arena submit --address http://127.0.0.1:8265 --working-dir . --yes run.toml plan.toml
@@ -115,7 +115,7 @@ The worker image or repeatable `--pip SPEC` options must provide
 `swarm-arena[ray]` and the connector package, including the `swarm-arena`
 console script. For example, before the first release:
 
-```sh
+```bash
 swarm-arena submit --address http://127.0.0.1:8265 --working-dir . \
   --pip 'swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena' \
   --pip deepretro-swarm --yes run.toml plan.toml
@@ -197,6 +197,30 @@ can be retried by a later caller, after the previous attempt has finished.
 The abandoned caller cannot dispatch work after its lifetime ends. `aclose()`
 leaves the shared Ray connection open and never calls `ray.shutdown()`.
 
+You can construct and serialize a configuration without connecting to Ray or
+opening storage. This example needs the `ray` extra, but no cluster or AWS
+credentials:
+
+<!-- docs-test: requires ray -->
+```python
+from swarm_arena import RunConfig
+from swarm_arena.ray import RayExecutor
+
+config = RunConfig(
+    executor=RayExecutor(),
+    run_root="s3://bucket/runs",
+    arena_root="s3://bucket/arena",
+    artifact_root="s3://bucket/artifacts",
+)
+print(config.dumps())
+```
+
+For an actual multi-node run, provision the buckets, credentials, and
+[S3 support](arena.md#storage-on-s3) on the driver and workers. Use a shared
+`artifact_root` on `s3://` so workers can read inputs and publish outputs, and
+keep the run journals reachable from every arena reader. The cluster commands
+in this guide are deployment recipes; the offline examples do not start Ray.
+
 ### Initialization warning
 
 Ray may log `SIGTERM handler is not set because current thread is not the main
@@ -205,8 +229,9 @@ stays off the event loop so it cannot block lease renewal or cancellation.
 
 ### Dispatch, resources and cancellation
 
-Each job gets one task named with its job ID. When provided, `on_started`
-receives the dispatch intent and original Ray driver job ID before submission.
+Each job gets one task named with its job ID, with `max_retries=0` and
+`max_calls=1`: Ray does not retry paid work, and a worker handles only one task
+before exiting. When provided, `on_started` receives the dispatch intent and original Ray driver job ID before submission.
 A failed callback prevents submission. Payload serialization and `ray.put`
 finish in an abandonable preparation worker before that intent; the event loop
 submits the resulting object reference. Tasks are not resubmitted after a Ray
@@ -330,6 +355,14 @@ or `runtime_env`. Workers need network access to the proxy URL. A loopback URL
 works only when the proxy is on the same host as the calling process; use the
 cluster-reachable proxy address for distributed workers.
 
+Hard USD caps require a verified **strict profile**: budget reservations enabled,
+enforcement that fails closed on stale or unavailable counters, only priced
+models on supported routes, a per-key output-token ceiling, an enforced maximum
+request duration no greater than `request_timeout_s`, and required virtual-key
+use. Preflight checks these capabilities; a configuration flag cannot assert
+that the proxy implements them. Pin the proxy's model cost map. Even with this
+profile, gateway caps are in USD, not total tokens.
+
 **The pinned LiteLLM 1.107.0rc2 profile provides soft caps and estimated spend
 only.** It cannot verify a per-key output-token ceiling, a maximum total request
 duration, or required virtual-key use, and its settings introspection is
@@ -418,10 +451,11 @@ storage, and never put secrets in Ray `runtime_env`.
 Configure LiteLLM Proxy's own `cache` and `langfuse` callback settings for
 caching and tracing **tool-internal** calls, with their credentials provisioned
 on the proxy. The driver's response cache and Langfuse setup do not configure
-an arbitrary subprocess or the external proxy. Apply an outbound network rule
-that blocks workers from provider hosts while allowing the proxy; otherwise a
-tool with a hard-coded provider URL can go around it. The proxy needs its own
-provider egress.
+an arbitrary subprocess or the external proxy.
+
+Blocking outbound traffic from workers to provider hosts
+closes the hard-coded-provider-URL bypass; allow workers to reach the proxy.
+This is the owner's network setting. The proxy needs its own provider egress.
 
 ### Reconcile gateway spend
 
@@ -429,7 +463,7 @@ Run completion makes a bounded reconciliation attempt. To retry later, use
 the addressed run directory and its original gateway configuration. Replace
 `example-id` with your run's ID:
 
-```sh
+```bash
 swarm-arena reconcile runs/example-id
 # Optional explicit configuration, retaining the original gateway URL:
 swarm-arena reconcile runs/example-id --config run.toml
