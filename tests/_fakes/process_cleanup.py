@@ -3,8 +3,10 @@
 import os
 import signal
 import subprocess
+import time
 from collections.abc import Iterator
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
@@ -104,3 +106,146 @@ def owned_processes(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         errors = reap_children(children)
         assert not leaked, "test left an owned child alive; emergency cleanup ran"
         assert not errors, "; ".join(errors)
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    """A process-table identity and its parent/group ownership links."""
+
+    pid: int
+    ppid: int
+    pgid: int
+    started: str
+
+
+def process_table() -> dict[int, ProcessIdentity]:
+    """
+    Snapshot process identities and ownership links with one bounded ps call.
+
+    Returns
+    -------
+    dict of int to ProcessIdentity
+        Process ids mapped to start times, parents and groups.
+
+    Examples
+    --------
+    >>> process_table()[os.getpid()].pid == os.getpid()
+    True
+    """
+    done = subprocess.run(
+        ["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "lstart="],
+        env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
+        capture_output=True,
+        encoding="utf-8",
+        timeout=10,
+        check=False,
+    )
+    if done.returncode:
+        raise AssertionError("owned process table unavailable")
+    result = {}
+    for line in done.stdout.splitlines():
+        pid, ppid, pgid, started = line.split(maxsplit=3)
+        record = ProcessIdentity(int(pid), int(ppid), int(pgid), started.strip())
+        result[record.pid] = record
+    return result
+
+
+def snapshot_process_tree(pid: int) -> dict[int, ProcessIdentity]:
+    """
+    Record a driver's entire transitive descendant tree before sending signals.
+
+    Parameters
+    ----------
+    pid : int
+        Owned driver's process id.
+
+    Returns
+    -------
+    dict of int to ProcessIdentity
+        The driver and all descendants, including separate sessions/groups.
+
+    Examples
+    --------
+    >>> snapshot_process_tree(os.getpid())[os.getpid()].pid == os.getpid()
+    True
+    """
+    table = process_table()
+    descendants = {pid: table[pid]} if pid in table else {}
+    pending = [pid]
+    while pending:
+        parent = pending.pop()
+        for child in table.values():
+            if child.ppid == parent and child.pid not in descendants:
+                descendants[child.pid] = child
+                pending.append(child.pid)
+    return descendants
+
+
+def reap_process_tree(
+    process: subprocess.Popen[Any],
+    started: str | None,
+    recorded: dict[int, ProcessIdentity],
+    *,
+    timeout_s: float = 60,
+) -> None:
+    """
+    Kill owned descendant groups and verify each captured pid identity is gone.
+
+    Parameters
+    ----------
+    process : subprocess.Popen
+        Owned driver, reaped through the shared child helper.
+    started : str or None
+        Driver's captured start time.
+    recorded : dict of int to ProcessIdentity
+        Snapshot taken before signalling, possibly retained across driver exit.
+    timeout_s : float, optional
+        Separate cleanup verification allowance.
+
+    Raises
+    ------
+    AssertionError
+        Any recorded identity remains or the process table cannot be read.
+
+    Examples
+    --------
+    >>> callable(reap_process_tree)
+    True
+    """
+    signalled: set[int] = set()
+    try:
+        current = process_table()
+        for record in reversed(recorded.values()):
+            present = current.get(record.pid)
+            if present is None or present.started != record.started:
+                continue
+            record = present
+            with suppress(ProcessLookupError):
+                # Never signal the test runner's inherited group if session creation regresses.
+                if record.pgid in recorded and record.pgid != os.getpgrp():
+                    leader = current.get(record.pgid)
+                    original = recorded[record.pgid]
+                    if leader is not None and leader.started != original.started:
+                        continue
+                    if record.pgid not in signalled:
+                        os.killpg(record.pgid, signal.SIGKILL)
+                        signalled.add(record.pgid)
+                else:
+                    os.kill(record.pid, signal.SIGKILL)
+    finally:
+        errors = reap_children([(process, True, started)])
+    if errors:
+        raise AssertionError("; ".join(errors))
+    deadline = time.monotonic() + timeout_s
+    while True:
+        current = process_table()
+        remaining = [
+            pid
+            for pid, record in recorded.items()
+            if pid in current and current[pid].started == record.started
+        ]
+        if not remaining:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError("owned process identities remained after cleanup")
+        time.sleep(0.01)
