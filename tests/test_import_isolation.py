@@ -359,6 +359,24 @@ def test_extra_facade_keeps_missing_vendor_submodule(module: str, sub: str) -> N
     assert "swarm-arena[" not in done.stderr
 
 
+def test_llm_facade_keeps_missing_vendor_name() -> None:
+    public_object("swarm_arena.llm", PUBLIC_ALL["swarm_arena.llm"][0])
+    code = """
+import agents
+del agents.Model
+import swarm_arena.llm
+"""
+    done = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        capture_output=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+    assert done.returncode != 0
+    assert "ImportError: cannot import name 'Model' from 'agents'" in done.stderr
+    assert "swarm-arena[" not in done.stderr
+
+
 @pytest.mark.parametrize("module", ["swarm_arena.llm", "swarm_arena.ray"])
 def test_extra_facade_keeps_other_import_errors(
     module: str, monkeypatch: pytest.MonkeyPatch
