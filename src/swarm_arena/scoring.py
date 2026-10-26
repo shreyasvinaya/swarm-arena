@@ -11,10 +11,10 @@ __all__: list[str] = [
     "Check",
     "CheckContext",
     "CheckResult",
-    "HumanReview",
     "Judge",
     "JudgeContext",
     "Lexicographic",
+    "HumanReview",
 ]
 
 _publish(__name__, __all__)

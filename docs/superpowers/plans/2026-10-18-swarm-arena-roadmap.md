@@ -433,6 +433,7 @@ M3 invocation and integration additions to R3.1 (these extend the existing modul
 | `tests/_fakes/gateway.py` | Stdlib fake LiteLLM Proxy (strict-profile endpoints, keys, spend logs) | M4 |
 | `tests/_fakes/tools.py` | Small module-level tool functions and scripts used across tests; refs name them `_fakes.tools:<name>` (importable through `pythonpath = ["tests"]`, R5.3) | M1a |
 | `tests/llm/test_upstream_facts.py` | Offline pinned SDK, LiteLLM callbacks, pricing, cache identity, retry and tracing facts | M3 |
+| `tests/_surface.py` | The §9 table and import helpers shared by the surface tests; `deps_present` checks distribution metadata, including both `agents` and `litellm` for lazy testing names | M5 |
 | `tests/test_public_api.py` | One `__all__` snapshot test per public module | M1a (exact §9 in M5) |
 | `tests/test_docstrings.py` | numpydoc validation and a required `Examples` section for every public name and its public methods | M1a |
 | `tests/test_import_isolation.py` | `import swarm_arena` (and each core facade) loads no optional dependency | M1a |
@@ -1627,7 +1628,7 @@ def make_candidate(output: ToolOutput, *, request: ToolRequest | None = None, to
 # testing/_artifacts.py — M1a
 def read_output_file(output: ToolOutput, path: str) -> bytes: ...
 def read_logs(output: ToolOutput) -> tuple[bytes, bytes]: ...   # stdout, stderr; verified stored bytes
-# testing/_fake_model.py — M3 (lazy import of `agents`)
+# testing/_fake_model.py — M3 (lazy import through the llm facade; requires both `agents` and `litellm`)
 @dataclass(frozen=True, kw_only=True)
 class FakeTurn:
     text: str | None = None
@@ -3199,6 +3200,12 @@ Other fixed values: `Learning.title` ≤ 120 characters, `Learning.text` ≤ 1,5
   [tool.ruff.lint.per-file-ignores]
   "tests/**" = ["D"]
   "examples/**" = ["D"]
+  # E402: core facades imported after _publish; llm exports follow its optional-import guard.
+  # RUF022: §9 order is the snapshot order, and it is not isort order.
+  "src/swarm_arena/__init__.py" = ["E402", "RUF022"]
+  "src/swarm_arena/{tool,scoring,manager,planning,board,executor,config,protocol}.py" = ["RUF022"]
+  "src/swarm_arena/llm/__init__.py" = ["E402", "RUF022"]
+  "src/swarm_arena/{ray,testing}/__init__.py" = ["RUF022"]
   [tool.ruff.lint.flake8-tidy-imports]
   ban-relative-imports = "all"
   [tool.ruff.lint.flake8-tidy-imports.banned-api]

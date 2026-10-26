@@ -6,6 +6,13 @@ from swarm_arena._model.planning_types import Decision, History, RoundState
 from swarm_arena._planning.planner import Planner
 from swarm_arena._planning.policy import Policy
 
-__all__: list[str] = ["Decision", "FlowSpec", "History", "Planner", "Policy", "RoundState"]
+__all__: list[str] = [
+    "Planner",
+    "History",
+    "Policy",
+    "RoundState",
+    "Decision",
+    "FlowSpec",
+]
 
 _publish(__name__, __all__)

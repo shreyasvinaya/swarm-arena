@@ -5,14 +5,14 @@ from swarm_arena._model.catalog import CatalogEntry, ModelCatalog, ModelSpec, Pl
 from swarm_arena._model.settings import CachePolicy, GatewayConfig, SecretsPolicy, TracingConfig
 
 __all__: list[str] = [
-    "CachePolicy",
-    "CatalogEntry",
-    "GatewayConfig",
     "ModelCatalog",
     "ModelSpec",
+    "CachePolicy",
     "PlannerCatalog",
+    "CatalogEntry",
     "SecretsPolicy",
     "TracingConfig",
+    "GatewayConfig",
 ]
 
 _publish(__name__, __all__)
