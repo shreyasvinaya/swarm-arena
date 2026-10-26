@@ -1095,14 +1095,21 @@ def test_retry_inventory_remains_active_for_newer_upstream(
         "version",
         lambda name: versions[name] if name in versions else original_version(name),
     )
-    test_installed_upstream_versions_follow_selected_policy()
-    test_pinned_retry_and_fallback_inventory_covers_upstream_controls()
-    monkeypatch.setattr(
-        "litellm.constants.RUNTIME_UPDATABLE_ROUTER_SETTINGS",
-        [*RUNTIME_UPDATABLE_ROUTER_SETTINGS, "new_upstream_retry_control"],
-    )
-    with pytest.raises(AssertionError):
+    try:
+        test_installed_upstream_versions_follow_selected_policy()
         test_pinned_retry_and_fallback_inventory_covers_upstream_controls()
+        if canary:
+            versions["langfuse"] = "6.0.0"
+            with pytest.raises(AssertionError):
+                test_langfuse_v5_api()
+        monkeypatch.setattr(
+            "litellm.constants.RUNTIME_UPDATABLE_ROUTER_SETTINGS",
+            [*RUNTIME_UPDATABLE_ROUTER_SETTINGS, "new_upstream_retry_control"],
+        )
+        with pytest.raises(AssertionError):
+            test_pinned_retry_and_fallback_inventory_covers_upstream_controls()
+    except pytest.skip.Exception:
+        pytest.fail("upstream checks must not skip in the policy regression")
 
 
 def test_canary_record_command_uses_the_current_interpreter(tmp_path: Path) -> None:
