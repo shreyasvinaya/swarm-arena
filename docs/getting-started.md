@@ -1,9 +1,9 @@
 # Getting started
 
-`swarm-arena` runs teams of agents against a goal, prunes weak branches with
-recorded reasons, and converges on ranked solutions. This example minimizes
-Rosenbrock's function, `(1 - x)² + 100(y - x²)²`, entirely on your machine with
-scripted managers. It needs no API key or model provider.
+Run a small hello-world goal offline, view its result, then exchange a review
+with a teammate. It needs only the core package, with no API key or model
+provider. The later Rosenbrock example shows how `swarm-arena` runs teams of
+agents, prunes weak branches with recorded reasons, and ranks solutions.
 
 ```text
                  ┌── Team A ──┬─ agent ─┬─ agent ──┐
@@ -35,6 +35,166 @@ Contributors can clone the source and set up its environment:
 git clone https://github.com/shreyasvinaya/swarm-arena && cd swarm-arena && uv sync
 ```
 
+Optional extras are `llm` (Agents SDK managers, judges and planners), `cache`
+(response caching), `ray` (cluster execution), `s3` (S3 storage), and `langfuse`
+(tracing export). For example, add the LLM integration before the API-key
+example later on this page:
+
+```sh
+uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"
+```
+
+## Run hello-world
+
+In an empty working folder, save these two files as `run.toml` and `plan.toml`.
+The one-round `ScriptedManager` calls a standard-library `ScriptTool`.
+The `ScriptJudge` gives every result the constant demonstration score 1;
+this shows the scoring path, not a measure of greeting quality.
+
+<!-- docs-test: file run.toml -->
+```toml
+[limits]
+max_rounds = 1
+```
+
+<!-- docs-test: file plan.toml -->
+```toml
+judges = [{name="hello", path="swarm_arena:ScriptJudge", config={command=["python", "-c", "import os; from pathlib import Path; Path(os.environ['SWARM_ARENA_RESULT']).write_text('{\"value\": 1}', encoding='utf-8')"], direction="max"}}]
+[goal]
+id = "hello"
+namespace = "hello"
+[[teams]]
+name = "local"
+rationale = "Say hello offline."
+[[teams.agents]]
+name = "greeter"
+rationale = "Use the standard library."
+tool = {path="swarm_arena:ScriptTool", config={command=["python", "-c", "import os; from pathlib import Path; Path(os.environ['SWARM_ARENA_RESULT']).write_text('{\"data\": {\"message\": \"hello world\"}}', encoding='utf-8')"]}}
+manager = {path="swarm_arena:ScriptedManager", config={requests=[{round=1, inputs={}}]}}
+```
+
+Run it with one command. The redirection saves the CLI output for inspection;
+`--yes` approves its printed estimate. Omit `--yes` to approve interactively.
+
+<!-- docs-test: run -->
+```bash
+swarm-arena run --yes run.toml plan.toml > hello-run-output.txt
+cat hello-run-output.txt
+```
+
+## View results
+
+One command shows the hello namespace's ranked candidates:
+
+<!-- docs-test: run -->
+```bash
+swarm-arena leaderboard hello > hello-leaderboard.txt
+cat hello-leaderboard.txt
+```
+
+For the optional local web viewer, run the following command in your terminal.
+It runs until Ctrl-C; this server command is not executed by the docs tests,
+which execute the bounded leaderboard command above instead.
+
+```sh
+swarm-arena board serve hello
+```
+
+The defaults put the run, shared arena index inputs, and artifacts under
+`.swarm-arena/` in this working folder:
+
+```text
+.swarm-arena/
+  runs/<run-id>/
+    run.toml
+    manifest.json
+    control/owner.json
+    journal/e<epoch>-<last-seq>.jsonl
+    goals/hello/
+      plan.r0.toml
+      rounds/round-01.md
+      solution.json
+  arena/
+  artifacts/
+```
+
+Each run has one committed journal; the plan, round pages and `solution.json`
+are derived views. A solution's `source_head` identifies the committed journal
+head behind it. Read the successful greeting and save its actual generated
+run ID for the review commands:
+
+```python
+import json
+from pathlib import Path
+
+run_line = next(
+    line
+    for line in Path("hello-run-output.txt").read_text(encoding="utf-8").splitlines()
+    if line.startswith("run ") and " at " in line
+)
+run_dir = Path(run_line.split(" at ", 1)[1])
+solution = json.loads((run_dir / "goals/hello/solution.json").read_text(encoding="utf-8"))
+assert solution["status"] == "ok" and solution["source_head"]
+assert len(solution["finalists"]) == 1
+best = solution["finalists"][0]["candidate"]
+assert best["output"]["data"] == {"message": "hello world"}
+print(best["id"], best["output"]["data"])
+Path("hello-run-id.txt").write_text(solution["run_id"] + "\n", encoding="utf-8")
+```
+
+## Share a review
+
+Export the run's review bundle, share it with a teammate, then import their
+edited CSV. Export/import take the **run ID**, not its directory; `--out` names
+a directory. The following commands reuse the ID saved above:
+
+<!-- docs-test: run -->
+```bash
+swarm-arena review export "$(cat hello-run-id.txt)" --out review-bundle
+```
+
+The teammate edits `review-bundle/review.csv`: `verdict` is `accept` or `reject`,
+`score` is numeric, and `notes` holds their explanation. To try the exchange
+offline, this block fills the single row with `accept` and score `1`:
+
+```python
+import csv
+from pathlib import Path
+
+path = Path("review-bundle/review.csv")
+with path.open(encoding="utf-8", newline="") as stream:
+    reader = csv.DictReader(stream)
+    fieldnames = reader.fieldnames
+    rows = list(reader)
+assert fieldnames is not None and len(rows) == 1
+rows[0].update(verdict="accept", score="1", notes="Greeting verified offline.")
+with path.open("w", encoding="utf-8", newline="") as stream:
+    writer = csv.DictWriter(stream, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+```
+
+<!-- docs-test: run -->
+```bash
+swarm-arena review import "$(cat hello-run-id.txt)" review-bundle/review.csv --reviewer demo > hello-import.txt
+cat hello-import.txt
+swarm-arena leaderboard "$(cat hello-run-id.txt)" --by human:demo > hello-human-leaderboard.txt
+cat hello-human-leaderboard.txt
+```
+
+Teammates need access to the existing run, arena and artifact roots and their
+configuration. A review bundle does not upload or synchronize those stores.
+For custom roots, pass `--config run.toml` to each arena/review command with the
+appropriate trusted configuration. See [The arena](arena.md) and
+[Scoring and review](scoring-and-review.md) for details.
+
+## Rosenbrock
+
+For a fuller source-checkout example, minimize Rosenbrock's function,
+`(1 - x)² + 100(y - x²)²`, entirely offline. The three files shown below live
+in `examples/rosenbrock/`; the docs harness copies that directory before
+executing these commands. The hello-world recipe above needs no checkout.
+
 To run the bundled example from a source checkout, use these two commands in the
 repository root:
 
@@ -58,11 +218,13 @@ and the interrupt handler afterward.
 
 ## Tools, check, and judge
 
-The two `FunctionTool`s return data only. Gradient descent follows local
-updates, while random search samples a square. Fixed seeds make this tutorial
+The two `FunctionTool`s return data only: `gradient_descent(lr, steps, x0, y0)`
+follows local updates, while `random_search(n, radius, seed)` samples a square.
+Fixed seeds make this tutorial
 repeatable; omitting `seed` gives fresh random samples. `BoundsCheck` rejects
 missing, non-finite, or out-of-bounds results. The `ProgramJudge` minimizes `f`.
-No extra dependencies are needed beyond the package.
+The scoring function returns `Score.minimize(f)`, so smaller objectives rank
+higher. No extra dependencies are needed beyond the package.
 
 ```{literalinclude} ../examples/rosenbrock/rosen.py
 :language: python
@@ -70,7 +232,7 @@ No extra dependencies are needed beyond the package.
 
 ## Plan and limits
 
-Each team contains two agents with different approaches. A `ScriptedManager`
+Two teams each contain two agents with different approaches. A `ScriptedManager`
 selects requests explicitly for rounds 1 and 2. `SuccessiveHalving` prunes weaker
 agents between rounds and records its reasons. Convergence selects two distinct
 results and ranks them with a final judging batch.
@@ -144,11 +306,11 @@ from swarm_arena import Plan, RunConfig, Swarm
 async def main() -> None:
     config = RunConfig.load("examples/rosenbrock/run.toml")
     results = await Swarm(config).run(Plan.load("examples/rosenbrock/plan.toml"))
-    for candidate in results["rosenbrock"]:
-        print(candidate.id, candidate.output.data["f"])
+    best = results["rosenbrock"][0]
+    print(best.id, best.output.data)
 
 
-anyio.run(main)
+anyio.run(main, backend="asyncio")
 ```
 
 `Plan.load` captures the plan directory so `rosen:*` imports resolve both in the
