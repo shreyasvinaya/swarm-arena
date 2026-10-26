@@ -2,6 +2,9 @@ import asyncio
 import dataclasses
 import importlib.metadata
 import inspect
+import json
+import subprocess
+import sys
 import typing
 from collections.abc import AsyncIterator
 from datetime import datetime
@@ -12,6 +15,7 @@ from typing import Any
 import anyio
 import pydantic
 import pytest
+from test_ci_config import _check_upstream_versions
 
 pytest.importorskip("agents")
 
@@ -1047,13 +1051,16 @@ async def test_metered_call_has_one_provider_dispatch_with_retry_policy(
         assert "retry_policy" not in (attempts[0].get("extra_body") or {})
 
 
+def test_installed_upstream_versions_follow_selected_policy() -> None:
+    _check_upstream_versions()
+
+
 def test_pinned_retry_and_fallback_inventory_covers_upstream_controls() -> None:
     from litellm.constants import RUNTIME_UPDATABLE_ROUTER_SETTINGS
     from litellm.router_utils.fallback_event_handlers import _PER_REQUEST_FALLBACK_CONTROL_KEYS
 
     from swarm_arena.llm._hooks import _PROVIDER_ATTEMPT_CONTROLS
 
-    assert importlib.metadata.version("litellm").startswith("1.107.")
     upstream = {
         key
         for key in RUNTIME_UPDATABLE_ROUTER_SETTINGS
@@ -1062,3 +1069,54 @@ def test_pinned_retry_and_fallback_inventory_covers_upstream_controls() -> None:
     assert upstream <= _PROVIDER_ATTEMPT_CONTROLS
     # The direct completion wrappers have controls outside the router inventory.
     assert {"context_window_fallback_dict", "retry_strategy"} <= _PROVIDER_ATTEMPT_CONTROLS
+
+
+@pytest.mark.parametrize("canary", [False, True], ids=["production", "canary"])
+def test_retry_inventory_remains_active_for_newer_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    canary: bool,
+) -> None:
+    from litellm.constants import RUNTIME_UPDATABLE_ROUTER_SETTINGS
+
+    versions = (
+        {"openai-agents": "0.25.0", "litellm": "1.108.0"}
+        if canary
+        else {"openai-agents": "0.24.0", "litellm": "1.107.0rc2"}
+    )
+    record = tmp_path / "installed.json"
+    record.write_text(json.dumps(versions), encoding="utf-8")
+    monkeypatch.delenv("SWARM_ARENA_UPSTREAM_CANARY", raising=False)
+    if canary:
+        monkeypatch.setenv("SWARM_ARENA_UPSTREAM_CANARY", str(record))
+    original_version = importlib.metadata.version
+    monkeypatch.setattr(
+        importlib.metadata,
+        "version",
+        lambda name: versions[name] if name in versions else original_version(name),
+    )
+    test_installed_upstream_versions_follow_selected_policy()
+    test_pinned_retry_and_fallback_inventory_covers_upstream_controls()
+    monkeypatch.setattr(
+        "litellm.constants.RUNTIME_UPDATABLE_ROUTER_SETTINGS",
+        [*RUNTIME_UPDATABLE_ROUTER_SETTINGS, "new_upstream_retry_control"],
+    )
+    with pytest.raises(AssertionError):
+        test_pinned_retry_and_fallback_inventory_covers_upstream_controls()
+
+
+def test_canary_record_command_uses_the_current_interpreter(tmp_path: Path) -> None:
+    record = tmp_path / "installed.json"
+    script = Path(__file__).resolve().parents[1] / "test_ci_config.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--record-upstream", str(record)],
+        cwd=tmp_path,
+        capture_output=True,
+        encoding="utf-8",
+        timeout=60,
+        check=True,
+    )
+    versions = {name: importlib.metadata.version(name) for name in ("openai-agents", "litellm")}
+    assert json.loads(result.stdout) == versions
+    assert json.loads(record.read_text(encoding="utf-8")) == versions
+    assert result.stderr == ""
