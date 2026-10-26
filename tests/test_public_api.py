@@ -25,9 +25,6 @@ from pydantic import BaseModel
 import swarm_arena
 from swarm_arena._facade import publish
 
-# Transitional alias for the existing docstring collector.
-PUBLIC = PUBLIC_ALL
-
 
 @pytest.mark.parametrize("module", PUBLIC_ALL)
 def test_all_matches_spec(module: str) -> None:
@@ -149,7 +146,7 @@ def test_publish_lets_doctest_find_method_examples(monkeypatch: pytest.MonkeyPat
 
 
 CORE = sorted(
-    set(PUBLIC) - {"swarm_arena", "swarm_arena.testing", "swarm_arena.llm", "swarm_arena.ray"}
+    set(PUBLIC_ALL) - {"swarm_arena", "swarm_arena.testing", "swarm_arena.llm", "swarm_arena.ray"}
 )
 
 
@@ -399,7 +396,7 @@ def test_surface_resolve_reports_missing_module_and_attribute() -> None:
 
 
 @pytest.mark.parametrize("missing", ["openai-agents", "litellm", "ray"])
-def test_docstring_collector_omits_missing_optional_dependencies(
+def test_docstring_collector_does_not_import_missing_optional_dependencies(
     monkeypatch: pytest.MonkeyPatch, missing: str
 ) -> None:
     from test_docstrings import public_objects
@@ -420,7 +417,7 @@ def test_docstring_collector_omits_missing_optional_dependencies(
 
     monkeypatch.setattr(importlib.metadata, "version", version)
     monkeypatch.setattr(importlib, "import_module", importing)
-    names = public_objects()
+    names = [str(param.values[0]) for param in public_objects() if not param.marks]
     assert not any(name.startswith(f"swarm_arena.{extra}.") for name in names)
     if extra == "llm":
         assert not any(name.startswith("swarm_arena.testing.Fake") for name in names)

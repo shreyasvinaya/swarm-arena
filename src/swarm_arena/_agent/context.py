@@ -603,8 +603,20 @@ class AgentContext:
 
         Examples
         --------
-        The :class:`AgentContext` example constructs a context in memory and
-        reads its carried notes without an action or a running journal.
+        >>> from unittest.mock import Mock
+        >>> from swarm_arena import AgentSpec, Goal, Ref, RoundSpec, ScriptTool, TeamSpec
+        >>> tool = ScriptTool(command=["echo"])
+        >>> spec = AgentSpec(name="a", rationale="Explore", tool=Ref.of(tool),
+        ...                  manager=Ref(path="example:Manager"))
+        >>> rt = Mock(goal=Goal(id="g", namespace="demo"),
+        ...           team=TeamSpec(name="t", rationale="Explore", agents=[spec]),
+        ...           round=1, round_spec=RoundSpec(), digest="", notes="try a smaller step",
+        ...           resumed=(), checks=[], tool=tool, own=[],
+        ...           repeats=Mock(candidates_of=lambda author: []))
+        >>> rt.spec = spec
+        >>> ctx = AgentContext(rt)
+        >>> ctx.notes
+        'try a smaller step'
         """
         return self._rt.notes
 
@@ -736,8 +748,20 @@ class AgentContext:
 
         Examples
         --------
-        The :class:`AgentContext` example calls this method with an empty
-        in-memory result index and returns an empty list.
+        >>> from unittest.mock import Mock
+        >>> from swarm_arena import AgentSpec, Goal, Ref, RoundSpec, ScriptTool, TeamSpec
+        >>> tool = ScriptTool(command=["echo"])
+        >>> spec = AgentSpec(name="a", rationale="Explore", tool=Ref.of(tool),
+        ...                  manager=Ref(path="example:Manager"))
+        >>> rt = Mock(goal=Goal(id="g", namespace="demo"),
+        ...           team=TeamSpec(name="t", rationale="Explore", agents=[spec]),
+        ...           round=1, round_spec=RoundSpec(), digest="", notes="try a smaller step",
+        ...           resumed=(), checks=[], tool=tool, own=[],
+        ...           repeats=Mock(candidates_of=lambda author: []))
+        >>> rt.spec = spec
+        >>> ctx = AgentContext(rt)
+        >>> ctx.my_candidates()
+        []
         """
 
         def read() -> list[Candidate]:

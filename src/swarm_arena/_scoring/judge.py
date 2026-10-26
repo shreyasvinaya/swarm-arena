@@ -150,8 +150,16 @@ class JudgeContext(CheckContext):
 
         Examples
         --------
-        The :class:`JudgeContext` example calls ``context.judge_error(...)`` twice
-        and verifies that the first reason wins.
+        >>> from unittest.mock import Mock
+        >>> from swarm_arena import Goal
+        >>> from swarm_arena.executor import Executor
+        >>> from swarm_arena.scoring import JudgeContext
+        >>> context = JudgeContext(goal=Goal(id='g', namespace='example'),
+        ...     executor=Mock(spec=Executor), artifact_root='/artifacts', batch_id='b1')
+        >>> context.judge_error('c1', 'non-finite key')
+        >>> context.judge_error('c1', 'later reason')
+        >>> (context.batch_id, context.errors)
+        ('b1', {'c1': 'non-finite key'})
         """
         candidate_id = _context_string(candidate_id, "candidate_id")
         reason = _context_string(reason, "reason")
@@ -213,7 +221,17 @@ class Judge(Configurable, ABC):
 
         Examples
         --------
-        The :class:`Judge` example calls ``judge.preflight()`` without I/O.
+        >>> from collections.abc import Sequence
+        >>> from swarm_arena import Goal, Score
+        >>> from swarm_arena.board import Candidate
+        >>> from swarm_arena.scoring import Judge, JudgeContext
+        >>> class ExampleJudge(Judge):
+        ...     name = 'example'
+        ...     async def judge(self, goal: Goal, candidates: Sequence[Candidate],
+        ...                     ctx: JudgeContext) -> list[Score]:
+        ...         return [Score(key=(1.0,), candidate_id=c.id) for c in candidates]
+        >>> judge = ExampleJudge()
+        >>> judge.preflight()
         """
 
     def rubric_hash(self) -> str:
@@ -232,8 +250,12 @@ class Judge(Configurable, ABC):
 
         Examples
         --------
-        The :class:`Judge` example calls ``judge.rubric_hash()`` and checks its
-        digest length.
+        >>> from swarm_arena import ProgramJudge
+        >>> judge = ProgramJudge("my_judges:quality")
+        >>> len(judge.rubric_hash())
+        64
+        >>> judge.rubric_hash() == ProgramJudge("my_judges:quality").rubric_hash()
+        True
         """
         cls = type(self)
         try:
@@ -262,7 +284,9 @@ class Judge(Configurable, ABC):
 
         Examples
         --------
-        The :class:`Judge` example calls ``judge.panel_hash()`` and gets ``''``.
+        >>> from swarm_arena import ScriptJudge
+        >>> ScriptJudge(command=["score"]).panel_hash()
+        ''
         """
         return ""
 
@@ -277,7 +301,9 @@ class Judge(Configurable, ABC):
 
         Examples
         --------
-        The :class:`Judge` example calls ``judge.anchor_count()`` and gets zero.
+        >>> from swarm_arena import ScriptJudge
+        >>> ScriptJudge(command=["score"]).anchor_count()
+        0
         """
         return 0
 
@@ -292,7 +318,9 @@ class Judge(Configurable, ABC):
 
         Examples
         --------
-        The :class:`Judge` example calls ``judge.providers()`` and gets an empty set.
+        >>> from swarm_arena import ScriptJudge
+        >>> ScriptJudge(command=["score"]).providers()
+        frozenset()
         """
         return frozenset()
 
@@ -307,7 +335,9 @@ class Judge(Configurable, ABC):
 
         Examples
         --------
-        The :class:`Judge` example calls ``judge.models()`` and gets an empty tuple.
+        >>> from swarm_arena import ScriptJudge
+        >>> ScriptJudge(command=["score"]).models()
+        ()
         """
         return ()
 
@@ -334,8 +364,32 @@ class Judge(Configurable, ABC):
 
         Examples
         --------
-        The :class:`Judge` example runs ``judge.judge(goal, candidates, context)``
-        with ``asyncio.run`` and inspects the returned candidate scores.
+        >>> import asyncio
+        >>> from collections.abc import Sequence
+        >>> from unittest.mock import Mock
+        >>> from swarm_arena import Goal, Score
+        >>> from swarm_arena.board import Candidate
+        >>> from swarm_arena.scoring import Judge, JudgeContext
+        >>> from swarm_arena.tool import RunStatus, ToolOutput, ToolRequest
+        >>> sorted(Judge.__abstractmethods__)
+        ['judge']
+        >>> class ExampleJudge(Judge):
+        ...     name = 'example'
+        ...     async def judge(self, goal: Goal, candidates: Sequence[Candidate],
+        ...                     ctx: JudgeContext) -> list[Score]:
+        ...         return [Score(key=(1.0,), candidate_id=c.id) for c in candidates]
+        >>> judge = ExampleJudge()
+        >>> judge.preflight()
+        >>> len(judge.rubric_hash())
+        64
+        >>> (judge.panel_hash(), judge.anchor_count(), judge.providers(), judge.models())
+        ('', 0, frozenset(), ())
+        >>> goal = Goal(id='g', namespace='example')
+        >>> candidate = Candidate(id='c1', run_id='r', goal_id=goal.id, team='t', agent='a',
+        ...     round=1, request=ToolRequest(), output=ToolOutput(status=RunStatus.OK))
+        >>> scores = asyncio.run(judge.judge(goal, [candidate], Mock(spec=JudgeContext)))
+        >>> [(s.candidate_id, s.key) for s in scores]
+        [('c1', (1.0,))]
         """
 
 
