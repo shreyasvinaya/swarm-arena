@@ -25,6 +25,9 @@ REQUIRED_FACTS = [
     "snapshot test",
     "Everything else is private",
     "upper bound is raised only after",
+    "tests/test_public_api.py",
+    "tests/test_docstrings.py",
+    "tests/test_compat.py",
 ]
 
 

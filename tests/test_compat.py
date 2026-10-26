@@ -1,15 +1,11 @@
-import builtins
 import importlib
-import io
-import os
 import re
-import socket
-import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any
 
 import pytest
 from _fakes.secrecy import assert_secret_absent
@@ -175,14 +171,37 @@ COMPONENTS: list[ParameterSet] = [
 ]
 
 
-def _forbid(*args: object, **kwargs: object) -> NoReturn:
-    raise AssertionError("I/O in a component __init__ (§9 rule 3)")
+_IO_GUARD_ACTIVE = False
+_IO_EVENTS = frozenset(
+    {
+        "open",
+        "os.mkdir",
+        "subprocess.Popen",
+        "os.system",
+        "os.posix_spawn",
+        "os.fork",
+        "socket.connect",
+        "socket.bind",
+        "socket.sendto",
+    }
+)
+
+
+def _forbid(event: str, args: tuple[object, ...]) -> None:
+    if _IO_GUARD_ACTIVE and event in _IO_EVENTS:
+        raise AssertionError(f"I/O in a component __init__ (§9 rule 3): {event}")
+
+
+# Audit hooks cannot be removed; this one is dormant outside the constructor call.
+sys.addaudithook(_forbid)
 
 
 @pytest.mark.parametrize(("module", "build"), COMPONENTS)
 def test_component_init_does_no_io(
     module: str, build: Callable[[Path], object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    global _IO_GUARD_ACTIVE
+
     importlib.import_module(module)
     # Resolve the test refs before guarding construction, just as for facade imports.
     importlib.import_module("_fakes.tools")
@@ -193,17 +212,11 @@ def test_component_init_does_no_io(
     for var, directory in zip(("HOME", "TMPDIR", "XDG_CACHE_HOME"), dirs[1:], strict=True):
         monkeypatch.setenv(var, str(directory))
     monkeypatch.setattr(tempfile, "tempdir", None)
-    with monkeypatch.context() as guard:
-        for target, attr in (
-            (socket.socket, "connect"),
-            (subprocess.Popen, "__init__"),
-            (builtins, "open"),
-            (io, "open"),
-            (os, "open"),
-            (os, "mkdir"),
-        ):
-            guard.setattr(target, attr, _forbid)
+    _IO_GUARD_ACTIVE = True
+    try:
         build(tmp_path)
+    finally:
+        _IO_GUARD_ACTIVE = False
     assert [directory.name for directory in dirs if any(directory.iterdir())] == []
     assert not (tmp_path / "arena").exists()
 
