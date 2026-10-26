@@ -187,8 +187,19 @@ _IO_EVENTS = frozenset(
 )
 
 
+def _importing() -> bool:
+    # Module files read (and bytecode written) by the import system are not
+    # component I/O, so a constructor may import on first use.
+    frame = sys._getframe(2)
+    while frame is not None:
+        if frame.f_code.co_filename.startswith("<frozen importlib._bootstrap"):
+            return True
+        frame = frame.f_back
+    return False
+
+
 def _forbid(event: str, args: tuple[object, ...]) -> None:
-    if _IO_GUARD_ACTIVE and event in _IO_EVENTS:
+    if _IO_GUARD_ACTIVE and event in _IO_EVENTS and not (event == "open" and _importing()):
         raise AssertionError(f"I/O in a component __init__ (§9 rule 3): {event}")
 
 
@@ -219,6 +230,19 @@ def test_component_init_does_no_io(
         _IO_GUARD_ACTIVE = False
     assert [directory.name for directory in dirs if any(directory.iterdir())] == []
     assert not (tmp_path / "arena").exists()
+
+
+def test_io_guard_allows_lazy_imports_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    global _IO_GUARD_ACTIVE
+
+    monkeypatch.delitem(sys.modules, "colorsys", raising=False)
+    _IO_GUARD_ACTIVE = True
+    try:
+        importlib.import_module("colorsys")  # the import system reads a module file
+        with pytest.raises(AssertionError, match="open"):
+            open(__file__, "rb").close()
+    finally:
+        _IO_GUARD_ACTIVE = False
 
 
 @pytest.mark.parametrize("kind", sorted(CURRENT))
