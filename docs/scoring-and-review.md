@@ -10,7 +10,7 @@ judges run offline today. See the [scoring API](api/scoring.md),
 
 Tool candidates are checked in plan order before publication to the manager;
 cancelled preparations without a start skip checks.
-`CheckResult.passed=False` makes a candidate **gated out**: it remains
+`CheckResult.passed=False` makes a candidate **gated out** (`gated_out`): it remains
 recorded but cannot be judged or selected. A malformed result or check exception
 fails closed. `ScriptCheck` also fails closed on crashes, timeouts, and missing
 results. The core stamps each result with its check's plan name.
@@ -39,7 +39,8 @@ reference from the kit's content-addressed log reference.
 
 A larger `Score.key` wins, comparing tuple elements in order. `Score.minimize(x)`
 uses `(-x,)`; `Score.maximize(x)` uses `(x,)`. `value` is a human-facing number,
-not a replacement for the ranking key. Keys must be finite. Missing scores,
+not a replacement for the ranking key. Keys must be finite: NaN and positive
+or negative infinity (`inf`) are invalid. Missing scores,
 non-finite keys, or judge errors leave the affected candidate unranked; foreign
 candidate IDs and later duplicate scores are discarded.
 
@@ -61,9 +62,110 @@ ID counter, then full ID.
 `ProgramJudge` calls a trusted scoring function. `ScriptJudge` executes a
 scoring program with its own files. `Lexicographic` combines ordered judges:
 only candidates scored by every member get a composite score.
-With one judge the plan can omit `ranking`; with several, `ranking` must name
+With one judge the plan can omit `Plan.ranking`; with several, `ranking` must name
 the declared judge whose scores drive selection. A part can inherit main
 scoring or supply its own checks, judges, and ranking.
+
+Use one scale across rounds: a key must mean the same thing whenever its judge
+identity is unchanged. Anchors help detect drift; they do not make unrelated
+rubrics or different surviving panels comparable.
+
+### Compose two offline judges
+
+Save these module-level functions as `judges.py`. Correctness is the primary
+key; a shorter answer breaks correctness ties.
+
+<!-- docs-test: file judges.py -->
+```python
+from swarm_arena import Goal, Score
+from swarm_arena.board import Candidate
+
+
+def exact(goal: Goal, candidate: Candidate) -> Score:
+    """
+    Score an exact match to the goal's expected answer.
+
+    Parameters
+    ----------
+    goal : Goal
+        Goal containing the expected answer.
+    candidate : Candidate
+        Candidate containing the proposed answer.
+
+    Returns
+    -------
+    Score
+        One for an exact match, otherwise zero.
+
+    Examples
+    --------
+    >>> from swarm_arena.testing import make_candidate
+    >>> from swarm_arena.tool import RunStatus, ToolOutput
+    >>> goal = Goal(id="answer", namespace="demo", inputs={"answer": "42"})
+    >>> candidate = make_candidate(ToolOutput(status=RunStatus.OK, data={"answer": "42"}), goal=goal)
+    >>> exact(goal, candidate).key
+    (1.0,)
+    """
+    return Score.maximize(float(candidate.output.data["answer"] == goal.inputs["answer"]))
+
+
+def short(goal: Goal, candidate: Candidate) -> Score:
+    """
+    Prefer answers with fewer characters.
+
+    Parameters
+    ----------
+    goal : Goal
+        Goal supplied by the judging interface.
+    candidate : Candidate
+        Candidate containing the proposed answer.
+
+    Returns
+    -------
+    Score
+        Negated character count as the ranking key.
+
+    Examples
+    --------
+    >>> from swarm_arena.testing import make_candidate
+    >>> from swarm_arena.tool import RunStatus, ToolOutput
+    >>> goal = Goal(id="answer", namespace="demo")
+    >>> candidate = make_candidate(ToolOutput(status=RunStatus.OK, data={"answer": "42"}), goal=goal)
+    >>> short(goal, candidate).key
+    (-2.0,)
+    """
+    return Score.minimize(float(len(str(candidate.output.data["answer"]))))
+```
+
+In the same directory, run the composition through the public conformance kit:
+
+```python
+import anyio
+
+from swarm_arena import Goal, ProgramJudge
+from swarm_arena.scoring import Lexicographic
+from swarm_arena.testing import check_judge, make_candidate
+from swarm_arena.tool import RunStatus, ToolOutput
+
+
+async def score_answers() -> None:
+    goal = Goal(id="answer", namespace="demo", inputs={"answer": "42"})
+    candidates = [
+        make_candidate(ToolOutput(status=RunStatus.OK, data={"answer": answer}), goal=goal)
+        for answer in ("42", "0042")
+    ]
+    scores = await check_judge(
+        Lexicographic([ProgramJudge("judges:exact"), ProgramJudge("judges:short")]),
+        goal,
+        candidates,
+    )
+    for score in scores:
+        print(score.key)
+    assert [score.key for score in scores] == [(1.0, -2.0), (0.0, -4.0)]
+
+
+anyio.run(score_answers)
+```
 
 `Lexicographic` concatenates member keys in order, so each member must return
 keys of one fixed length within a candidate batch. Different members may use
@@ -98,7 +200,7 @@ judge = LLMJudge(
 ```
 
 Aliases can refer to different providers. Every panel member scores every batch
-concurrently, at temperature zero. `mean` (the default), `median`, `min` and
+concurrently, at temperature 0. `mean` (the default), `median`, `min` and
 `max` aggregate votes. Repeated aliases retain separate votes and funding terms.
 A member that fails any batch is excluded from the entire invocation; all
 batches use the same surviving panel. A candidate is omitted unless every live
@@ -119,6 +221,11 @@ one score from the first batch, with later aggregated anchor values appended to
 its notes so drift is visible. Its call links include every batch that held it.
 The final judge scores all finalists in one call per member, regardless of
 `batch_size`. Anchors and the final judge never read the response cache.
+Ordinary non-anchor batches can read it when response caching is configured and
+the [cache eligibility rules](concepts.md#caching) hold, including
+temperature 0. The dispatched prompt, model and request parameters determine
+the cache key; tracking metadata does not. A cache hit retains reported usage
+for display but costs zero charged tokens and USD.
 
 All four LLM judge aggregators preserve finite, in-scale votes as finite,
 in-scale scores, including votes near the floating-point limits. Mean and
@@ -180,6 +287,13 @@ of a group is retained. This protection can keep more agents or teams than a
 policy's nominal cutoff. A policy may also return `Decision.no_result` to end a
 goal with a reason. Hard limits and watchdogs can stop work mid-round; they do
 not wait for a policy barrier.
+
+With its default `min_per_team=1`, `SuccessiveHalving` retains the agent with a
+team's only passing candidate on the current ranking identity and fidelity.
+This passing minimum can be disabled explicitly with `min_per_team=0`.
+Starved agents had no compute to start their runs, so lack of results cannot
+justify pruning them. The group guard protects a part's last team as well as
+the main group's last team; retained parts also need a team after replanning.
 
 ```python
 from swarm_arena import Chain, KeepTopTeams, Patience, SuccessiveHalving
@@ -256,6 +370,49 @@ reasons remain durable in the journal. See [Getting started](getting-started.md#
 for reading an actual solution.
 
 ## Human review
+
+### Export, edit, import, and re-rank
+
+From a source checkout, this complete offline workflow runs Rosenbrock, exports
+its top candidates, and records Alice's review. Start in a clean directory
+containing the checkout's `examples/` tree so the first discovered run is the
+one just created. Every arena command selects the same configuration explicitly.
+
+<!-- docs-test: run -->
+```bash
+swarm-arena run --yes examples/rosenbrock/run.toml examples/rosenbrock/plan.toml
+run="$(basename "$(find . -type d -path '*/.swarm-arena/runs/*' -print -quit)")"
+test -n "$run"
+swarm-arena review export "$run" --top 20 --out review --config examples/rosenbrock/run.toml
+python - <<'EOF'
+import csv
+from pathlib import Path
+
+path = Path("review/review.csv")
+with path.open(encoding="utf-8", newline="") as stream:
+    reader = csv.DictReader(stream)
+    fields = reader.fieldnames
+    rows = list(reader)
+assert fields is not None and rows, "the export must contain candidates"
+# After inspecting the candidate, record an actual review rather than importing blanks.
+rows[0].update(verdict="accept", score="1", notes="Reviewed the offline example.")
+with path.open("w", encoding="utf-8", newline="") as stream:
+    writer = csv.DictWriter(stream, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(rows)
+EOF
+swarm-arena review import "$run" review/review.csv --reviewer alice --config examples/rosenbrock/run.toml
+swarm-arena leaderboard "$run" --by human:alice --config examples/rosenbrock/run.toml
+```
+
+For your own run, use its printed run ID and make the verdict reflect your
+inspection. The example's automated edit illustrates the CSV format; it is not
+an independent quality assessment. Share the exported directory with a reviewer
+and bring back the edited CSV. Exporting a bundle does not provision a shared
+arena store. Human scores add another ranking; they do not overwrite the original
+program scores or the run's final solution.
+
+### Review records and recovery
 
 `HumanReview` exports committed candidates to `review.csv`, a static escaped
 `index.html`, and one `candidates/<id>.json` file containing the candidate and
