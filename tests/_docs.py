@@ -2,10 +2,12 @@
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
-import time
+import tempfile
+import threading
 import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -13,10 +15,10 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
-from _fakes.process_cleanup import reap_children
+from _fakes.process_cleanup import ProcessIdentity, reap_process_tree, snapshot_process_tree
 from _surface import DISTRIBUTIONS, EXTRA_DEPS, deps_present
 
-from swarm_arena._exec.procinfo import group_has_live_member, process_start_time
+from swarm_arena._exec.procinfo import process_start_time
 
 REPO: Path = Path(__file__).resolve().parents[1]
 PAGES: list[tuple[str, str]] = [
@@ -208,36 +210,170 @@ def block_env(workdir: Path, bindir: Path) -> dict[str, str]:
     }
 
 
+def _exit_gate(command: list[str], ready: Path, release: Path) -> list[str]:
+    """Hold normal Python/bash exit until the owner has snapshotted descendants."""
+    if command[0] == "bash":
+        hold = (
+            f"touch {shlex.quote(str(ready))}; "
+            f"while ! test -e {shlex.quote(str(release))}; do sleep 0.01; done"
+        )
+        return [*command[:-1], f"trap {shlex.quote(hold)} EXIT\n{command[-1]}"]
+    prelude = (
+        "import atexit, pathlib, runpy, sys, time\n"
+        "def _docs_hold_exit():\n"
+        f"    pathlib.Path({str(ready)!r}).touch()\n"
+        "    deadline = time.monotonic() + 120\n"
+        f"    while not pathlib.Path({str(release)!r}).exists():\n"
+        "        if time.monotonic() >= deadline: raise RuntimeError('docs owner disappeared')\n"
+        "        time.sleep(0.01)\n"
+        "atexit.register(_docs_hold_exit)\n"
+    )
+    if command[1] == "-c":
+        body = (
+            f"sys.argv = {['-c', *command[3:]]!r}\n"
+            f"exec(compile({command[2]!r}, '<string>', 'exec'))\n"
+        )
+    elif command[1] == "-m":
+        body = (
+            f"sys.argv = {command[2:]!r}\n"
+            f"runpy.run_module({command[2]!r}, run_name='__main__', alter_sys=True)\n"
+        )
+    else:
+        body = (
+            f"sys.argv = {command[1:]!r}\n"
+            f"sys.path[0] = str(pathlib.Path({command[1]!r}).resolve().parent)\n"
+            f"runpy.run_path({command[1]!r}, run_name='__main__')\n"
+        )
+    return [command[0], "-c", prelude + body]
+
+
 def _execute(
     command: list[str], *, workdir: Path, env: dict[str, str], timeout_s: float
 ) -> tuple[int, str, str]:
-    """Capture one owned session and clean its descendants on every exit path."""
-    process = subprocess.Popen(
-        command,
-        cwd=workdir,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        encoding="utf-8",
-        start_new_session=True,
-    )
-    started = None
-    try:
-        started = process_start_time(process.pid)
-        stdout, stderr = process.communicate(timeout=timeout_s)
+    """Own a Python/bash driver's tree, including separately grouped descendants.
+
+    The exit handshake holds the driver alive while ps records its descendants,
+    before normal exit can reparent them. On interruption/timeout, snapshot again
+    before sending any signal. Pipes drain concurrently through communicate.
+    Process identities, not only group liveness, establish final cleanup.
+    """
+    with tempfile.TemporaryDirectory(prefix="docs-owner-", dir=env.get("TMPDIR")) as directory:
+        ready, release = Path(directory) / "ready", Path(directory) / "release"
+        process = subprocess.Popen(
+            _exit_gate(command, ready, release),
+            cwd=workdir,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            start_new_session=True,
+        )
+        recorded: dict[int, ProcessIdentity] = {}
+        stop = threading.Event()
+        observer_errors: list[Exception] = []
+
+        def observe_exit() -> None:
+            try:
+                while not stop.wait(0.01):
+                    if ready.exists():
+                        recorded.update(snapshot_process_tree(process.pid))
+                        release.touch()
+                        return
+            except Exception as error:
+                observer_errors.append(error)
+                release.touch()
+
+        observer = threading.Thread(target=observe_exit, name="docs-exit-owner")
+        started = None
+        timed_out: subprocess.TimeoutExpired | None = None
+        observer_started = False
+        try:
+            started = process_start_time(process.pid)
+            observer.start()
+            observer_started = True
+            try:
+                stdout, stderr = process.communicate(timeout=timeout_s)
+            except subprocess.TimeoutExpired as error:
+                timed_out = error
+        finally:
+            stop.set()
+            if observer_started:
+                observer.join(60)
+                assert not observer.is_alive(), "docs-test exit observer did not finish"
+            try:
+                recorded.update(snapshot_process_tree(process.pid))
+            finally:
+                try:
+                    reap_process_tree(process, started, recorded)
+                    if timed_out is not None:
+                        stdout, stderr = process.communicate(timeout=60)
+                finally:
+                    if process.stdout is not None:
+                        process.stdout.close()
+                    if process.stderr is not None:
+                        process.stderr.close()
+        assert not observer_errors, "docs-test descendant snapshot failed"
+        if timed_out is not None:
+            raise subprocess.TimeoutExpired(
+                command, timeout_s, output=stdout, stderr=stderr
+            ) from None
         return process.returncode, stdout, stderr
-    finally:
-        # Identity-aware cleanup also handles descendants whose leader already exited.
-        errors = reap_children([(process, True, started)])
-        deadline = time.monotonic() + 10
-        while group_has_live_member(process.pid) and time.monotonic() < deadline:
-            time.sleep(0.01)
-        if errors or group_has_live_member(process.pid):
-            raise AssertionError("docs-test owned process cleanup failed")
-        if process.stdout is not None:
-            process.stdout.close()
-        if process.stderr is not None:
-            process.stderr.close()
+
+
+def run_command(
+    command: list[str],
+    *,
+    source: str,
+    line: int,
+    workdir: Path,
+    bindir: Path,
+    timeout_s: float = 300.0,
+) -> tuple[str, str]:
+    """
+    Run a documentation command with shared ownership and located diagnostics.
+
+    Parameters
+    ----------
+    command : list of str
+        Target Python or bash command.
+    source : str
+        Source document path.
+    line : int
+        Opening fence line.
+    workdir : Path
+        Isolated working directory.
+    bindir : Path
+        Target interpreter directory used in the minimal environment.
+    timeout_s : float, optional
+        Execution allowance, independent of bounded cleanup.
+
+    Returns
+    -------
+    tuple of str and str
+        Captured stdout and stderr.
+
+    Raises
+    ------
+    AssertionError
+        A command fails or times out; includes location and both output streams.
+
+    Examples
+    --------
+    >>> callable(run_command)
+    True
+    """
+    try:
+        rc, stdout, stderr = _execute(
+            command, workdir=workdir, env=block_env(workdir, bindir), timeout_s=timeout_s
+        )
+    except subprocess.TimeoutExpired as error:
+        raise AssertionError(
+            f"{source}:{line} timed out after {timeout_s:g}s\n"
+            f"{error.stdout or ''}\n{error.stderr or ''}"
+        ) from None
+    if rc != 0:
+        raise AssertionError(f"{source}:{line} exited {rc}\n{stdout}\n{stderr}")
+    return stdout, stderr
 
 
 def requires_available(
@@ -360,9 +496,8 @@ def run_blocks(
     Raises
     ------
     AssertionError
-        An example or installed dependency fails.
-    subprocess.TimeoutExpired
-        An executable block exceeds its deadline; owned children are cleaned.
+        An example or installed dependency fails, or execution times out.
+        Timeout diagnostics include source location and captured output.
 
     Examples
     --------
@@ -384,11 +519,14 @@ def run_blocks(
             command = [str(bindir / "python"), str(path)]
         else:
             command = ["bash", "-euo", "pipefail", "-c", block.code]
-        rc, stdout, stderr = _execute(
-            command, workdir=workdir, env=block_env(workdir, bindir), timeout_s=timeout_s
+        run_command(
+            command,
+            source=source,
+            line=block.line,
+            workdir=workdir,
+            bindir=bindir,
+            timeout_s=timeout_s,
         )
-        if rc != 0:
-            raise AssertionError(f"{source}:{block.line} exited {rc}\n{stdout}\n{stderr}")
 
 
 def page_path(title: str) -> Path:

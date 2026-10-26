@@ -4,12 +4,15 @@ import ast
 import importlib
 import importlib.metadata
 import inspect
+import os
 import re
 import runpy
+import signal
 import subprocess
 import sys
 import time
 import zlib
+from contextlib import suppress
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -18,6 +21,7 @@ from _docs import (
     EXTRA_IMPORTS,
     PAGES,
     REPO,
+    STUB_TEXT,
     block_env,
     block_runs,
     docs_bindir,
@@ -28,6 +32,7 @@ from _docs import (
     required_facts,
     requires_available,
     run_blocks,
+    run_command,
     spec_picture,
     sphinx_html,
     toctree_titles,
@@ -35,7 +40,7 @@ from _docs import (
 from _fakes.process_cleanup import owned_processes
 from _surface import PUBLIC_ALL
 
-from swarm_arena._exec.procinfo import group_has_live_member
+from swarm_arena._exec.procinfo import group_has_live_member, process_start_time
 
 assert sphinx_html  # Imported pytest fixtures.
 assert owned_processes
@@ -305,17 +310,20 @@ def test_own_files_offline_example_runs(tmp_path: Path) -> None:
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source, encoding="utf-8")
-    done = subprocess.run(
-        [sys.executable, "try_scripts.py"],
-        cwd=tmp_path,
-        capture_output=True,
-        encoding="utf-8",
-        timeout=60,
-        check=False,
+    stdout, stderr = run_command(
+        [str(docs_bindir() / "python"), "try_scripts.py"],
+        source="docs/own-files.md",
+        line=next(
+            block.line
+            for block in parse_blocks(text)
+            if block.kind == "file" and block.arg == "try_scripts.py"
+        ),
+        workdir=tmp_path,
+        bindir=docs_bindir(),
+        timeout_s=60,
     )
-    assert done.returncode == 0, done.stdout + done.stderr
-    assert done.stdout.strip() == "ok: loss=0.25, check=True, key=(-0.25,)"
-    assert done.stderr == ""
+    assert stdout.strip() == OWN_FILES_EXPECTED
+    assert stderr == ""
 
 
 @pytest.mark.parametrize(
@@ -639,71 +647,293 @@ def test_execution_predicate_excludes_ignored_blocks(tmp_path: Path) -> None:
     )
 
 
+def _wait_ready(
+    workdir: Path, names: tuple[str, ...], process: subprocess.Popen[str] | None = None
+) -> dict[int, str]:
+    """Wait for test-owned process identities independently of the behavior deadline."""
+    deadline = time.monotonic() + 60
+    while not all((workdir / name).exists() for name in names):
+        assert process is None or process.poll() is None, (
+            "driver exited before descendants were ready"
+        )
+        assert time.monotonic() < deadline, "held descendants did not become ready"
+        time.sleep(0.01)
+    identities = {}
+    for name in names:
+        pid = int((workdir / name).read_text(encoding="utf-8"))
+        started = process_start_time(pid)
+        identities[pid] = started if started is not None else "<exited>"
+    return identities
+
+
+def _assert_recorded_pids_gone(identities: dict[int, str]) -> None:
+    """Use each pid's identity, independently of the driver's process-group oracle."""
+    assert {
+        pid: started for pid, started in identities.items() if process_start_time(pid) == started
+    } == {}
+
+
+def _emergency_reap_recorded(identities: dict[int, str]) -> None:
+    """Clean deliberately failing RED/mutation probes without hiding their assertions."""
+    for pid, started in reversed(identities.items()):
+        if process_start_time(pid) == started:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 60
+    while any(process_start_time(pid) == started for pid, started in identities.items()):
+        assert time.monotonic() < deadline, "emergency pid cleanup did not finish"
+        time.sleep(0.01)
+
+
+def _held_tree(workdir: Path, *, executor: bool, detached: bool) -> str:
+    """Build a held three-generation tree, optionally using the real LocalExecutor."""
+    grandchild = (
+        "import os, time; from pathlib import Path; "
+        + ("os.setsid(); " if detached else "")
+        + f"Path({str(workdir / 'grandchild')!r}).write_text(str(os.getpid())); time.sleep(300)"
+    )
+    child = (
+        "import os, subprocess, sys, time\nfrom pathlib import Path\n"
+        f"Path({str(workdir / 'child')!r}).write_text(str(os.getpid()))\n"
+        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "time.sleep(300)\n"
+    )
+    if executor:
+        worker = (
+            "import anyio, sys\nfrom swarm_arena import ScriptTool\n"
+            "from swarm_arena.testing import check_tool\n"
+            f"anyio.run(check_tool, ScriptTool(command=[sys.executable, '-c', {child!r}]), {{}})\n"
+        )
+    else:
+        worker = child
+    return (
+        "import os, subprocess, sys, time\nfrom pathlib import Path\n"
+        "assert os.getpgid(0) == os.getpid(), 'driver must own its group'\n"
+        f"Path({str(workdir / 'driver')!r}).write_text(str(os.getpid()))\n"
+        f"subprocess.Popen([sys.executable, '-c', {worker!r}], "
+        f"start_new_session={detached!r}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        f"while not Path({str(workdir / 'grandchild')!r}).exists(): time.sleep(0.01)\n"
+        "print('held stdout', flush=True)\nprint('held stderr', file=sys.stderr, flush=True)\n"
+    )
+
+
 @pytest.mark.usefixtures("owned_processes")
+@pytest.mark.parametrize("topology", ["same_group", "sessions", "executor"])
 @pytest.mark.parametrize("outcome", ["timeout", "failure", "success", "interrupt"])
 def test_run_blocks_reaps_driver_and_descendant(
-    outcome: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    outcome: str, topology: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import _docs
-
     workdir = make_workdir(tmp_path, with_examples=False)
-    # The child signals readiness before the driver can exit/fail. No elapsed-time oracle.
-    code = (
-        "import os, subprocess, sys, time\nfrom pathlib import Path\n"
-        'Path("driver").write_text(str(os.getpid()))\n'
-        'child = subprocess.Popen([sys.executable, "-c", '
-        "'import os, time; from pathlib import Path; "
-        'Path("child").write_text(str(os.getpid())); time.sleep(120)\'], '
-        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
-        'while not Path("child").exists(): time.sleep(0.01)\n'
-    )
+    code = _held_tree(workdir, executor=topology == "executor", detached=topology != "same_group")
+    # Failed/successful leaders can exit before the test thread returns from communicate.
     code += (
-        "time.sleep(120)\n"
+        "time.sleep(300)\n"
         if outcome in {"timeout", "interrupt"}
         else f"raise SystemExit({3 if outcome == 'failure' else 0})\n"
     )
-    blocks = parse_blocks(f"```python\n{code}```")
-    if outcome == "interrupt":
-        communicate = subprocess.Popen.communicate
-        interrupted = False
+    communicate = subprocess.Popen.communicate
+    identities: dict[int, str] = {}
+    injected = False
 
-        def interrupt_once(
-            self: subprocess.Popen[str], input: str | None = None, timeout: float | None = None
-        ) -> tuple[str, str]:
-            nonlocal interrupted
-            if (
-                not interrupted
-                and isinstance(self.args, list)
-                and self.args[0] == str(docs_bindir() / "python")
-            ):
-                deadline = time.monotonic() + 30
-                while not (workdir / "child").exists():
-                    assert time.monotonic() < deadline
-                    time.sleep(0.01)
-                interrupted = True
+    def after_readiness(
+        self: subprocess.Popen[str], input: str | None = None, timeout: float | None = None
+    ) -> tuple[str, str]:
+        nonlocal injected
+        if (
+            not injected
+            and isinstance(self.args, list)
+            and self.args[0] == str(docs_bindir() / "python")
+        ):
+            injected = True
+            identities.update(_wait_ready(workdir, ("driver", "child", "grandchild"), self))
+            if outcome == "interrupt":
                 raise KeyboardInterrupt
-            return communicate(self, input=input, timeout=timeout)
+            if outcome == "timeout":
+                # Real communicate drains output and expires only after readiness, not cold startup.
+                assert timeout == 60
+                return communicate(self, input=input, timeout=0.05)
+        return communicate(self, input=input, timeout=timeout)
 
-        monkeypatch.setattr(_docs.subprocess.Popen, "communicate", interrupt_once)
-    expected = {
-        "timeout": subprocess.TimeoutExpired,
-        "failure": AssertionError,
-        "interrupt": KeyboardInterrupt,
-    }
-    if outcome in expected:
-        with pytest.raises(expected[outcome]):
+    monkeypatch.setattr(subprocess.Popen, "communicate", after_readiness)
+    try:
+        if outcome in {"timeout", "failure", "interrupt"}:
+            with pytest.raises(
+                KeyboardInterrupt if outcome == "interrupt" else AssertionError,
+                match=None
+                if outcome == "interrupt"
+                else ("tree.md:1 timed out" if outcome == "timeout" else "tree.md:1 exited 3"),
+            ):
+                run_blocks(
+                    parse_blocks(f"```python\n{code}```"),
+                    source="tree.md",
+                    workdir=workdir,
+                    bindir=docs_bindir(),
+                    timeout_s=60,
+                )
+        else:
             run_blocks(
-                blocks,
-                source="t.md",
+                parse_blocks(f"```python\n{code}```"),
+                source="tree.md",
                 workdir=workdir,
                 bindir=docs_bindir(),
-                timeout_s=3 if outcome == "timeout" else 30,
+                timeout_s=60,
             )
-    else:
-        run_blocks(blocks, source="t.md", workdir=workdir, bindir=docs_bindir())
-    assert (workdir / "child").exists()
-    pgid = int((workdir / "driver").read_text(encoding="utf-8"))
-    assert not group_has_live_member(pgid)
+        assert len(identities) == 3
+        _assert_recorded_pids_gone(identities)
+        assert not group_has_live_member(int((workdir / "driver").read_text(encoding="utf-8")))
+    finally:
+        _emergency_reap_recorded(identities)
+
+
+@pytest.mark.parametrize("lang", ["python", "bash"])
+def test_timeout_reports_source_line_and_captured_output(
+    lang: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workdir = make_workdir(tmp_path, with_examples=False)
+    code = (
+        "from pathlib import Path; import time; print('timeout stdout', flush=True); import sys; "
+        "print('timeout stderr', file=sys.stderr, flush=True); "
+        "Path('timeout-ready').touch(); time.sleep(300)"
+    )
+    if lang == "bash":
+        code = "echo 'timeout stdout'; echo 'timeout stderr' >&2; touch timeout-ready; sleep 300"
+    communicate = subprocess.Popen.communicate
+    forced = False
+
+    def expire(
+        self: subprocess.Popen[str], input: str | None = None, timeout: float | None = None
+    ) -> tuple[str, str]:
+        nonlocal forced
+        if (
+            not forced
+            and isinstance(self.args, list)
+            and (self.args[0] == str(docs_bindir() / "python") or self.args[0] == "bash")
+        ):
+            forced = True
+            deadline = time.monotonic() + 60
+            while not (workdir / "timeout-ready").exists():
+                assert self.poll() is None, "driver exited before output readiness"
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            assert timeout == 60
+            return communicate(self, input=input, timeout=0.05)
+        return communicate(self, input=input, timeout=timeout)
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", expire)
+    marker = "<!-- docs-test: run -->\n" if lang == "bash" else ""
+    line = 3 if lang == "bash" else 2
+    with pytest.raises(AssertionError, match=f"timeout.md:{line} timed out") as caught:
+        run_blocks(
+            parse_blocks(f"heading\n{marker}```{lang}\n{code}\n```"),
+            source="timeout.md",
+            workdir=workdir,
+            bindir=docs_bindir(),
+            timeout_s=60,
+        )
+    assert "timeout stdout" in str(caught.value)
+    assert "timeout stderr" in str(caught.value)
+
+
+def test_skip_reasons_have_no_stub_text() -> None:
+    paths = [REPO / "README.md", *(REPO / "docs").rglob("*.md")]
+    assert [
+        f"{path.relative_to(REPO)}:{block.line}"
+        for path in paths
+        if not {"superpowers", "_build"} & set(path.relative_to(REPO).parts)
+        for block in parse_blocks(path.read_text(encoding="utf-8"))
+        if block.kind == "skip" and STUB_TEXT.search(block.arg)
+    ] == []
+
+
+OWN_FILES_EXPECTED = "ok: loss=0.25, check=True, key=(-0.25,)"
+
+
+def test_own_files_expected_output_matches_documentation() -> None:
+    text = page_path("Use your own files and script").read_text(encoding="utf-8")
+    example = text.split("## Try it offline\n", 1)[1].split("\n## ", 1)[0]
+    assert [block.code.strip() for block in parse_blocks(example) if block.lang == "text"] == [
+        OWN_FILES_EXPECTED
+    ]
+
+
+@pytest.mark.usefixtures("owned_processes")
+def test_own_files_offline_example_timeout_owns_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = Path.read_text
+    text = original(page_path("Use your own files and script"), encoding="utf-8")
+    driver = next(
+        b.code for b in parse_blocks(text) if b.kind == "file" and b.arg == "try_scripts.py"
+    )
+    held = (
+        _held_tree(tmp_path, executor=True, detached=True).replace(
+            "assert os.getpgid(0) == os.getpid(), 'driver must own its group'\n", ""
+        )
+        + "time.sleep(300)\n"
+    )
+    mutated = text.replace(driver, held, 1)
+    identities: dict[int, str] = {}
+    communicate = subprocess.Popen.communicate
+    forced = False
+
+    def read_text(self: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        if self == ROOT / "docs/own-files.md":
+            return mutated
+        return original(self, encoding=encoding, errors=errors)
+
+    def expire(
+        self: subprocess.Popen[str], input: str | None = None, timeout: float | None = None
+    ) -> tuple[str, str]:
+        nonlocal forced
+        if (
+            not forced
+            and isinstance(self.args, list)
+            and self.args[0] in {sys.executable, str(docs_bindir() / "python")}
+        ):
+            forced = True
+            identities.update(_wait_ready(tmp_path, ("driver", "child", "grandchild"), self))
+            return communicate(self, input=input, timeout=0.05)
+        return communicate(self, input=input, timeout=timeout)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(subprocess.Popen, "communicate", expire)
+    try:
+        with pytest.raises(AssertionError, match=r"own-files\.md:.* timed out"):
+            test_own_files_offline_example_runs(tmp_path)
+        _assert_recorded_pids_gone(identities)
+    finally:
+        _emergency_reap_recorded(identities)
+
+
+@pytest.mark.parametrize("mutation", ["route_file", "validator_file", "assertion"])
+def test_connector_conformance_detects_broken_files_and_assertions(
+    mutation: str, tmp_path: Path
+) -> None:
+    text = page_path("Writing a connector").read_text(encoding="utf-8")
+    old, new = {
+        "route_file": ("file my_connector/route.py", "file my_connector/routes.py"),
+        "validator_file": ("file my_connector/validate.py", "file my_connector/validates.py"),
+        "assertion": ('out.data == {"target": "CCO"', 'out.data == {"target": "WRONG"'),
+    }[mutation]
+    assert old in text
+    with pytest.raises(AssertionError, match="exited"):
+        run_blocks(
+            parse_blocks(text.replace(old, new, 1)),
+            source="connector.md",
+            workdir=make_workdir(tmp_path, with_examples=False),
+            bindir=docs_bindir(),
+        )
+
+
+def test_connector_ray_example_is_explicitly_not_credited(tmp_path: Path) -> None:
+    text = page_path("Writing a connector").read_text(encoding="utf-8")
+    block = next(b for b in parse_blocks(text) if "async def test_tool_on_ray" in b.code)
+    assert block.kind == "skip"
+    assert "cluster" in block.arg
+    assert not block_runs(
+        block, workdir=make_workdir(tmp_path, with_examples=False), bindir=docs_bindir()
+    )
 
 
 def test_shared_lookup_helpers(tmp_path: Path) -> None:
@@ -774,3 +1004,81 @@ def test_page_blocks_run(title: str, pid: str, tmp_path: Path) -> None:
         workdir=make_workdir(tmp_path, with_examples=True),
         bindir=docs_bindir(),
     )
+
+
+def test_process_tree_snapshot_follows_parents_across_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from _fakes import process_cleanup
+    from _fakes.process_cleanup import ProcessIdentity
+
+    table = {
+        r.pid: r
+        for r in [
+            ProcessIdentity(6000, 1, 6000, "driver"),
+            ProcessIdentity(6001, 6000, 6001, "child"),
+            ProcessIdentity(6002, 6001, 6002, "grandchild"),
+            ProcessIdentity(6003, 1, 6003, "unrelated"),
+        ]
+    }
+    monkeypatch.setattr(process_cleanup, "process_table", lambda: table)
+    assert process_cleanup.snapshot_process_tree(6000) == {
+        pid: table[pid] for pid in (6000, 6001, 6002)
+    }
+
+
+def test_process_tree_reaper_kills_every_owned_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import Mock
+
+    from _fakes import process_cleanup
+    from _fakes.process_cleanup import ProcessIdentity
+
+    table = {pid: ProcessIdentity(pid, pid - 1, pid, str(pid)) for pid in (6000, 6001, 6002)}
+    tables = iter((table, {}))
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(process_cleanup, "process_table", lambda: next(tables))
+    monkeypatch.setattr(process_cleanup, "reap_children", lambda children: [])
+    monkeypatch.setattr(process_cleanup.os, "getpgrp", lambda: 0)
+    monkeypatch.setattr(process_cleanup.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    process_cleanup.reap_process_tree(Mock(spec=subprocess.Popen), "6000", table)
+    assert set(signals) == {(pid, signal.SIGKILL) for pid in table}
+
+
+def test_process_tree_reaper_verifies_pid_exit_and_refuses_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+
+    from _fakes import process_cleanup
+    from _fakes.process_cleanup import ProcessIdentity
+
+    record = ProcessIdentity(6000, 1, 6000, "captured")
+    current = {6000: record}
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(process_cleanup, "process_table", lambda: current)
+    monkeypatch.setattr(process_cleanup, "reap_children", lambda children: [])
+    monkeypatch.setattr(process_cleanup.os, "getpgrp", lambda: 0)
+    monkeypatch.setattr(process_cleanup.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    with pytest.raises(AssertionError, match="identities remained"):
+        process_cleanup.reap_process_tree(
+            Mock(spec=subprocess.Popen), "captured", {6000: record}, timeout_s=0
+        )
+    assert signals == [(6000, signal.SIGKILL)]
+    signals.clear()
+    current[6000] = ProcessIdentity(6000, 1, 6000, "replacement")
+    process_cleanup.reap_process_tree(
+        Mock(spec=subprocess.Popen), "captured", {6000: record}, timeout_s=0
+    )
+    assert signals == []
+
+
+def test_connector_executable_examples_do_not_require_pytest() -> None:
+    blocks = parse_blocks(page_path("Writing a connector").read_text(encoding="utf-8"))
+    assert [
+        block.line
+        for block in blocks
+        if block.lang == "python" and block.kind != "skip"
+        for node in ast.walk(ast.parse(block.code))
+        if (isinstance(node, ast.Import) and any(n.name == "pytest" for n in node.names))
+        or (isinstance(node, ast.ImportFrom) and node.module == "pytest")
+    ] == []
