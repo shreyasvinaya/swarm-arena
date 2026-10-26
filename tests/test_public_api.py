@@ -38,6 +38,23 @@ def test_all_matches_spec(module: str) -> None:
 def test_public_names_report_facade_module(module: str) -> None:
     import_public(module)
     objs = [(n, public_object(module, n)) for n in PUBLIC_ALL[module] if deps_present(module, n)]
+    classes = [(name, obj) for name, obj in objs if isinstance(obj, type)]
+    while classes:
+        name, cls = classes.pop()
+        prefix = cls.__qualname__ + "."
+        for attr, value in vars(cls).items():
+            if isinstance(value, type):
+                if not attr.startswith("_") and value.__qualname__.startswith(prefix):
+                    nested = (f"{name}.{attr}", value)
+                    objs.append(nested)
+                    classes.append(nested)
+                continue
+            if isinstance(value, classmethod | staticmethod):
+                value = value.__func__
+            elif isinstance(value, property):
+                value = value.fget
+            if inspect.isfunction(value) and value.__qualname__.startswith(prefix):
+                objs.append((f"{name}.{attr}", value))
     assert [n for n, o in objs if o.__module__ != module] == []
     assert [
         n
@@ -58,6 +75,81 @@ def test_facades_hold_only_imports_and_all(module: str) -> None:
         PUBLIC_SUBMODULES | ENTRY_MODULES if module == "swarm_arena" else set()
     )
     assert {n for n in vars(mod) if not n.startswith("_")} - allowed == set()
+
+
+@pytest.mark.parametrize("module", PUBLIC_ALL)
+def test_facade_bodies_hold_only_sanctioned_statements(module: str) -> None:
+    import ast
+    from pathlib import Path
+
+    sanctioned = {
+        "swarm_arena.llm": """
+_EXTRA_DEPS = ("agents", "litellm")
+for _dist, _module in (("openai-agents", "agents"), ("litellm", "litellm")):
+    try:
+        _metadata.version(_dist)
+    except _metadata.PackageNotFoundError:
+        raise ModuleNotFoundError(_MSG, name=_module) from None
+try:
+    from swarm_arena.llm import _catalog as _catalog
+    from swarm_arena.llm import _logger as _logger
+    import agents as _agents
+except ModuleNotFoundError as _exc:
+    if _exc.name in _EXTRA_DEPS:
+        raise ModuleNotFoundError(_MSG, name=_exc.name) from None
+    raise
+""",
+        "swarm_arena.testing": """
+_LAZY = ("FakeModel", "FakeTurn")
+def __getattr__(name: str) -> _Any:
+    if name not in _LAZY:
+        raise AttributeError(name)
+    _importlib.import_module("swarm_arena.llm")
+    obj = getattr(_importlib.import_module("swarm_arena.testing._fake_model"), name)
+    globals()[name] = obj
+    _publish(__name__, [name])
+    return obj
+def __dir__() -> list[str]:
+    return sorted({*globals(), *__all__})
+""",
+    }
+    allowed = [ast.dump(node) for node in ast.parse(sanctioned.get(module, "")).body]
+    publish_names = (
+        "[n for n in __all__ if n not in _LAZY]" if module == "swarm_arena.testing" else "__all__"
+    )
+    publish_call = ast.dump(ast.parse(f"_publish(__name__, {publish_names})").body[0])
+    spec = importlib.util.find_spec(module)
+    assert spec is not None
+    assert spec.origin is not None
+    tree = ast.parse(Path(spec.origin).read_text(encoding="utf-8"))
+    assert ast.get_docstring(tree) is not None
+    all_count = publish_count = 0
+    for node in tree.body[1:]:
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            continue
+        targets = (
+            node.targets
+            if isinstance(node, ast.Assign)
+            else [node.target]
+            if isinstance(node, ast.AnnAssign)
+            else []
+        )
+        if len(targets) == 1 and isinstance(targets[0], ast.Name) and targets[0].id == "__all__":
+            assert isinstance(node, ast.Assign | ast.AnnAssign)
+            assert node.value is not None
+            assert ast.literal_eval(node.value) == PUBLIC_ALL[module]
+            all_count += 1
+        elif ast.dump(node) == publish_call:
+            publish_count += 1
+        elif ast.dump(node) in allowed:
+            allowed.remove(ast.dump(node))
+        else:
+            pytest.fail(
+                f"{module}:{node.lineno}: unexpected facade statement {type(node).__name__}"
+            )
+    assert all_count == 1
+    assert publish_count == 1
+    assert allowed == []
 
 
 def test_no_other_public_modules() -> None:
