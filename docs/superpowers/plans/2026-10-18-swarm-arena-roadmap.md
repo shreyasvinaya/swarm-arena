@@ -436,6 +436,7 @@ M3 invocation and integration additions to R3.1 (these extend the existing modul
 | `tests/_surface.py` | The §9 table and import helpers shared by the surface tests; `deps_present` checks distribution metadata, including both `agents` and `litellm` for lazy testing names | M5 |
 | `tests/test_public_api.py` | One `__all__` snapshot test per public module | M1a (exact §9 in M5) |
 | `tests/test_docstrings.py` | numpydoc validation and a required `Examples` section for every public name and its public methods | M1a |
+| `tests/test_compat.py` | §9 rules 2, 3: frozen abstract methods, no I/O in `__init__`, newer `schema_version` refused | M5 |
 | `tests/_docs.py` | Shared docs block parser/runner, target-interpreter dependency probes (complete LLM dependencies), minimal no-key environment, per-worker Sphinx fixture, required-facts helper and stub pattern | M5 |
 | `tests/test_docs.py` | Existing documentation regressions plus docs code-block harness, site structure, required facts, README quickstart, M5 | M1b (+M2 +M3 +M4 +M5) |
 | `tests/test_docs_getting_started.py` | Page-specific required facts and executable documentation regressions for `getting-started` | M5 |
