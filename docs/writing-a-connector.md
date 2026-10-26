@@ -11,7 +11,191 @@ classes at all: `ScriptTool`, `ScriptCheck`, and `ScriptJudge` are configured
 in TOML (see [Use your own files and script](own-files.md)). This page is for
 the case where you write the classes yourself.
 
-The examples on this page are one small connector, `my_connector`, that plans a
+Subclass `Tool` when you need a custom input model, command construction,
+collection, identity, estimates, or extra manager actions. Keep `ScriptTool`
+for programs that already follow the workspace JSON contract. A component's
+`__init__` **does no I/O**; put file, interpreter, and dependency checks or
+other setup side effects in `preflight()`, which runs before execution.
+The tool program is **never imported** by the core. Only the connector class
+is imported; `command()` and `collect()` run next to the tool on its worker.
+
+## A minimal connector
+
+Save this as `echo_tool.py`. Its nested `Config` has no settings; the input
+model exposes one string. The command reads the staged request and writes
+`swarm/result.json`, using the executor's Python interpreter:
+
+<!-- docs-test: file echo_tool.py -->
+```python
+import json
+from pathlib import Path
+
+from pydantic import BaseModel, ConfigDict
+from swarm_arena.tool import Command, CompletedRun, RunStatus, Tool, ToolOutput, ToolRequest
+
+
+class EchoInputs(BaseModel):
+    """Text accepted from the manager."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    text: str
+
+
+class EchoTool(Tool):
+    """Echo a request through a separate Python process."""
+
+    name = "echo"
+    description = "Return the supplied text."
+    input_model = EchoInputs
+
+    class Config(BaseModel):
+        """No plan-level settings are needed for this tool."""
+
+        model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    def command(self, request: ToolRequest, workspace: Path) -> Command:
+        """
+        Build the subprocess command.
+
+        Parameters
+        ----------
+        request : ToolRequest
+            Validated request, also staged by the core.
+        workspace : Path
+            Executor-owned working directory.
+
+        Returns
+        -------
+        Command
+            Program that writes the echo envelope.
+
+        Examples
+        --------
+        >>> EchoTool().command(ToolRequest(inputs={"text": "hi"}), Path(".")).argv[0]
+        'python'
+        """
+        program = (
+            "import json; from pathlib import Path; "
+            "params = json.loads(Path('swarm/request.json').read_text(encoding='utf-8'))['params']; "
+            "Path('swarm/result.json').write_text(json.dumps({'data': params}), encoding='utf-8')"
+        )
+        return Command(argv=["python", "-c", program])
+
+    def collect(self, request: ToolRequest, workspace: Path, run: CompletedRun) -> ToolOutput:
+        """
+        Collect the echoed data, including a stopped run's partial result.
+
+        Parameters
+        ----------
+        request : ToolRequest
+            Original invocation.
+        workspace : Path
+            Directory containing the result file.
+        run : CompletedRun
+            Process outcome supplied by the executor.
+
+        Returns
+        -------
+        ToolOutput
+            Echoed data, or a failed output when no result exists.
+
+        Examples
+        --------
+        The executed ``check_tool`` example below covers result-file I/O.
+        """
+        result = workspace / "swarm" / "result.json"
+        if not result.is_file():
+            return ToolOutput(status=RunStatus.ERROR if run.status == RunStatus.OK else run.status)
+        return ToolOutput(
+            status=run.status,
+            partial=run.status in (RunStatus.TIMEOUT, RunStatus.CANCELLED),
+            data=json.loads(result.read_text(encoding="utf-8"))["data"],
+        )
+```
+
+Run the conformance check with only the core package installed:
+
+```python
+import anyio
+
+from echo_tool import EchoTool
+from swarm_arena.testing import check_tool
+
+output = anyio.run(check_tool, EchoTool(), {"text": "hi"}, backend="asyncio")
+assert output.status == "ok"
+assert output.data == {"text": "hi"}
+```
+
+Save a check as `nonempty_check.py`. It examines structured output directly,
+so it needs no validator subprocess:
+
+<!-- docs-test: file nonempty_check.py -->
+```python
+from swarm_arena.board import Candidate
+from swarm_arena.scoring import Check, CheckContext, CheckResult
+
+
+class NonemptyCheck(Check):
+    """Require nonempty echoed text."""
+
+    name = "nonempty"
+
+    async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
+        """
+        Check the echoed text.
+
+        Parameters
+        ----------
+        candidate : Candidate
+            Output to validate.
+        ctx : CheckContext
+            Execution context, unused by this in-memory check.
+
+        Returns
+        -------
+        CheckResult
+            Pass status and a value-free reason on failure.
+
+        Examples
+        --------
+        The following ``check_check`` example exercises both outcomes.
+        """
+        text = candidate.output.data.get("text")
+        passed = isinstance(text, str) and bool(text.strip())
+        return CheckResult(
+            check=self.name, passed=passed, reasons=[] if passed else ["text is empty"]
+        )
+```
+
+Use the same explicit goal for the candidate and the kit call:
+
+```python
+import anyio
+
+from nonempty_check import NonemptyCheck
+from swarm_arena import Goal
+from swarm_arena.testing import check_check, make_candidate
+from swarm_arena.tool import ToolOutput
+
+goal = Goal(id="echo", namespace="connector-demo")
+
+
+async def check_examples() -> None:
+    candidate = make_candidate(ToolOutput(status="ok", data={"text": "hi"}), goal=goal)
+    result = await check_check(NonemptyCheck(), candidate, goal=goal)
+    assert result.passed
+    print(result)
+    empty = make_candidate(ToolOutput(status="ok", data={"text": ""}), goal=goal)
+    rejected = await check_check(NonemptyCheck(), empty, goal=goal)
+    assert not rejected.passed and rejected.reasons == ["text is empty"]
+
+
+anyio.run(check_examples)
+```
+
+## A domain connector
+
+The remaining examples are one small connector, `my_connector`, that plans a
 synthesis route for a target molecule. Its files are:
 
 ```text
@@ -186,10 +370,12 @@ LiteLLM profile supports soft caps and estimated spend only. See
 [The LLM gateway on the cluster](running-on-ray.md#the-llm-gateway-on-the-cluster)
 for configuration, secret transport, proxy caching/tracing and network rules.
 
-### Optional methods and their defaults
+### Tool methods and their defaults
 
 | Method | Default | Override it to |
 |---|---|---|
+| `command(request, workspace)` | abstract; required | describe the external program with a `Command` |
+| `collect(request, workspace, run)` | abstract; required | return complete or partial `ToolOutput` |
 | `preflight()` | does nothing | check the interpreter, imports, or files before the first run |
 | `is_deterministic(request)` | `True` | return `False` for a stochastic program, so that replicates are allowed |
 | `editable()` | `()` | name the globs of files that a manager may edit or add |
@@ -476,8 +662,8 @@ jobs:
       RAY_ENABLE_UV_RUN_RUNTIME_ENV: "0"
       RAY_USAGE_STATS_ENABLED: "0"
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
         with:
           python-version: "3.11"
       - run: uv sync --extra ray --extra llm --all-groups
@@ -547,6 +733,9 @@ model-driven managers. `FakeModel` can also supply scripted turns to an
 `LLMJudge` (see the offline judge example below). These checks need no provider
 credentials. A caller-supplied executor belongs to the caller and remains open
 after a kit call; close it in `finally`.
+
+The Ray option is `check_tool(..., executor=RayExecutor(...))`; retain that
+executor in a variable as in the example so you can close it explicitly.
 
 Include assertions on file bytes, overlays and edits, both logs and stopped
 results. `read_output_file` and `read_logs` read retained artifacts after the
