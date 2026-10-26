@@ -4,7 +4,10 @@ import argparse
 import importlib.metadata
 import json
 import os
+import re
 import shlex
+import subprocess
+import sys
 import tomllib
 import traceback
 from pathlib import Path
@@ -552,15 +555,22 @@ def test_override_parser_rejects_unsupported_requirements(requirement: str) -> N
 
 
 @pytest.mark.parametrize(
-    ("canary", "versions", "valid"),
+    ("canary", "versions", "valid", "record_in_cwd"),
     [
-        (False, {"openai-agents": "0.24.0", "litellm": "1.107.0rc2"}, True),
-        (False, {"openai-agents": "0.25.0", "litellm": "1.108.0"}, False),
-        (False, {"openai-agents": "0.24.0", "litellm": "1.107.0rc1"}, False),
-        (True, {"openai-agents": "0.25.0", "litellm": "1.108.0"}, True),
-        (True, {"openai-agents": "0.24.0", "litellm": "1.107.0rc2"}, True),
-        (True, {"openai-agents": "0.23.0", "litellm": "1.108.0"}, False),
-        (True, {"openai-agents": "0.25.0", "litellm": "1.106.4"}, False),
+        (False, {"openai-agents": "0.24.0", "litellm": "1.107.0rc2"}, True, False),
+        (False, {"openai-agents": "0.25.0", "litellm": "1.108.0"}, False, False),
+        (False, {"openai-agents": "0.24.0", "litellm": "1.107.0rc1"}, False, False),
+        (True, {"openai-agents": "0.25.0", "litellm": "1.108.0"}, True, False),
+        (True, {"openai-agents": "0.24.0", "litellm": "1.107.0rc2"}, True, False),
+        (True, {"openai-agents": "0.23.0", "litellm": "1.108.0"}, False, False),
+        (True, {"openai-agents": "0.25.0", "litellm": "1.106.4"}, False, False),
+        pytest.param(
+            False,
+            {"openai-agents": "0.25.0", "litellm": "1.108.0"},
+            False,
+            True,
+            id="record-in-cwd-does-not-select-canary",
+        ),
     ],
 )
 def test_upstream_version_policy(
@@ -569,9 +579,13 @@ def test_upstream_version_policy(
     canary: bool,
     versions: dict[str, str],
     valid: bool,
+    record_in_cwd: bool,
 ) -> None:
     monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
     monkeypatch.delenv("SWARM_ARENA_UPSTREAM_CANARY", raising=False)
+    if record_in_cwd:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "upstream-installed.json").write_text(json.dumps(versions), encoding="utf-8")
     if canary:
         record = tmp_path / "installed.json"
         record.write_text(json.dumps(versions), encoding="utf-8")
@@ -719,6 +733,52 @@ def test_upstream_install_command_semantics(
     else:
         with pytest.raises((AssertionError, ValueError)):
             test_upstream_workflow()
+
+
+def test_canary_executes_all_upstream_facts_without_skips(tmp_path: Path) -> None:
+    pytest.importorskip("agents")
+    record = tmp_path / "installed.json"
+    environment = dict(os.environ)
+    environment.pop("SWARM_ARENA_UPSTREAM_CANARY", None)
+    recorded = subprocess.run(
+        [sys.executable, str(REPO / "tests/test_ci_config.py"), "--record-upstream", str(record)],
+        cwd=REPO,
+        env=environment,
+        capture_output=True,
+        encoding="utf-8",
+        timeout=180,
+        check=False,
+    )
+    assert recorded.returncode == 0, recorded.stdout + recorded.stderr
+    assert json.loads(record.read_text(encoding="utf-8")) == _installed_upstream_versions()
+    passed_counts = []
+    for canary in (False, True):
+        if canary:
+            environment["SWARM_ARENA_UPSTREAM_CANARY"] = str(record)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "no:cacheprovider",
+                "-rs",
+                "tests/llm/test_upstream_facts.py",
+            ],
+            cwd=REPO,
+            env=environment,
+            capture_output=True,
+            encoding="utf-8",
+            timeout=180,
+            check=False,
+        )
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        assert re.search(r"\b\d+ (?:skipped|deselected)\b", output) is None, output
+        [passed] = re.findall(r"\b(\d+) passed\b", output)
+        assert int(passed) > 0, output
+        passed_counts.append(int(passed))
+    assert passed_counts[0] == passed_counts[1]
 
 
 if __name__ == "__main__":
