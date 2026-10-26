@@ -501,10 +501,11 @@ establish that both complete calls fit.
 
 ## Caching
 
-Provider prompt caching is on by default. Stable instructions, tools, the
-frozen goal and its reference files precede changing round facts.
-Prompts shorter than the provider's minimum do not receive its caching benefit;
-enabling caching does not guarantee a cache hit.
+Provider prompt caching is on by default in the model configuration. Stable
+instructions, tools, the frozen goal and its reference files precede changing
+round facts. swarm-arena sends supported cache hints but does not enforce
+provider minimum prompt lengths or guarantee a cache hit; consult the selected
+provider's policy for prompts shorter than the provider's minimum.
 
 | Provider | Prompt-cache behavior |
 | --- | --- |
