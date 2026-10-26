@@ -28,9 +28,14 @@ REPO = Path(__file__).resolve().parents[1]
 def _checkout_snapshot(root: Path) -> dict[str, str]:
     # Runtime caches can be populated by pytest/xdist independently of the build.
     ignored = {".git", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache"}
+    # Local workspaces and docs output are written by other tools while a build runs.
+    local = {".superpowers", "tasks", ".claude", "docs/_build"}
     snapshot: dict[str, str] = {}
     for directory, dirs, files in os.walk(root):
-        dirs[:] = sorted(name for name in dirs if name not in ignored)
+        here = Path(directory).relative_to(root)
+        dirs[:] = sorted(
+            name for name in dirs if name not in ignored and (here / name).as_posix() not in local
+        )
         for name in [*dirs, *(name for name in files if name not in ignored)]:
             path = Path(directory) / name
             relative = path.relative_to(root).as_posix()
@@ -244,9 +249,13 @@ def test_license_is_mit() -> None:
     assert "Shreyas Vinaya" in text
 
 
-@pytest.mark.parametrize(("released_on", "valid"), [("2026-10-27", True), ("2026-10-28", False)])
+@pytest.mark.parametrize(
+    ("hour", "released_on", "valid"),
+    # At 05:00Z the latest calendar day anywhere is still 2026-10-26.
+    [(19, "2026-10-27", True), (19, "2026-10-28", False), (5, "2026-10-27", False)],
+)
 def test_changelog_date_uses_latest_calendar_day(
-    monkeypatch: pytest.MonkeyPatch, released_on: str, valid: bool
+    monkeypatch: pytest.MonkeyPatch, hour: int, released_on: str, valid: bool
 ) -> None:
     class FrozenDate(date):
         @classmethod
@@ -257,7 +266,7 @@ def test_changelog_date_uses_latest_calendar_day(
         @classmethod
         def now(cls, tz: tzinfo | None = None) -> "FrozenDatetime":
             assert tz is UTC
-            return cls(2026, 10, 26, 19, tzinfo=UTC)
+            return cls(2026, 10, 26, hour, tzinfo=UTC)
 
     monkeypatch.setattr(sys.modules[__name__], "date", FrozenDate)
     monkeypatch.setattr(sys.modules[__name__], "datetime", FrozenDatetime)

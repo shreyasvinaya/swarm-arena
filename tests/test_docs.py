@@ -109,11 +109,17 @@ def _install_violations(text: str, *, python: bool = False) -> list[str]:
         except ValueError:
             violations.append("Malformed install command")
             continue
+        takes_value = {"--python", "-p", "--index-url", "--extra-index-url", "--find-links", "-f"}
+        arguments = iter(arguments)
         for argument in arguments:
-            requirement = argument.removeprefix("--editable=").rstrip(";,")
-            if requirement in {".", "..", "./", "../"} or (
-                re.search(r"(?:^|/)(?:agent-swarm|swarm-arena)(?:\[[^\]]+\])?/?$", requirement)
-                and "/" in requirement
+            if argument in takes_value:
+                next(arguments, None)  # an option's value is not a requirement
+                continue
+            requirement = argument.rstrip(";,")
+            if (
+                requirement in {"-e", "--editable"}
+                or requirement.startswith(("--editable=", ".", "/", "~"))
+                or "file://" in requirement
             ):
                 violations.append(match.group())
                 break
@@ -172,11 +178,23 @@ def test_install_guard_rejects_mixed_forms(command: str, quote: str, extras: str
         "uv add swarm-arena@file:///absolute/path/to/agent-swarm",
         "uv add --editable .",
         "uv pip install -e .",
+        "uv add -e .[ray]",
+        'uv add --editable ".[ray]"',
+        'uv pip install -e ".[dev]"',
+        "uv add --editable ~/src/arena",
+        "uv add --editable /home/me/code/swarm-arena-main",
+        "uv add ~/src/arena",
+        "uv add .[ray]",
     ],
 )
 def test_install_guard_rejects_local_package_installs(command: str) -> None:
     assert _install_violations(command)
     assert _install_violations(f"uv add swarm-arena\n{command}")
+
+
+def test_install_guard_allows_option_values_and_a_built_wheel() -> None:
+    command = 'uv pip install --python "$VENV/bin/python" dist/swarm_arena-0.1.0-py3-none-any.whl'
+    assert _install_violations(command) == []
 
 
 def test_install_guard_limits_local_exception_to_contributor_setup() -> None:
