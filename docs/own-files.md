@@ -222,6 +222,7 @@ to this current directory and manages a local executor.
 
 The tool reads parameters and an editable problem file, then writes a result:
 
+<!-- docs-test: file problem/run.py -->
 ```python
 import json
 import os
@@ -237,6 +238,7 @@ Path(os.environ["SWARM_ARENA_RESULT"]).write_text(json.dumps({"data": {"loss": l
 
 The check sees the candidate's edited file and its recorded output:
 
+<!-- docs-test: file checks/check.py -->
 ```python
 import json
 import os
@@ -256,6 +258,7 @@ Path(os.environ["SWARM_ARENA_RESULT"]).write_text(
 
 The judge returns a loss; its configuration below makes smaller values better:
 
+<!-- docs-test: file judge/score.py -->
 ```python
 import json
 import os
@@ -269,6 +272,7 @@ Path(os.environ["SWARM_ARENA_RESULT"]).write_text(json.dumps({"value": output["d
 
 All imports use the public API:
 
+<!-- docs-test: file try_scripts.py -->
 ```python
 from pathlib import Path
 
@@ -317,6 +321,11 @@ if __name__ == "__main__":
 ```
 
 Expected output:
+
+<!-- docs-test: run -->
+```bash
+python try_scripts.py
+```
 
 ```text
 ok: loss=0.25, check=True, key=(-0.25,)
@@ -501,6 +510,7 @@ valid `result.json`. Failed, timed-out, or invalid collection gives empty data,
 `partial=false`, and a note. Write partial results atomically so collection never
 sees half a JSON document:
 
+<!-- docs-test: file write_partial.py -->
 ```python
 import json
 import os
@@ -521,6 +531,7 @@ invocation. Check/judge jobs have empty team and agent values.
 `"python"` becomes the configured `python` interpreter or the current
 interpreter. Programs start directly, never through `uv run`.
 
+<!-- docs-test: file invocation_env.py -->
 ```python
 import os
 
@@ -583,6 +594,7 @@ solver file.
 
 Checks write a raw object, without the tool's `data` envelope:
 
+<!-- docs-test: file check_result.py -->
 ```python
 import json
 import os

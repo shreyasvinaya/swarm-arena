@@ -29,6 +29,7 @@ tests/
 
 A tool says **what** to run. The executor decides **where** it runs.
 
+<!-- docs-test: file my_connector/tools.py -->
 ```python
 # my_connector/tools.py
 import json
@@ -85,6 +86,7 @@ class RouteTool(Tool):
         )
 ```
 
+<!-- docs-test: file my_connector/route.py -->
 ```python
 # my_connector/route.py: the program. The core never imports it.
 import json
@@ -225,6 +227,7 @@ and never holds secret values.
 The check and the judge of `my_connector`, and the validator program that the
 check runs:
 
+<!-- docs-test: file my_connector/scoring.py -->
 ```python
 # my_connector/scoring.py
 from collections.abc import Sequence
@@ -278,6 +281,7 @@ class FewestSteps(Judge):
         return scores
 ```
 
+<!-- docs-test: file my_connector/validate.py -->
 ```python
 # my_connector/validate.py: runs in the check's workspace, next to candidate/
 import json
@@ -471,6 +475,7 @@ until the first release, add the package with
 Use your connector test paths in the job. A Ray tool case takes this form,
 using the `RouteTool` from this guide:
 
+<!-- docs-test: requires ray -->
 ```python
 import pytest
 
@@ -530,6 +535,7 @@ Install the optional SDK with
 `swarm_arena.testing` itself does not load the SDK; accessing `FakeModel` or
 `FakeTurn` loads it. No API key is needed for scripted calls:
 
+<!-- docs-test: requires llm -->
 ```python
 import asyncio
 
@@ -552,6 +558,7 @@ assert model.calls[0]["input"]
 For a component that resolves a catalog alias, register the instance and use
 the corresponding `fake/` model in the run configuration:
 
+<!-- docs-test: requires llm -->
 ```python
 import asyncio
 
@@ -728,6 +735,7 @@ The `llm` extra supplies `LLMJudge`; the conformance kit accepts its real model
 catalog through `config=`. Register a fresh `FakeModel` for each test. This
 example performs no provider request and verifies journaled call links:
 
+<!-- docs-test: requires llm -->
 ```python
 import asyncio
 import json

@@ -10,6 +10,7 @@
 `FunctionTool` wraps an importable, synchronous Python function. Put the function
 in a module, for example `my_tools.py`:
 
+<!-- docs-test: file my_tools.py -->
 ```python
 def add(a: int, b: int = 1) -> dict[str, int]:
     """Add two numbers."""

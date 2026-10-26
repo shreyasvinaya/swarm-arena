@@ -85,6 +85,7 @@ Install the `llm` extra and configure model aliases with the `judge` role.
 `LLMJudge` scores each candidate independently against a fixed rubric and a
 finite scale (0–10 by default). Include concrete score anchors in the rubric:
 
+<!-- docs-test: requires llm -->
 ```python
 from swarm_arena.llm import LLMJudge
 
@@ -262,16 +263,26 @@ its recorded scores. Each goal contributes up to 20 rows by default. Main and
 part groups use their own recorded ranking judges; replaced part identities
 are excluded. Export reads one committed head and does not import judge plugins.
 
+<!-- docs-test: skip needs a committed run and an edited human-review CSV -->
 ```python
 from pathlib import Path
+
+import anyio
+
 from swarm_arena import RunConfig
 from swarm_arena.scoring import HumanReview
 
-config = RunConfig.load(Path("runs/my-run/run.toml"))
-review = HumanReview("alice")
-out = await review.export("my-run", config=config, out_dir=Path("review"), top=20)
-# After editing review/review.csv:
-scores = await review.import_csv("my-run", out / "review.csv", config=config)
+
+async def review_run() -> None:
+    config = RunConfig.load(Path("runs/my-run/run.toml"))
+    review = HumanReview("alice")
+    out = await review.export("my-run", config=config, out_dir=Path("review"), top=20)
+    # After editing review/review.csv:
+    scores = await review.import_csv("my-run", out / "review.csv", config=config)
+    print(scores)
+
+
+anyio.run(review_run)
 ```
 
 Reviewer names are 1–64 character lowercase slugs: `[a-z0-9][a-z0-9._-]*`.

@@ -1,4 +1,6 @@
-# Ray execution
+# swarm_arena.ray
+
+Needs the `ray` extra.
 
 Install the `ray` extra to use the public executor. See [Running on Ray](../running-on-ray.md)
 for cluster setup, resource scheduling, cancellation and recovery limits.

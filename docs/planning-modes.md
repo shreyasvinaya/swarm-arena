@@ -250,11 +250,20 @@ set, every used model alias needs a known price, from explicit catalog prices
 or the bundled price map. Unused catalog aliases need no price. `LLMPlanner`
 checks aliases before opening a standalone planning session or making a paid call.
 
+<!-- docs-test: skip needs configured model credentials and a provider planning call -->
 ```python
+import anyio
+
 from swarm_arena.llm import LLMPlanner
 
-# config contains your model aliases, limits, and permitted component entries.
-plan = await LLMPlanner("planner").plan(goal, config, None)
+from swarm_arena import Goal, Plan, RunConfig
+
+
+async def create_plan(goal: Goal, config: RunConfig) -> Plan:
+    return await LLMPlanner("planner").plan(goal, config, None)
+
+
+plan = anyio.run(create_plan, Goal(id="research", namespace="toy"), RunConfig.load("run.toml"))
 ```
 
 The model selects catalog entry names and fills only their `settable` fields.
@@ -336,8 +345,11 @@ and review.
 
 Using the same `goal` and catalog-backed `config` as LLM planning:
 
+<!-- docs-test: skip needs configured model credentials and a provider planning call -->
 ```python
-from swarm_arena import Plan
+import anyio
+
+from swarm_arena import Goal, Plan, RunConfig
 from swarm_arena.llm import Approve, CollaborativePlanner, LLMPlanner
 
 
@@ -347,8 +359,14 @@ class ApprovingReviewer:
         return Approve()
 
 
-planner = CollaborativePlanner(LLMPlanner("planner"), ApprovingReviewer())
-plan = await planner.plan(goal, config, None)
+async def create_reviewed_plan(goal: Goal, config: RunConfig) -> Plan:
+    planner = CollaborativePlanner(LLMPlanner("planner"), ApprovingReviewer())
+    return await planner.plan(goal, config, None)
+
+
+plan = anyio.run(
+    create_reviewed_plan, Goal(id="research", namespace="toy"), RunConfig.load("run.toml")
+)
 ```
 
 The private terminal adapter is provided for the plan CLI. It displays TOML
