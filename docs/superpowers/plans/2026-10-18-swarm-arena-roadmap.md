@@ -437,6 +437,7 @@ M3 invocation and integration additions to R3.1 (these extend the existing modul
 | `tests/test_public_api.py` | One `__all__` snapshot test per public module | M1a (exact §9 in M5) |
 | `tests/test_docstrings.py` | numpydoc validation and a required `Examples` section for every public name and its public methods | M1a |
 | `tests/test_compat.py` | §9 rules 2, 3: frozen abstract methods, no I/O in `__init__`, newer `schema_version` refused | M5 |
+| `tests/test_ci_config.py` | Shared safe YAML/workflow helpers and Read the Docs configuration parity with the locked docs CI job | M5 |
 | `tests/_docs.py` | Shared docs block parser/runner, target-interpreter dependency probes (complete LLM dependencies), minimal no-key environment, per-worker Sphinx fixture, required-facts helper and stub pattern | M5 |
 | `tests/test_docs.py` | Existing documentation regressions plus docs code-block harness, site structure, required facts, README quickstart, M5 | M1b (+M2 +M3 +M4 +M5) |
 | `tests/test_docs_getting_started.py` | Page-specific required facts and executable documentation regressions for `getting-started` | M5 |
@@ -3274,6 +3275,8 @@ Other fixed values: `Learning.title` ≤ 120 characters, `Learning.text` ≤ 1,5
 19. **Deviation from §4.2 (A2A parent links):** `Task` has no `reference_task_ids` field in A2A v1.0.1. A tool-run task records its parent candidate ids on one request `Message.reference_task_ids` in `Task.history`. Tool-run and agent-round records take an explicit aware `at` timestamp from the output or event; their JSON uses proto camelCase field names and UTC millisecond timestamps.
 
 20. **Deviation from §11 (LLM dependency versions), Ruling P39:** use `openai-agents[litellm]>=0.24,<0.25` with `litellm>=1.107.0rc2,<1.108` for `llm` and `litellm[caching,proxy]>=1.107.0rc2,<1.108` for `cache`. The spec's 1.105 range cannot resolve with openai-agents 0.24; M3's upstream facts were re-checked at the pinned 1.107 release candidate. M5 release gate: move the lower bound to 1.107.0 final and re-run the upstream facts before the first release.
+
+21. Test-only dev dependency `pyyaml>=6` parses `.readthedocs.yaml` and the workflow files, M5.
 
 
 ### Delivered provider-state interface additions
