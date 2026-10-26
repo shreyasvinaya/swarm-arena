@@ -153,6 +153,7 @@ Registered ownership and terminal cleanup failures retain their core stop behavi
 these actions. Its `model` is an alias in the
 run configuration's model catalog and must permit the `manager` role:
 
+<!-- docs-test: requires llm -->
 ```python
 from swarm_arena import Ref
 from swarm_arena.manager import Manager

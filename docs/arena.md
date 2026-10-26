@@ -186,12 +186,19 @@ rule. Hidden learnings do not participate. Duplicate refusals identify learning
 IDs without echoing titles or bodies.
 
 ```python
-learning = await ctx.post_learning(
-    title="Fitting log(nu) converged in 8 iterations",
-    text="The raw-nu fit took 24 iterations on the same grid.",
-    evidence=[candidate.id],
-    refines=[previous_learning.id],
-)
+from swarm_arena.board import Candidate, Learning
+from swarm_arena.manager import AgentContext
+
+
+async def post_result(
+    ctx: AgentContext, candidate: Candidate, previous_learning: Learning
+) -> Learning:
+    return await ctx.post_learning(
+        title="Fitting log(nu) converged in 8 iterations",
+        text="The raw-nu fit took 24 iterations on the same grid.",
+        evidence=[candidate.id],
+        refines=[previous_learning.id],
+    )
 ```
 
 Posting charges one action turn. Invalid posts allocate no learning ID and do
@@ -379,6 +386,7 @@ Install the optional integration with
 `uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`,
 then configure an approved model with the `curator` role:
 
+<!-- docs-test: requires llm -->
 ```python
 from swarm_arena import Limits, Ref, RunConfig
 from swarm_arena.config import ModelCatalog, ModelSpec

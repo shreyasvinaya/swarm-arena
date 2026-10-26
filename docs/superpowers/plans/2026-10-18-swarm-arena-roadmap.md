@@ -436,6 +436,19 @@ M3 invocation and integration additions to R3.1 (these extend the existing modul
 | `tests/_surface.py` | The §9 table and import helpers shared by the surface tests; `deps_present` checks distribution metadata, including both `agents` and `litellm` for lazy testing names | M5 |
 | `tests/test_public_api.py` | One `__all__` snapshot test per public module | M1a (exact §9 in M5) |
 | `tests/test_docstrings.py` | numpydoc validation and a required `Examples` section for every public name and its public methods | M1a |
+| `tests/_docs.py` | Shared docs block parser/runner, target-interpreter dependency probes (complete LLM dependencies), minimal no-key environment, per-worker Sphinx fixture, required-facts helper and stub pattern | M5 |
+| `tests/test_docs.py` | Existing documentation regressions plus docs code-block harness, site structure, required facts, README quickstart, M5 | M1b (+M2 +M3 +M4 +M5) |
+| `tests/test_docs_getting_started.py` | Page-specific required facts and executable documentation regressions for `getting-started` | M5 |
+| `tests/test_docs_concepts.py` | Page-specific required facts and executable documentation regressions for `concepts` | M5 |
+| `tests/test_docs_own_files.py` | Page-specific required facts and executable documentation regressions for `own-files` | M5 |
+| `tests/test_docs_writing_a_connector.py` | Page-specific required facts and executable documentation regressions for `writing-a-connector` | M5 |
+| `tests/test_docs_planning_modes.py` | Page-specific required facts and executable documentation regressions for `planning-modes` | M5 |
+| `tests/test_docs_scoring_and_review.py` | Page-specific required facts and executable documentation regressions for `scoring-and-review` | M5 |
+| `tests/test_docs_limits_and_safety.py` | Page-specific required facts and executable documentation regressions for `limits-and-safety` | M5 |
+| `tests/test_docs_running_on_ray.py` | Page-specific required facts and executable documentation regressions for `running-on-ray` | M5 |
+| `tests/test_docs_arena.py` | Page-specific required facts and executable documentation regressions for `arena` | M5 |
+| `tests/test_docs_versioning.py` | Page-specific required facts and executable documentation regressions for `versioning` | M5 |
+| `tests/test_docs_roadmap.py` | Page-specific required facts and executable documentation regressions for `roadmap` | M5 |
 | `tests/test_import_isolation.py` | `import swarm_arena` (and each core facade) loads no optional dependency | M1a |
 | `tests/e2e/test_single_run.py` | M1a exit test | M1a |
 | `tests/e2e/test_rosenbrock.py`, `test_own_script.py`, `test_many_goals_parts.py`, `test_cli_lifecycle.py`, `test_crash_resume.py`, `test_fencing.py` | M1b exit tests | M1b |
