@@ -1,3 +1,4 @@
+import ast
 import doctest
 import enum
 import importlib.metadata
@@ -9,12 +10,23 @@ import numpydoc.validate
 import pytest
 from _pytest.mark.structures import ParameterSet
 from _surface import LAZY_DEPS, PUBLIC_ALL, deps_present, import_public, resolve
+from numpydoc.docscrape import NumpyDocString
 from pydantic import BaseModel
 
 from swarm_arena.board import Board, BoardView
 
 IGNORED = frozenset({"SA01", "ES01"})
 DOCTEST_FLAGS = doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE
+IO_ONLY_EXAMPLES = {
+    "swarm_arena.Swarm.resume": "Reads a persisted run and resumes execution services.",
+    "swarm_arena.Swarm.stop": "Writes a stop request to the active run's storage.",
+    "swarm_arena.scoring.HumanReview.export": "Reads run storage and writes review files.",
+    "swarm_arena.manager.AgentContext.run_tool": "Stages files and executes a tool subprocess.",
+    "swarm_arena.executor.LocalExecutor.submit": "Stages a workspace and executes a subprocess.",
+    "swarm_arena.llm.LLMPlanner.plan": "Calls a configured model provider over the network.",
+    "swarm_arena.llm.CollaborativePlanner.plan": "Calls model providers and an external reviewer.",
+    "swarm_arena.llm.LLMJudge.judge": "Calls the configured model panel over the network.",
+}
 
 BOARD_READS = {
     "best",
@@ -226,15 +238,33 @@ def test_numpydoc_valid(dotted: str) -> None:
 @pytest.mark.parametrize("dotted", public_objects())
 def test_examples_are_doctests(dotted: str) -> None:
     module = max((m for m in PUBLIC_ALL if dotted.startswith(f"{m}.")), key=len)
+    obj = resolve(dotted)
+    section = NumpyDocString(inspect.getdoc(obj) or "")["Examples"]
+    examples = doctest.DocTestParser().get_examples("\n".join(section))
+    assert examples, f"{dotted}: the Examples section has no >>> line"
+    runnable = any(not example.options.get(doctest.SKIP, False) for example in examples)
+    if dotted in IO_ONLY_EXAMPLES:
+        assert not runnable, f"{dotted}: remove the now-runnable example from IO_ONLY_EXAMPLES"
+    else:
+        assert runnable, f"{dotted}: every Examples line is skipped without a real-I/O reason"
     found = doctest.DocTestFinder(recurse=False).find(
-        resolve(dotted), dotted, globs=dict(vars(import_public(module)))
+        obj, dotted, globs=dict(vars(import_public(module)))
     )
-    assert any(t.examples for t in found), f"{dotted}: the Examples section has no >>> line"
     if (module, dotted[len(module) + 1 :].partition(".")[0]) in LAZY_DEPS:
         runner = doctest.DocTestRunner(optionflags=DOCTEST_FLAGS)
         for test in found:
             runner.run(test)
         assert runner.failures == 0, f"{dotted}: an Examples line failed (see the captured stdout)"
+
+
+def test_arena_snapshot_example_uses_public_members() -> None:
+    doc = inspect.getdoc(resolve("swarm_arena.board.ArenaBoard.snapshot")) or ""
+    example = ast.parse(doctest.script_from_examples(doc))
+    assert not [
+        node.attr
+        for node in ast.walk(example)
+        if isinstance(node, ast.Attribute) and node.attr.startswith("_")
+    ]
 
 
 @pytest.mark.parametrize("module", PUBLIC_ALL)
