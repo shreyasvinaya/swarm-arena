@@ -27,6 +27,22 @@ IO_ONLY_EXAMPLES = {
     "swarm_arena.llm.CollaborativePlanner.plan": "Calls model providers and an external reviewer.",
     "swarm_arena.llm.LLMJudge.judge": "Calls the configured model panel over the network.",
 }
+# Existing mixed examples: changing a skipped-line count requires an explicit review.
+PARTLY_SKIPPED_EXAMPLES = {
+    "swarm_arena.Plan.load": 1,
+    "swarm_arena.RunConfig.load": 1,
+    "swarm_arena.Swarm": 1,
+    "swarm_arena.Swarm.run": 1,
+    "swarm_arena.ScriptTool.collect": 1,
+    "swarm_arena.scoring.HumanReview.import_csv": 1,
+    "swarm_arena.executor.LocalExecutor": 1,
+    "swarm_arena.llm.AgentsSDKManager.run_round": 1,
+    "swarm_arena.ray.RayExecutor.submit": 1,
+    "swarm_arena.ray.RayExecutor.capacity": 1,
+    "swarm_arena.testing.check_tool": 2,
+    "swarm_arena.testing.check_check": 2,
+    "swarm_arena.testing.check_manager": 1,
+}
 
 BOARD_READS = {
     "best",
@@ -126,6 +142,7 @@ def test_public_objects_cover_nested_classes() -> None:
 def test_public_objects_exclude_injected_methods_and_config_aliases() -> None:
     names = {p.values[0] for p in public_objects()}
     assert "swarm_arena.Plan.model_post_init" not in names
+    assert "swarm_arena.Goal.model_validate" not in names
     assert "swarm_arena.tool.Tool.Config" not in names
     assert len(names) == len(public_objects())
 
@@ -247,6 +264,10 @@ def test_examples_are_doctests(dotted: str) -> None:
         assert not runnable, f"{dotted}: remove the now-runnable example from IO_ONLY_EXAMPLES"
     else:
         assert runnable, f"{dotted}: every Examples line is skipped without a real-I/O reason"
+        skipped = sum(bool(example.options.get(doctest.SKIP, False)) for example in examples)
+        assert skipped == PARTLY_SKIPPED_EXAMPLES.get(dotted, 0), (
+            f"{dotted}: skipped-example count differs from PARTLY_SKIPPED_EXAMPLES"
+        )
     found = doctest.DocTestFinder(recurse=False).find(
         obj, dotted, globs=dict(vars(import_public(module)))
     )
