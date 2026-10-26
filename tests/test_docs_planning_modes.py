@@ -1,6 +1,6 @@
 """Required facts for the planning modes guide."""
 
-from _docs import required_facts
+from _docs import page_path, required_facts
 
 REQUIRED_FACTS = [
     "Manual",
@@ -25,3 +25,10 @@ REQUIRED_FACTS = [
 
 def test_required_facts() -> None:
     required_facts("Planning modes", REQUIRED_FACTS)
+
+
+def test_retained_scoring_rules_name_their_scope() -> None:
+    # The retained-scoring rule skips human revisions and plans without history.
+    text = " ".join(page_path("Planning modes").read_text(encoding="utf-8").split())
+    assert "For non-human revisions with admitted history" in text
+    assert "New parts inherit main scoring." not in text

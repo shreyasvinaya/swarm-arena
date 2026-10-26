@@ -218,10 +218,14 @@ rules below, it checks:
   `ConvergeSpec.round` are merged. Non-human overrides may set only authorized
   fields; an unchanged carried-over human override retains its provenance.
 - A team for every part, valid team-to-part assignments, and team-mode
-  convergence when there are parts. New parts inherit main scoring.
-- The r0 main `GoalKey`, all historical main checks and judges, the ranking
-  judge, and retained parts' scoring. Removing a part with all its teams is
-  permitted; leaving a retained part without a team is not.
+  convergence when there are parts. A part inherits main scoring when its own
+  scoring fields are unset.
+- The r0 main `GoalKey` for revisions with history. For non-human revisions
+  with admitted history, all historical main checks and judges, the ranking
+  setting, and retained parts' scoring must remain unchanged; newly added parts
+  must leave their scoring fields unset to inherit main scoring. Removing a
+  part with all its teams is permitted; leaving a retained part without a team
+  is not.
 - Duplicate agent fingerprints: tool path, tool configuration and manager
   model aliases, excluding instructions, names and rationales. At most
   `max_agents_per_fingerprint` agents (default 2) may share one fingerprint.
