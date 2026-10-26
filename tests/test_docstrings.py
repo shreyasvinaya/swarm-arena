@@ -5,6 +5,7 @@ import importlib.metadata
 import inspect
 import pydoc
 import types
+from pathlib import Path
 
 import numpydoc.validate
 import pytest
@@ -17,15 +18,42 @@ from swarm_arena.board import Board, BoardView
 
 IGNORED = frozenset({"SA01", "ES01"})
 DOCTEST_FLAGS = doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE
+# Real-I/O examples stay skipped; each names the test that covers the behaviour.
 IO_ONLY_EXAMPLES = {
-    "swarm_arena.Swarm.resume": "Reads a persisted run and resumes execution services.",
-    "swarm_arena.Swarm.stop": "Writes a stop request to the active run's storage.",
-    "swarm_arena.scoring.HumanReview.export": "Reads run storage and writes review files.",
-    "swarm_arena.manager.AgentContext.run_tool": "Stages files and executes a tool subprocess.",
-    "swarm_arena.executor.LocalExecutor.submit": "Stages a workspace and executes a subprocess.",
-    "swarm_arena.llm.LLMPlanner.plan": "Calls a configured model provider over the network.",
-    "swarm_arena.llm.CollaborativePlanner.plan": "Calls model providers and an external reviewer.",
-    "swarm_arena.llm.LLMJudge.judge": "Calls the configured model panel over the network.",
+    "swarm_arena.Swarm.resume": (
+        "Reads a persisted run and resumes execution services.",
+        "tests/_engine/test_resume.py::test_live_lease_needs_force",
+    ),
+    "swarm_arena.Swarm.stop": (
+        "Writes a stop request to the active run's storage.",
+        "tests/_engine/test_pr1_fm_stop.py::test_unpaid_request_hook_stops_promptly",
+    ),
+    "swarm_arena.scoring.HumanReview.export": (
+        "Reads run storage and writes review files.",
+        "tests/_scoring/test_human_review.py::test_export_writes_csv_json_and_html",
+    ),
+    "swarm_arena.manager.AgentContext.run_tool": (
+        "Stages files and executes a tool subprocess.",
+        "tests/_agent/test_tool_run.py::"
+        "test_core_tool_limits_survive_extra_actions_and_round_classification",
+    ),
+    "swarm_arena.executor.LocalExecutor.submit": (
+        "Stages a workspace and executes a subprocess.",
+        "tests/_exec/test_local.py::test_tool_never_runs_when_start_commit_fails",
+    ),
+    "swarm_arena.llm.LLMPlanner.plan": (
+        "Calls a configured model provider over the network.",
+        "tests/llm/test_planner.py::test_plan_outside_a_swarm_opens_a_planning_session",
+    ),
+    "swarm_arena.llm.CollaborativePlanner.plan": (
+        "Calls model providers and an external reviewer.",
+        "tests/llm/test_planner.py::test_loops_until_approve_and_sends_feedback",
+    ),
+    "swarm_arena.llm.LLMJudge.judge": (
+        "Calls the configured model panel over the network.",
+        "tests/llm/test_judge.py::"
+        "test_judge_response_cache_misses_for_changed_goal_and_hits_for_same_goal",
+    ),
 }
 # Existing mixed examples: changing a skipped-line count requires an explicit review.
 PARTLY_SKIPPED_EXAMPLES = {
@@ -276,6 +304,16 @@ def test_examples_are_doctests(dotted: str) -> None:
         for test in found:
             runner.run(test)
         assert runner.failures == 0, f"{dotted}: an Examples line failed (see the captured stdout)"
+
+
+@pytest.mark.parametrize("dotted", sorted(IO_ONLY_EXAMPLES))
+def test_io_only_examples_name_a_covering_test(dotted: str) -> None:
+    path, _, name = IO_ONLY_EXAMPLES[dotted][1].partition("::")
+    tree = ast.parse((Path(__file__).parents[1] / path).read_text(encoding="utf-8"))
+    tests = {
+        node.name for node in tree.body if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    assert name in tests, f"{dotted}: covering test {path}::{name} does not exist"
 
 
 def test_arena_snapshot_example_uses_public_members() -> None:
