@@ -5,269 +5,76 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - Unreleased
+## [Unreleased]
+
+## [0.1.0] - 2026-10-27
 
 ### Added
 
-- Public `swarm_arena.ray.RayExecutor` and the `[ray]` extra provide resource-aware
-  cluster scheduling, bounded recovery and two-step cancellation with data-only
-  partial results. Hash-checked files travel through Ray's object store for local
-  artifact roots or through shared S3 storage, with cluster and connector guides.
-
-- `swarm-arena submit` launches an unattended driver through Ray Jobs, with explicit
-  approval, working-directory and dependency packaging, and bounded submission.
-
-- Optional LLM gateway keys per LLM-calling tool run, strict-profile preflight,
-  full-reservation charging and recorded cap labels. The pinned LiteLLM profile
-  supports soft caps and estimated spend only; requiring a hard cap fails preflight.
-  Empty first-row waits produce a neutral note; gateway call provenance requires
-  a created key.
-
-- `swarm-arena reconcile RUN_DIR` reports gateway spend under the run lease,
-  with conservative death evidence, exact deduplicated totals and a bounded
-  run-end attempt. Labels are `estimated`, `observed (completeness unverified)`
-  and `observed`; the pinned LiteLLM profile retains estimated reservations.
-
-- `ScriptTool` and `FunctionTool` expose provider declarations through
-  `providers()` and their `providers` setting for gateway key selection and
-  provider-aware validation.
-
-- Tools can report informational LLM calls through bounded `swarm/llm_calls.jsonl`
-  files, with validated rows, deduplication and call-source labels on candidates.
-
-- Rosenbrock examples with LLM managers and an advisory judge panel, plus offline
-  exit tests for exact call accounting, replay and a model-managed final slice.
-
-- `swarm-arena plan` validates and estimates manual plans or saves catalog-admitted
-  LLM and terminal-reviewed proposals with planning-session provenance, safe output
-  handling, and shared interrupt cleanup.
-
-- Candidate trace and board pages show recorded planner, manager, tool and judge
-  LLM calls, standalone planning provenance, cache origins and trace URLs; run
-  pages report per-agent prompt-cache rates and response-cache hit counts from
-  the same retained committed generation, without requiring LLM extras.
-
-- Opt-in Langfuse sessions and LLM trace links for managers, judges, planners and
-  curators, with per-scope consent, no default vendor tracing and bounded
-  process-exit exporter cleanup.
-
-- Provider failures outside agents preserve panel survivor identities, pause ranking
-  policies, and skip replanning or curation with durable completion receipts;
-  resume reuses failed batches and skipped phases without repeating paid work.
-
-- Run-wide provider pauses retain agent capacity, recover through uncached probes
-  before fresh-round shares, and replay provider generations and causes on resume.
-
-- CollaborativePlanner supports bounded human approval, accumulated feedback and
-  catalog-admitted edits in one planning session, with a cancellable terminal
-  reviewer and supervised editor cleanup.
-- `LLMCurator` merges evidence-backed round learnings through metered structured
-  calls, with bounded invocation cleanup and invocation-validated summary call links.
-
-- LLMPlanner generates catalog-authorized drafts, freezes human goal identity,
-  and preserves human components during autonomous replanning; standalone planning
-  sessions meter and journal calls with replayable provenance links in saved plans.
-
-- LLMJudge scores fixed rubrics against goal descriptions and inputs with
-  mixed-provider panels, repeated anchors,
-  survivor identities and metered structured-output fallback; full-call input
-  funding is checked before provider dispatch and accounting drains before return.
-
-- Offline manager and judge conformance checks run in isolated, bound LLM scopes with
-  registered run setups, verify self-drain and requesting-call provenance,
-  force parallel manager tool calls, and accept a model catalog through
-  `check_judge(..., config=...)`. `check_manager` classifies
-  user-created limit exceptions as manager errors while registered limits,
-  including nested groups, end only the affected round.
-
-- AgentsSDKManager runs a fresh metered Agents SDK conversation each round,
-  exposes authorized context actions and finish_round, honors core limits, and
-  drains usage accounting on success, failure, timeout and cancellation.
-
-- Manager actions as SDK function tools, with validated schemas, per-call
-  provenance, bounded feedback-redacted results, untrusted board content,
-  cross-goal learning text with evidence trimming and value-free out-of-view
-  and read-limit evidence markers,
-  recoverable soft errors, and terminal controls that stop further model turns.
-
-- Metered LLM calls reserve against committed tranche credit, protect per-call
-  tracking and output caps, link requested tools to their call, and preserve
-  registered budget, fencing and cleanup controls across SDK boundaries.
-
-- LiteLLM call logging with per-run catalog prices, exact cache-lifetime usage,
-  conservative failed-call charging, proven response-cache origins, and idempotent
-  logger/cache installation under the owning run lifetime. Cache backend settings
-  are process-wide, with clear configuration refusals; role switches and namespaces
-  remain per scope.
-
-- Lazy `FakeModel` and `FakeTurn` helpers replay isolated offline LLM
-  conversations, capture SDK inputs, and record exact catalog-priced usage
-  through the real journal and reservation settlement path. Missing LLM extras
-  retain one safe installation hint through lazy imports and plan admission.
-- Per-call LLM settings with tracking metadata, Claude prompt-cache points,
-  per-role response-cache controls, complete probe bypass and replayable cache origins.
-
-- Manager prompts keep system instructions and frozen reference files ahead of round facts;
-  shared untrusted-content wrapping removes embedded markers before digest byte capping.
-- Model alias, role, capability and price validation for plans, replanners and
-  curators; exact cache-lifetime-aware LLM costs, conservative call estimates,
-  and LiteLLM or registered offline model construction.
-
-- Optional `llm`, `cache`, and `langfuse` dependencies, an LLM import guard,
-  bundled LiteLLM prices, and offline upstream compatibility checks.
-
-- Core LLM call recording with replayable deduplication and cache provenance,
-  exact reservation accounting, bounded missing-report cleanup, and supervised
-  fresh/resumed run bindings without optional provider dependencies.
-- Local `board serve` viewer with search, filters, pagination, evidence and lineage
-  pages, and token-protected pin, hide and add curation.
-- Offline arena commands export/import human reviews, rank runs and namespaces,
-  search and inspect board evidence, curate learnings, trace provenance and reindex caches.
+- Typed goals, candidates, scores, learnings, protocol records and TOML plans and
+  run configurations. Content-addressed file snapshots and catalog-admitted
+  component references preserve provenance; stored models carry schema versions
+  and refuse newer formats. Configuration diagnostics identify fields without
+  exposing rejected values or secrets.
+- `ScriptTool` and `FunctionTool` run user scripts and importable Python functions,
+  with typed parameters, editable files, parent overlays and protected reference
+  data. The workspace contract uses `swarm/request.json` and `swarm/result.json`,
+  declared output files, bounded logs and output sizes, provider declarations,
+  and validated informational tool LLM calls.
+- `LocalExecutor` provides fresh workspaces, environment allowlists, resource
+  limits, timeout and cancellation handling, process-group cleanup and partial
+  output collection. It runs as the same OS user and is not a security sandbox.
+- Script and function judges, script checks, lexicographic scoring and custom
+  evaluator interfaces support finite ranking keys, fixed judge identities and
+  fail-closed validation. Scores support both minimization and maximization.
+- The swarm engine executes queued goals, teams and agents through rounds,
+  pruning policies, validated replanning, part joins, convergence and final
+  judging. `ScriptedManager` supplies an offline baseline. Approval precedes run
+  publication; graceful and immediate stops, fenced ownership and conservative
+  resume preserve durable finalists, no-result outcomes and completed work.
+- The run journal, leases and epoch-scoped controls provide committed snapshots,
+  replay, auditable takeover, repaired result views and crash-safe completion
+  receipts. Immutable round pages retain rankings, learnings and prune reasons.
+- The budget ledger reserves and settles tool and LLM usage against committed
+  credit, tracks deduplicated call provenance and cache origins, drains accounting
+  on shutdown and conservatively charges uncertain or lost work. Provider pauses
+  retain capacity and recover through uncached probes before fresh rounds.
+- `ArenaBoard` is the default board, with fixed goal and sibling views, multi-run
+  frontiers, ranking, lineage, learning search and bounded digests. Lazy SQLite
+  and FTS5 caches index committed evidence and support safe reindexing. Local and
+  optional conditional S3 storage support validated roots and conservative
+  unknown-write outcomes; S3 checks live SDK conditional-write capabilities.
 - Human review exports spreadsheet-safe CSV, canonical candidate JSON and escaped
-  HTML, imports validated scores under an ended run's lease, and repairs committed
-  review objects on resume.
-- Round digests show each group's ranking identity and human verdicts, plus
-  namespace-wide learning titles and counts under a strict UTF-8 byte cap.
-- Immutable per-round Markdown pages show the top ten candidates, new learnings,
-  and prune reasons, with historical frontier counts and missing-page resume repair.
-- Candidate traces show the committed round-applicable plan, tool usage, checks,
-  journal and human scores, and citing learnings without importing producer plugins.
-- Learning posts vet visible evidence and refinements before ID allocation,
-  require justification for near-duplicates, derive verification from complete
-  passing evidence, and include value-free writing guidance on invalid content.
-- Optional configurable curators merge round learnings with supervised normalization,
-  reserve accounting, and atomic completion receipts for crash-safe recovery.
-- Runs default to `ArenaBoard`, with fixed sibling rankings, scored past-run repeat
-  hints, and an isolated arena in the offline manager harness. Configured-board
-  lifecycle calls preserve safe diagnostics, responsive cancellation and bounded shutdown.
-- `ArenaBoard` provides synchronized multi-run frontiers, fixed goal and sibling
-  views across group namespaces, current producing-key rankings, hidden-safe
-  learning counts, and lazy XDG-aware SQLite/FTS5 caches. Published reads remain
-  available during storage refresh; call `frontier()` before reading committed data.
-- Arena caches incrementally index committed chains and exact named human objects,
-  retain producing identities and frontier-aware collision provenance, and rank
-  literal-text learning searches with frontier-local relevance. Reindex rebuilds
-  the same logical memberships and refuses to delete caches in use.
-- Conditional S3 storage provides uncached listings, raw child-key preservation,
-  single-attempt conditional writes with explicit unknown outcomes, per-root
-  storage probes, and validation before preflight and resume takeover.
-- Write-once arena run pointers and validated human review/curation objects use
-  versioned loading, deterministic JSONL bytes, and fixed application order.
+  HTML, then imports validated reviewer scores under an ended run's lease.
+  Learning curation records evidence, refinements and provenance. The local board
+  viewer supports search and evidence pages with token-protected curation writes;
+  sharing review files also requires access to the run, arena and artifact stores.
+- The CLI validates and estimates plans, runs, stops and resumes swarms, displays
+  committed status and version, exports/imports reviews, ranks and traces results,
+  serves the board and reindexes caches. Planning supports manual, LLM-generated
+  and terminal-reviewed proposals with saved planning-session provenance.
+- Optional `llm`, `cache` and `langfuse` integrations provide metered Agents SDK
+  managers, rubric judges, catalog-authorized planners and curators, bounded human
+  approval, model pricing, response and prompt-cache accounting, and opt-in trace
+  links. Provider failures retain survivor identities and replayable completion
+  receipts. The supported LiteLLM floor remains `>=1.107.0rc2,<1.108` because
+  1.107.0 final is unavailable; the owner must choose whether to ship with that
+  release candidate or wait before publishing 0.1.0.
+- `RayExecutor`, the `ray` extra and `swarm-arena submit` support resource-aware
+  cluster execution and Ray Jobs, checked file transfer, bounded recovery and
+  two-step cancellation with data-only partial results. Per-tool LLM gateway keys,
+  profile preflight and `swarm-arena reconcile` record cap and spend evidence.
+  The pinned LiteLLM profile supports soft caps and estimated reservations only;
+  requiring a hard cap fails preflight, and incomplete death evidence stays unknown.
+- The offline conformance kit checks tools, checks, judges and managers; builds
+  candidates; reads verified output and log bytes; and replays deterministic
+  `FakeModel`/`FakeTurn` conversations. Missing optional integrations give explicit
+  install guidance while core imports remain independent of extras.
+- Runnable documentation covers an offline hello-world run/view/review quickstart,
+  Rosenbrock examples, user scripts, connectors, concepts, planning, scoring,
+  limits and safety, Ray, the arena, versioning and the public API. Python 3.11–3.13
+  on POSIX, typed wheel metadata, Read the Docs configuration and release artifact
+  checks support the initial package release.
 
-- Offline Rosenbrock swarm example with a Getting started guide and README quickstart.
-
-- `Swarm.resume` continues committed runs with auditable lease takeover,
-  conservative lost-run accounting, restored round state, and repaired result views.
-  Replayed budget exhaustion permits setup and reserve-funded completion;
-  completed budget-stopped goals reuse recorded results without new paid work.
-
-- CLI `run`, `status`, `stop`, and `resume` commands support terminal approval,
-  sorted plan directories, committed status, epoch-scoped stops, and saved or
-  override resume configuration. Use `swarm-arena run --yes run.toml plans/`
-  for unattended runs or `swarm-arena resume runs/<run-id> --force` for takeover.
-
-- `Swarm.run` approves estimates before publishing snapshots, runs queued goals
-  with shared budgets and capacity, and returns durable finalists; `Swarm.stop`
-  requests graceful or immediate stops, with journaled stop modes and fencing.
-
-- Run preflight checks distinct effective component configurations; versioned run
-  manifests record provenance, and epoch-scoped stop requests and committed-journal
-  status provide run control without importing user components for status.
-- Goal execution supports round barriers, pruning, validated replanning, part
-  joins, and final judging, with durable result fingerprints and explicit
-  no-result solutions.
-
-- `ScriptedManager` runs ordered baseline requests without a model;
-  `testing.check_manager` exercises managers offline through real core actions.
-
-- `AgentContext`, the manager action set (`swarm_arena.manager`).
-
-#### Tools and local execution
-
-- `ScriptTool` runs your own scripts with typed parameters, editable file globs,
-  and `list_files` / `read_file` actions for inspecting candidate files.
-- `FunctionTool` runs an importable, annotated Python function in a subprocess
-  and returns its JSON object as result data.
-- `Tool` and `Action` support custom connectors; `Command`, `CompletedRun`,
-  `ToolRequest`, `ParentRef`, `ToolOutput`, `RunStatus`, `Usage`, and `Estimate`
-  describe invocations, results, and resource use.
-- `Executor` and `Job` support execution backends. `LocalExecutor` runs jobs in
-  fresh workspaces with process-group cleanup, timeouts, cancellation, resource
-  limits, and an environment allowlist. Local execution runs as the same OS user
-  and does not provide a security sandbox.
-- Tool scripts exchange parameters and finite JSON results through
-  `swarm/request.json` and `swarm/result.json`. Results can declare output files,
-  usage, and provider failures. A stopped run retains partial output when a valid
-  collection marks itself partial or contains data or files.
-- Logs retain their last 8 MiB by default; declared output files are limited to
-  256 MiB per run by default. Configure these bounds with
-  `LocalExecutor.Config.max_log_bytes` and `max_output_bytes`.
-
-#### Goals, files, and configuration
-
-- Bring-your-own-script example fits a line across rounds with inherited edits,
-  protected public training points, and private judge data.
-- `validate_plan` checks limits, component configurations, planner provenance,
-  frozen goals and scoring, stable addresses, duplicate agents, private files,
-  and requested environment names before admitting a revision.
-
-- `Goal` describes a problem and `GoalKey` identifies its inputs and file
-  snapshot by SHA-256. `FileSet` snapshots globs and `FileRef` describes an
-  output artifact. Each source file is limited to 1 GiB.
-- File edits support base-parent overlays and read-only parent views. Workspace
-  paths must be relative strict UTF-8, with no symlinks, reserved names, or
-  collisions after Unicode normalization and case folding. Scripts and
-  human-controlled tool files are protected from edits.
-- `Ref` selects components by public import path and validates their configuration.
-  `Plan`, `PartSpec`, `TeamSpec`, `AgentSpec`, `RoundSpec`, `ConvergeSpec`, and
-  `FlowSpec` describe plans; `Plan` and `RunConfig` load and save TOML.
-- `Limits` and `Resources` describe budgets and execution requirements.
-  `ModelCatalog`, `ModelSpec`, `PlannerCatalog`, and `CatalogEntry` describe model
-  aliases and permitted planner choices. `CachePolicy`, `GatewayConfig`,
-  `SecretsPolicy`, and `TracingConfig` configure run services.
-- Configuration diagnostics retain field names and error codes while hiding
-  rejected values, defaults, and data-derived mapping keys, including in
-  Pydantic error details and tracebacks. Validation reports at most 20 details
-  followed by an omitted-error count.
-
-#### Checks, scoring, and records
-
-- `Board` and `BoardView` define journal-backed indexing and fixed snapshot reads;
-  the shared arena provides ranked results, namespace learning search,
-  lineage, deterministic frontiers, and digests with a strict UTF-8 byte cap.
-
-- `Policy`, `KeepTopTeams`, `SuccessiveHalving`, `Patience`, and `Chain` provide
-  configurable per-group pruning with starved-agent and last-team protection.
-- `Planner` ABC (`swarm_arena.planning`).
-- `Manager` ABC, `LimitReached`, and `RoundReport` (`swarm_arena.manager`).
-
-- `Decision`, `RoundState`, and `History` describe policy decisions and planning
-  evidence, with ranking isolated by group, judge identity, and newest fidelity.
-  `Frontier`, `Row`, and `LineageGraph` describe board snapshots and result ancestry.
-
-- `ScriptCheck` gates candidates with an external script and fails closed on
-  invalid results. `ScriptJudge` scores candidates using its own files;
-  `ProgramJudge` uses a trusted Python function. `Lexicographic` combines
-  ordered judges with fixed-length member keys.
-- `Check`, `Judge`, `CheckContext`, and `JudgeContext` support custom evaluators.
-  `CheckResult` records a gate decision; `Score` supports minimization and
-  maximization with finite ranking keys and judge identity.
-- `Candidate`, `Learning`, `LLMCall`, and `AgentStatus` record results, evidence,
-  usage, and agent state. Stored records carry schema versions and refuse newer
-  unsupported formats.
-- `Message`, `Part`, `Artifact`, `Task`, `TaskStatus`, `TaskState`, and `Role`
-  provide A2A protocol records without requiring an A2A SDK.
-
-#### Offline development and documentation
-
-- Planning, limits and safety, scoring and review, and concepts guides cover
-  manual swarm execution, catalog and snapshot trust, exact pruning rules,
-  committed budgets, epoch-scoped stops, and stopped-goal continuation.
-
-- `swarm_arena.testing.check_tool`, `check_check`, `check_judge`, and
-  `make_candidate` exercise connectors locally without a manager or provider.
-- `swarm_arena.testing.read_output_file` and `read_logs` return the verified
-  bytes of a run's declared output files and of its stdout and stderr logs.
-- Runnable function and script examples, connector authoring guidance, and a
-  public API reference cover local execution, file edits, checks, and scoring.
-- `swarm-arena --version` reports the installed package version.
+[Unreleased]: https://github.com/shreyasvinaya/swarm-arena/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/shreyasvinaya/swarm-arena/releases/tag/v0.1.0

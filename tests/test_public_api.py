@@ -289,10 +289,7 @@ def test_llm_facade_names_the_extra_when_missing(missing: str) -> None:
         [sys.executable, "-c", code], capture_output=True, encoding="utf-8", timeout=30
     )
     assert proc.returncode != 0
-    assert (
-        'uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"'
-        in proc.stderr
-    )
+    assert 'uv add "swarm-arena[llm]"' in proc.stderr
     assert "ModuleNotFoundError" in proc.stderr
 
 
@@ -317,7 +314,7 @@ try:
 except ModuleNotFoundError as error:
     assert error.name == {module!r}
     assert (
-        'uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"'
+        'uv add "swarm-arena[llm]"'
         in str(error)
     )
 else:

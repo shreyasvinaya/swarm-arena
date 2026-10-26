@@ -32,7 +32,7 @@ from swarm_arena._outcomes import _classify_outcome, _propagate_control, _raise_
 
 _LLM_EXTRA_HINT = (
     "swarm_arena.llm needs the 'llm' extra: "
-    'uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"'
+    'uv add "swarm-arena[llm]"; see https://github.com/shreyasvinaya/swarm-arena#install'
 )
 
 

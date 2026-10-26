@@ -298,8 +298,11 @@ executes configured requests without a model. A tool exception becomes an error
 candidate; an ordinary manager exception ends only that agent's round.
 Registered ownership and terminal cleanup failures retain their core stop behavior.
 
+See the [installation fallback](https://github.com/shreyasvinaya/swarm-arena#install)
+until 0.1.0 is on PyPI.
+
 `AgentsSDKManager` uses the optional Agents SDK integration (`uv add
-"swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`) to choose
+"swarm-arena[llm]"`) to choose
 these actions. Its `model` is an alias in the
 run configuration's model catalog and must permit the `manager` role:
 
@@ -429,7 +432,7 @@ or changing limits, and [Planning modes](planning-modes.md) for runnable plans.
 ## Models
 
 Install the optional integration with
-`uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`. The human's
+`uv add "swarm-arena[llm]"`. The human's
 `RunConfig` declares the provider models available to LLM components:
 
 ```toml
@@ -524,7 +527,7 @@ configuration error; use the installed settings or start a new process.
 Role read/write switches and namespaces remain per scope and may differ between runs.
 
 Response caching is optional: install `swarm-arena[cache]` as well as the `llm`
-extra (`uv add "swarm-arena[llm,cache] @ git+https://github.com/shreyasvinaya/swarm-arena"`).
+extra (`uv add "swarm-arena[llm,cache]"`).
 Configure `RunConfig.cache` in TOML:
 
 ```toml

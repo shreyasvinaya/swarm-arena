@@ -168,7 +168,7 @@ def test_submit_forwards_explicit_options(
                 "--working-dir",
                 ".",
                 "--pip",
-                "swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena",
+                "swarm-arena[ray]",
                 "--pip",
                 "deepretro-swarm",
                 "--yes",
@@ -186,7 +186,7 @@ def test_submit_forwards_explicit_options(
             {
                 "working_dir": ".",
                 "pip": [
-                    "swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena",
+                    "swarm-arena[ray]",
                     "deepretro-swarm",
                 ],
             },
@@ -302,7 +302,7 @@ raise SystemExit(main(["submit", "--yes", "run.toml", "plan.toml"]))
     if failure == "missing-ray":
         assert done.stderr == (
             "submit needs the 'ray' extra: uv add "
-            '"swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena"\n'
+            '"swarm-arena[ray]"; see https://github.com/shreyasvinaya/swarm-arena#install\n'
         )
     else:
         assert done.stderr == (
@@ -328,7 +328,7 @@ raise SystemExit(main(["submit", "--yes", "run.toml", "plan.toml"]))
     assert done.returncode == 1
     assert done.stdout == ""
     assert "submit needs the 'ray' extra: uv add" in done.stderr
-    assert "swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena" in done.stderr
+    assert "swarm-arena[ray]" in done.stderr
 
 
 @pytest.mark.parametrize("case", ["missing-dir", "not-dir", "outside", "symlink", "missing-path"])

@@ -1,17 +1,26 @@
 [project]
 name = "swarm-arena"
-version = "0.1.0.dev0"
-description = "Run a swarm of agents on hard goals: fan out to teams, prune weak branches, converge on answers you can prove."
+version = "0.1.0"
+description = "Run a swarm of agents on hard goals: teams, pruning with reasons, and answers you can trace."
 readme = "README.md"
 authors = [
-    { name = "Shreyas Vinaya", email = "vinaya.shreyas@gmail.com" }
+    { name = "Shreyas Vinaya" }
 ]
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
+keywords = ["agents", "multi-agent", "swarm", "llm", "optimization", "research"]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
     "Operating System :: POSIX",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Typing :: Typed",
 ]
 dependencies = [
@@ -19,6 +28,13 @@ dependencies = [
     "pydantic>=2.14.0,<3",
     "typing-extensions>=4.16.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/shreyasvinaya/swarm-arena"
+Repository = "https://github.com/shreyasvinaya/swarm-arena"
+Documentation = "https://swarm-arena.readthedocs.io/"
+Changelog = "https://github.com/shreyasvinaya/swarm-arena/blob/main/CHANGELOG.md"
+Issues = "https://github.com/shreyasvinaya/swarm-arena/issues"
 
 [project.scripts]
 swarm-arena = "swarm_arena._cli.main:main"

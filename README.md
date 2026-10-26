@@ -18,22 +18,14 @@
 
 ## Install
 
-Python 3.11+, Linux or macOS (POSIX). For releases:
-
-```sh
-pip install swarm-arena
-```
+Python 3.11+, Linux or macOS (POSIX). Install in a uv project:
 
 ```sh
 uv add swarm-arena
 ```
 
-**Before the first release**, the PyPI package is a name-reservation placeholder
-without this CLI or API. Install the development source instead:
-
-```sh
-uv add "swarm-arena @ git+https://github.com/shreyasvinaya/swarm-arena"
-```
+If 0.1.0 is not on PyPI yet, use `uv add "swarm-arena @ git+https://github.com/shreyasvinaya/swarm-arena"` (add the desired extras inside the quoted requirement).
+The earlier PyPI package is a name-reservation placeholder without this CLI or API.
 
 Contributors can clone the source and set up its environment:
 
@@ -49,14 +41,14 @@ git clone https://github.com/shreyasvinaya/swarm-arena && cd swarm-arena && uv s
 | `swarm-arena[s3]` | S3 run, arena and artifact storage. |
 | `swarm-arena[langfuse]` | Opt-in Langfuse tracing export. |
 
-Select extras from the same development source before the first release:
+Select the optional integrations you need:
 
 ```sh
-uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"
-uv add "swarm-arena[cache] @ git+https://github.com/shreyasvinaya/swarm-arena"
-uv add 'swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena'
-uv add "swarm-arena[s3] @ git+https://github.com/shreyasvinaya/swarm-arena"
-uv add "swarm-arena[langfuse] @ git+https://github.com/shreyasvinaya/swarm-arena"
+uv add "swarm-arena[llm]"
+uv add "swarm-arena[cache]"
+uv add "swarm-arena[ray]"
+uv add "swarm-arena[s3]"
+uv add "swarm-arena[langfuse]"
 ```
 
 ## Quickstart (offline)

@@ -5,8 +5,11 @@
 Install the optional runtime with uv:
 
 ```bash
-uv add "swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena"
+uv add "swarm-arena[ray]"
 ```
+
+See the [installation fallback](https://github.com/shreyasvinaya/swarm-arena#install)
+until 0.1.0 is on PyPI.
 
 The extra requires `ray[default]>=2.59,<3`. Ray 2.59 provides CPython
 3.11–3.13 wheels on Linux x86_64/aarch64 and macOS arm64 (macOS 12 or newer).
@@ -113,11 +116,11 @@ submission after returning.
 
 The worker image or repeatable `--pip SPEC` options must provide
 `swarm-arena[ray]` and the connector package, including the `swarm-arena`
-console script. For example, before the first release:
+console script. For example:
 
 ```bash
 swarm-arena submit --address http://127.0.0.1:8265 --working-dir . \
-  --pip 'swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena' \
+  --pip "swarm-arena[ray]" \
   --pip deepretro-swarm --yes run.toml plan.toml
 ```
 

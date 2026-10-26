@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 from _surface import LAZY_DEPS, PUBLIC_ALL, public_object
 
-_RAY_HINT = 'uv add "swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena"'
+_RAY_HINT = 'uv add "swarm-arena[ray]"'
 
 # The module list of test_public_api.PUBLIC, repeated so this test stands alone.
 PUBLIC = (
@@ -90,10 +90,7 @@ assert 'litellm' not in sys.modules
     )
     assert "swarm_arena.llm needs the 'llm' extra:" in done.stdout
     assert "swarm-arena[llm]" in done.stdout
-    assert (
-        'uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"'
-        in done.stdout
-    )
+    assert 'uv add "swarm-arena[llm]"' in done.stdout
     assert "missing-extra-secret-sentinel" not in done.stdout + done.stderr
 
 
@@ -395,3 +392,51 @@ def test_extra_facade_keeps_other_import_errors(
     with pytest.raises(ImportError, match=re.escape(f"cannot import name '{name}'")) as err:
         importlib.import_module(module)
     assert "swarm-arena[" not in str(err.value)
+
+
+def test_s3_missing_extra_names_release_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    import builtins
+
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._errors import ConditionalWritesUnsupported
+    from swarm_arena._store.s3 import S3Store
+
+    original = builtins.__import__
+
+    def missing(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "s3fs":
+            raise ImportError("s3-secret-sentinel")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing)
+    with pytest.raises(ConditionalWritesUnsupported) as caught:
+        S3Store("s3://bucket/prefix")
+    assert 'uv add "swarm-arena[s3]"' in str(caught.value)
+    assert "https://github.com/shreyasvinaya/swarm-arena#install" in str(caught.value)
+    assert_secret_absent(caught.value, "s3-secret-sentinel")
+
+
+@pytest.mark.parametrize("parameter", ["IfMatch", "IfNoneMatch"])
+def test_s3_old_sdk_hint_requires_upgrade_without_put(
+    monkeypatch: pytest.MonkeyPatch, parameter: str
+) -> None:
+    from _fakes.secrecy import assert_secret_absent
+
+    from swarm_arena._errors import ConditionalWritesUnsupported
+    from swarm_arena._store.s3 import S3Store
+
+    store = object.__new__(S3Store)
+    monkeypatch.setattr(store, "_key", lambda key: key)
+    monkeypatch.setattr(store, "_conditional_params", lambda: frozenset({"Bucket", "Key", "Body"}))
+
+    def no_put(*args: Any, **kwargs: Any) -> str:
+        pytest.fail("an unsupported SDK must not issue PutObject")
+
+    monkeypatch.setattr(store, "_put_object", no_put)
+    with pytest.raises(ConditionalWritesUnsupported) as caught:
+        store._write("s3-key-secret", b"s3-data-secret", parameter, "s3-value-secret")
+    assert parameter in str(caught.value)
+    assert 'uv add --upgrade "swarm-arena[s3]"' in str(caught.value)
+    for secret in ("s3-key-secret", "s3-data-secret", "s3-value-secret"):
+        assert_secret_absent(caught.value, secret)

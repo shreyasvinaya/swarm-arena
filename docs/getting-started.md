@@ -22,12 +22,8 @@ Use Python 3.11 or newer on POSIX. For releases, install the package in a uv pro
 uv add swarm-arena
 ```
 
-**Before the first release**, the PyPI package is a name-reservation placeholder
-without this CLI or API. Install the development source instead:
-
-```sh
-uv add "swarm-arena @ git+https://github.com/shreyasvinaya/swarm-arena"
-```
+Use the [source-install fallback](https://github.com/shreyasvinaya/swarm-arena#install) until 0.1.0 is on PyPI;
+the earlier package is a name-reservation placeholder without this CLI or API.
 
 Contributors can clone the source and set up its environment:
 
@@ -41,8 +37,12 @@ Optional extras are `llm` (Agents SDK managers, judges and planners), `cache`
 example later on this page:
 
 ```sh
-uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"
+uv add "swarm-arena[llm]"
 ```
+
+The `llm` and `cache` extras currently require `litellm>=1.107.0rc2,<1.108`.
+LiteLLM 1.107.0 final was not on PyPI when 0.1.0 was prepared; publication awaits
+an owner decision to use the release candidate or wait for the final version.
 
 ## Run hello-world
 

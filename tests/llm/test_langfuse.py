@@ -162,10 +162,7 @@ def test_missing_extra_is_actionable_and_value_free(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(builtins, "__import__", missing)
     with pytest.raises(ConfigError, match=r"swarm-arena\[langfuse\]") as caught:
         _langfuse.setup_langfuse(TracingConfig(langfuse=True))
-    assert (
-        'uv add "swarm-arena[langfuse] @ git+https://github.com/shreyasvinaya/swarm-arena"'
-        in str(caught.value)
-    )
+    assert 'uv add "swarm-arena[langfuse]"' in str(caught.value)
     assert_secret_absent(caught.value, "SENTINEL_SECRET")
 
 
