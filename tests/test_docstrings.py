@@ -1,12 +1,12 @@
 import enum
 import importlib
-import importlib.metadata
 import inspect
 import pydoc
 import types
 
 import numpydoc.validate
 import pytest
+from _surface import deps_present
 from pydantic import BaseModel
 from test_public_api import PUBLIC
 
@@ -78,15 +78,14 @@ def _members(cls: type, dotted: str) -> list[str]:
 def public_objects() -> list[str]:
     names: list[str] = []
     for module in sorted(PUBLIC):
+        if not deps_present(module):
+            continue
         mod = importlib.import_module(module)
         for name in mod.__all__:
+            if not deps_present(module, name):
+                continue
             dotted = f"{module}.{name}"
             names.append(dotted)
-            if module == "swarm_arena.testing" and name in {"FakeModel", "FakeTurn"}:
-                try:
-                    importlib.metadata.version("openai-agents")
-                except importlib.metadata.PackageNotFoundError:
-                    continue
             obj = getattr(mod, name)
             if isinstance(obj, type):
                 names.extend(_members(obj, dotted))

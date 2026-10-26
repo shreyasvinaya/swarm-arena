@@ -9,15 +9,15 @@ from swarm_arena.testing._candidates import make_candidate
 from swarm_arena.testing._conformance import check_check, check_judge, check_manager, check_tool
 
 __all__: list[str] = [
-    "FakeModel",
-    "FakeTurn",
+    "check_tool",
     "check_check",
     "check_judge",
     "check_manager",
-    "check_tool",
     "make_candidate",
-    "read_logs",
     "read_output_file",
+    "read_logs",
+    "FakeModel",
+    "FakeTurn",
 ]
 
 _LAZY = ("FakeModel", "FakeTurn")

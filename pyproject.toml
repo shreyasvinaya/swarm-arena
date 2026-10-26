@@ -73,8 +73,12 @@ pydocstyle.convention = "numpy"
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["D"]
 "examples/**" = ["D"]
-"src/swarm_arena/__init__.py" = ["E402"]   # the core facades are imported after _publish
-"src/swarm_arena/llm/__init__.py" = ["E402"]
+# E402: core facades imported after _publish; llm exports follow its optional-import guard.
+# RUF022: §9 order is the snapshot order, and it is not isort order.
+"src/swarm_arena/__init__.py" = ["E402", "RUF022"]
+"src/swarm_arena/{tool,scoring,manager,planning,board,executor,config,protocol}.py" = ["RUF022"]
+"src/swarm_arena/llm/__init__.py" = ["E402", "RUF022"]
+"src/swarm_arena/{ray,testing}/__init__.py" = ["RUF022"]
 "src/swarm_arena/llm/**" = ["TID251"]
 "src/swarm_arena/ray/**" = ["TID251"]
 "src/swarm_arena/_store/s3.py" = ["TID251"]

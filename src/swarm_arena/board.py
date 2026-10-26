@@ -9,17 +9,17 @@ from swarm_arena._model.goal import GoalKey
 from swarm_arena._model.results import Candidate, Learning, LLMCall
 
 __all__: list[str] = [
-    "ArenaBoard",
     "Board",
     "BoardView",
-    "Candidate",
-    "Curator",
+    "ArenaBoard",
     "Frontier",
-    "GoalKey",
-    "LLMCall",
     "Learning",
-    "LineageGraph",
+    "Candidate",
+    "LLMCall",
+    "GoalKey",
     "Row",
+    "LineageGraph",
+    "Curator",
 ]
 
 _publish(__name__, __all__)
