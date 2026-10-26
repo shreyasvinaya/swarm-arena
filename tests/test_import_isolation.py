@@ -1,8 +1,13 @@
+import importlib
+import inspect
+import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
+from _surface import LAZY_DEPS, PUBLIC_ALL, public_object
 
 _RAY_HINT = 'uv add "swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena"'
 
@@ -29,7 +34,7 @@ import swarm_arena
 assert 'swarm_arena._gateway.litellm_proxy' not in sys.modules
 """
     subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=30
+        [sys.executable, "-c", code], capture_output=True, encoding="utf-8", check=True, timeout=30
     )
 
 
@@ -81,7 +86,7 @@ assert 'agents' not in sys.modules
 assert 'litellm' not in sys.modules
 """
     done = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=60
+        [sys.executable, "-c", code], capture_output=True, encoding="utf-8", check=True, timeout=60
     )
     assert "swarm_arena.llm needs the 'llm' extra:" in done.stdout
     assert "swarm-arena[llm]" in done.stdout
@@ -98,7 +103,9 @@ def test_core_imports_load_no_optional_dependency() -> None:
         f"for m in {sorted(PUBLIC)!r}: importlib.import_module(m)\n"
         f"print(sorted({{n.split('.')[0] for n in sys.modules}} & set({OPTIONAL!r})))"
     )
-    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    done = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, encoding="utf-8", check=True
+    )
     assert done.stdout.strip() == "[]"
 
 
@@ -115,7 +122,7 @@ assert 'agents' not in sys.modules
 assert not hasattr(testing, 'unknown_testing_name')
 """
     subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=30
+        [sys.executable, "-c", code], capture_output=True, encoding="utf-8", check=True, timeout=30
     )
 
 
@@ -137,7 +144,7 @@ assert testing.FakeTurn.__module__ == 'swarm_arena.testing'
 assert dir(testing) == sorted(set(dir(testing)))
 """
     subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=30
+        [sys.executable, "-c", code], capture_output=True, encoding="utf-8", check=True, timeout=30
     )
 
 
@@ -178,7 +185,7 @@ def test_ray_facade_error_without_extra() -> None:
     result = subprocess.run(
         [sys.executable, "-c", FAKE_RAY_DIST + BLOCK_RAY + "import swarm_arena.ray"],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         timeout=30,
     )
     assert result.returncode != 0
@@ -190,7 +197,7 @@ def test_ray_facade_error_with_tests_dir_on_path() -> None:
     result = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         cwd=REPO_ROOT,
         timeout=30,
     )
@@ -204,7 +211,7 @@ def test_ray_facade_keeps_other_import_errors() -> None:
     result = subprocess.run(
         [sys.executable, "-c", FAKE_RAY_DIST + BOOM_FINDER + "import swarm_arena.ray"],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         timeout=30,
     )
     assert result.returncode != 0
@@ -216,7 +223,7 @@ def test_ray_facade_keeps_missing_vendor_submodule() -> None:
     result = subprocess.run(
         [sys.executable, "-c", FAKE_RAY_DIST + MISSING_SUB_FINDER + "import swarm_arena.ray"],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         timeout=30,
     )
     assert result.returncode != 0
@@ -241,7 +248,132 @@ import swarm_arena.ray
 """
     )
     result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, cwd=REPO_ROOT, timeout=30
+        [sys.executable, "-c", code],
+        capture_output=True,
+        encoding="utf-8",
+        cwd=REPO_ROOT,
+        timeout=30,
     )
     assert result.returncode != 0
     assert _RAY_HINT in result.stderr
+
+
+class _Hide:
+    """Hide a module prefix while retaining distribution-metadata discovery."""
+
+    def __init__(self, finder: Any, dep: str) -> None:
+        self.finder = finder
+        self.dep = dep
+
+    def find_spec(self, name: str, path: Any = None, target: Any = None) -> Any:
+        if name == self.dep or name.startswith(self.dep + "."):
+            return None
+        find_spec = getattr(self.finder, "find_spec", None)
+        return None if find_spec is None else find_spec(name, path, target)
+
+    def __getattr__(self, attr: str) -> Any:
+        return getattr(self.finder, attr)
+
+
+def _hide(prefix: str) -> None:
+    sys.meta_path[:] = [_Hide(finder, prefix) for finder in sys.meta_path]
+
+
+HIDE_SOURCE = (
+    "import sys\nfrom typing import Any\n"
+    + inspect.getsource(_Hide)
+    + "\n"
+    + inspect.getsource(_hide)
+)
+
+
+@pytest.mark.parametrize(
+    ("module", "dep", "extra"),
+    [
+        ("swarm_arena.llm", "agents", "llm"),
+        ("swarm_arena.llm", "litellm", "llm"),
+        ("swarm_arena.ray", "ray", "ray"),
+    ],
+)
+def test_extra_facade_names_its_extra(module: str, dep: str, extra: str) -> None:
+    # A fresh interpreter exercises the guard even if a prior test loaded it.
+    code = (
+        HIDE_SOURCE
+        + f"""
+_hide({dep!r})
+import importlib
+try:
+    importlib.import_module({module!r})
+except ModuleNotFoundError as error:
+    assert 'swarm-arena[{extra}]' in str(error), str(error)
+else:
+    raise AssertionError('missing extra was accepted')
+"""
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, encoding="utf-8", timeout=60
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "name", [name for module, name in LAZY_DEPS if module == "swarm_arena.testing"]
+)
+@pytest.mark.parametrize("dep", LAZY_DEPS[("swarm_arena.testing", "FakeModel")])
+def test_fake_model_names_the_llm_extra(name: str, dep: str) -> None:
+    code = (
+        HIDE_SOURCE
+        + f"""
+_hide({dep!r})
+import swarm_arena.testing as testing
+assert {name!r} not in vars(testing)
+try:
+    getattr(testing, {name!r})
+except ModuleNotFoundError as error:
+    assert 'swarm-arena[llm]' in str(error), str(error)
+else:
+    raise AssertionError('missing extra was accepted')
+assert {name!r} not in vars(testing)
+"""
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, encoding="utf-8", timeout=60
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stderr == ""
+
+
+@pytest.mark.parametrize(
+    ("module", "sub"),
+    [("swarm_arena.llm", "agents.models"), ("swarm_arena.ray", "ray._private")],
+)
+def test_extra_facade_keeps_missing_vendor_submodule(module: str, sub: str) -> None:
+    public_object(module, PUBLIC_ALL[module][0])
+    code = HIDE_SOURCE + f"_hide({sub!r})\nimport {module}\n"
+    done = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, encoding="utf-8", timeout=60
+    )
+    assert done.returncode != 0
+    assert f"No module named '{sub}'" in done.stderr
+    assert "swarm-arena[" not in done.stderr
+
+
+@pytest.mark.parametrize("module", ["swarm_arena.llm", "swarm_arena.ray"])
+def test_extra_facade_keeps_other_import_errors(
+    module: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    name = PUBLIC_ALL[module][0]
+    obj = public_object(module, name)
+    homes = [
+        home
+        for key, home in list(sys.modules.items())
+        if key.startswith("swarm_arena.") and key != module and vars(home).get(name) is obj
+    ]
+    assert homes != []
+    for home in homes:
+        monkeypatch.delitem(vars(home), name)
+    monkeypatch.delitem(sys.modules, module)
+    with pytest.raises(ImportError, match=re.escape(f"cannot import name '{name}'")) as err:
+        importlib.import_module(module)
+    assert "swarm-arena[" not in str(err.value)
