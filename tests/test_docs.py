@@ -4,6 +4,7 @@ import ast
 import importlib
 import importlib.metadata
 import inspect
+import json
 import os
 import re
 import runpy
@@ -11,6 +12,7 @@ import signal
 import subprocess
 import sys
 import time
+import tomllib
 import zlib
 from contextlib import suppress
 from html.parser import HTMLParser
@@ -46,6 +48,7 @@ assert sphinx_html  # Imported pytest fixtures.
 assert owned_processes
 
 ROOT = Path(__file__).resolve().parents[1]
+README = REPO / "README.md"
 GUIDES = sorted(
     path for path in (ROOT / "docs").glob("*.md") if path.name != "writing-a-connector.md"
 )
@@ -194,7 +197,7 @@ def test_changelog_describes_one_initial_release() -> None:
 
 @pytest.mark.parametrize(
     ("relative_path", "heading"),
-    [("README.md", "Quickstart"), ("docs/getting-started.md", "Install")],
+    [("README.md", "Install"), ("docs/getting-started.md", "Install")],
 )
 def test_quickstarts_distinguish_release_and_source_installs(
     relative_path: str, heading: str
@@ -209,6 +212,95 @@ def test_quickstarts_distinguish_release_and_source_installs(
         "git clone https://github.com/shreyasvinaya/swarm-arena && cd swarm-arena && uv sync"
         in prerelease
     )
+
+
+def test_readme_quickstart(tmp_path: Path) -> None:
+    work = make_workdir(tmp_path, with_examples=False)
+    assert list(work.iterdir()) == []
+    text = README.read_text(encoding="utf-8")
+    assert re.findall(r"^### (.+)$", text, re.M) == [
+        "Run hello-world",
+        "View results",
+        "Share a review",
+    ]
+    blocks = parse_blocks(text)
+    assert [block for block in blocks if block.kind in {"requires", "skip"}] == []
+    assert [(block.lang, block.arg) for block in blocks if block.kind == "file"] == [
+        ("toml", "run.toml"),
+        ("toml", "plan.toml"),
+    ]
+    commands = "\n".join(
+        block.code for block in blocks if block_runs(block, workdir=work, bindir=docs_bindir())
+    )
+    expected = [
+        "swarm-arena run --yes run.toml plan.toml",
+        "swarm-arena leaderboard hello",
+        "swarm-arena review export",
+        "swarm-arena review import",
+    ]
+    positions = [commands.index(command) for command in expected]
+    assert positions == sorted(positions)
+    viewer = [block for block in blocks if "swarm-arena board serve hello" in block.code]
+    assert len(viewer) == 1
+    assert viewer[0].lang == "sh"
+    assert viewer[0].kind == "none"
+    assert "Ctrl-C" in text
+    assert "not executed" in text
+    run_blocks(blocks, source="README.md", workdir=work, bindir=docs_bindir())
+    solutions = list(work.glob(".swarm-arena/runs/*/goals/*/solution.json"))
+    assert len(solutions) == 1
+    assert (solutions[0].parent / "rounds/round-01.md").is_file()
+    solution = json.loads(solutions[0].read_text(encoding="utf-8"))
+    assert solution["status"] == "ok"
+    assert solution["source_head"]
+    assert len(solution["finalists"]) == 1
+    candidate = solution["finalists"][0]["candidate"]
+    assert candidate["output"]["status"] == "ok"
+    assert candidate["output"]["data"] == {"message": "hello world"}
+    assert (work / "hello-run-id.txt").read_text(encoding="utf-8").strip() == solution["run_id"]
+    assert candidate["id"] in (work / "hello-leaderboard.txt").read_text(encoding="utf-8")
+    assert "imported 1 scores as human:demo" in (work / "hello-import.txt").read_text(
+        encoding="utf-8"
+    )
+    leaderboard = (work / "hello-human-leaderboard.txt").read_text(encoding="utf-8")
+    assert "human:demo" in leaderboard
+    row = next(line for line in leaderboard.splitlines() if candidate["id"] in line)
+    assert row.split("\t")[4] == "1"
+
+
+def test_readme_has_picture() -> None:
+    assert spec_picture() in README.read_text(encoding="utf-8")
+
+
+def test_readme_has_no_stub_text() -> None:
+    assert STUB_TEXT.search(README.read_text(encoding="utf-8")) is None
+
+
+def test_readme_sections() -> None:
+    assert re.findall(r"^## (.+)$", README.read_text(encoding="utf-8"), re.M) == [
+        "Install",
+        "Quickstart (offline)",
+        "Documentation",
+        "Status and versioning",
+        "Contributing",
+        "License",
+    ]
+
+
+def test_readme_links_are_absolute() -> None:
+    targets = re.findall(r"\]\(([^)\s]+)\)", README.read_text(encoding="utf-8"))
+    assert [target for target in targets if not target.startswith(("https://", "#"))] == []
+
+
+def test_readme_names_every_extra() -> None:
+    extras = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["project"][
+        "optional-dependencies"
+    ]
+    assert [
+        extra
+        for extra in extras
+        if f"swarm-arena[{extra}]" not in README.read_text(encoding="utf-8")
+    ] == []
 
 
 @pytest.mark.parametrize("path", GUIDES, ids=lambda path: path.name)
