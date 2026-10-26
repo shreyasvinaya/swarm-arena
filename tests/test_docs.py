@@ -8,6 +8,7 @@ import json
 import os
 import re
 import runpy
+import shlex
 import signal
 import subprocess
 import sys
@@ -56,7 +57,7 @@ ROADMAP = Path("docs/superpowers/plans/2026-10-18-swarm-arena-roadmap.md")
 INSTALL_COMMAND = re.compile(
     r"(?P<command>uv\s+add|(?:uv\s+)?pip3?\s+install|--pip)\s+"
     r"(?P<upgrade>--upgrade\s+)?(?P<quote>[\"']?)"
-    r"(?P<requirement>swarm-arena(?:\[[^\]]+\])?(?:\s+@\s+[^\s\"'`]+)?)"
+    r"(?P<requirement>swarm-arena(?:\[[^\]]+\])?(?:\s*@\s*[^\s\"'`]+)?)"
     r"(?P=quote)"
 )
 INSTALL_GUIDANCE = "https://github.com/shreyasvinaya/swarm-arena#install"
@@ -87,8 +88,35 @@ def _install_violations(text: str, *, python: bool = False) -> list[str]:
         ):
             violations.append(match.group())
     # Catch old requirements even without a command in the same literal.
-    if re.search(r"swarm-arena(?:\[[^\]]+\])?\s+@\s+git\+", text):
+    if "git+https://github.com/shreyasvinaya/swarm-arena" in text:
         violations.append("GitHub requirement")
+    # Only the explicitly labeled contributor setup may install a local checkout.
+    local_text = (
+        re.sub(
+            r"(?ms)^Contributors can clone the source and set up its environment:\n\n"
+            r"```sh\n.*?^```$",
+            "",
+            text,
+        )
+        if not python
+        else text
+    )
+    for match in re.finditer(
+        r"\b(?:uv\s+add|(?:uv\s+)?pip3?\s+install)\s+(?P<args>[^\n`]+)", local_text
+    ):
+        try:
+            arguments = shlex.split(match["args"])
+        except ValueError:
+            violations.append("Malformed install command")
+            continue
+        for argument in arguments:
+            requirement = argument.removeprefix("--editable=").rstrip(";,")
+            if requirement in {".", "..", "./", "../"} or (
+                re.search(r"(?:^|/)(?:agent-swarm|swarm-arena)(?:\[[^\]]+\])?/?$", requirement)
+                and "/" in requirement
+            ):
+                violations.append(match.group())
+                break
     return violations
 
 
@@ -125,9 +153,40 @@ def test_install_guard_rejects_mixed_forms(command: str, quote: str, extras: str
     requirement = "swarm-arena" + (f"[{extras}]" if extras else "")
     source = "git+https://github.com/shreyasvinaya/swarm-arena"
     assert _install_violations(f"{command} {quote}{requirement} @ {source}{quote}")
+    assert _install_violations(f"{command} {quote}{requirement}@{source}{quote}")
+    assert _install_violations(f"{command} {quote}{source}{quote}")
     violations = _install_violations(f"{command} {quote}{requirement}{quote}")
     valid = command == "uv add" and quote == ('"' if extras else "")
     assert bool(violations) is not valid
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "uv add --editable /absolute/path/to/agent-swarm",
+        'uv add --editable "/absolute/path/to/agent-swarm"',
+        "uv add -e ../swarm-arena",
+        "uv add /absolute/path/to/agent-swarm",
+        'uv add "../swarm-arena"',
+        "uv add ./agent-swarm",
+        "uv add swarm-arena@file:///absolute/path/to/agent-swarm",
+        "uv add --editable .",
+        "uv pip install -e .",
+    ],
+)
+def test_install_guard_rejects_local_package_installs(command: str) -> None:
+    assert _install_violations(command)
+    assert _install_violations(f"uv add swarm-arena\n{command}")
+
+
+def test_install_guard_limits_local_exception_to_contributor_setup() -> None:
+    setup = (
+        "Contributors can clone the source and set up its environment:\n\n"
+        "```sh\nuv add --editable /absolute/path/to/agent-swarm\n```"
+    )
+    assert not _install_violations(setup)
+    assert _install_violations(setup + "\nuv add --editable /absolute/path/to/agent-swarm")
+    assert _install_violations(setup.replace("Contributors", "Users"))
 
 
 @pytest.mark.parametrize("upgrade", ["", "--upgrade "])
@@ -242,10 +301,23 @@ def test_registry_describes_default_files_and_callback_ownership() -> None:
 
 def test_changelog_describes_one_initial_release() -> None:
     text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert re.findall(r"^## \[([^\]]+)\]", text, re.MULTILINE) == ["Unreleased", "0.1.0"]
-    assert re.search(r"^## \[0\.1\.0\] - \d{4}-\d{2}-\d{2}$", text, re.MULTILINE)
-    assert re.findall(r"^### .+$", text, re.MULTILINE) == ["### Added"]
+    _assert_changelog_overview(text)
+
+
+def _assert_changelog_overview(text: str) -> None:
+    headings = re.findall(r"^## (.+)$", text, re.MULTILINE)
+    assert headings[0] == "[Unreleased]"
+    assert re.fullmatch(r"\[\d+\.\d+\.\d+\] - \d{4}-\d{2}-\d{2}", headings[1])
+    newest = text.split(f"## {headings[1]}", 1)[1].split("\n## ", 1)[0]
+    assert "### Added" in newest
     assert "swarm_arena._" not in text
+
+
+def test_changelog_overview_accepts_later_releases() -> None:
+    _assert_changelog_overview(
+        "## [Unreleased]\n\n## [0.1.1] - 2026-10-28\n\n### Added\n- New release.\n"
+        "\n## [0.1.0] - 2026-10-27\n\n### Added\n- Initial release.\n"
+    )
 
 
 @pytest.mark.parametrize(

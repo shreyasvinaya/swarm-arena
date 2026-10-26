@@ -209,13 +209,16 @@ filesystem paths or artifact hashes as a way to select additional files.
 
 ## Try it offline
 
-Install this checkout in your project environment (Python 3.11+, POSIX):
+Install the package in your project environment (Python 3.11+, POSIX):
 
 ```sh
 uv init --python 3.11 script-demo
 cd script-demo
-uv add --editable /absolute/path/to/agent-swarm
+uv add swarm-arena
 ```
+
+Use the [installation fallback](https://github.com/shreyasvinaya/swarm-arena#install)
+until 0.1.0 is on PyPI.
 
 Save the following four files, creating their parent directories as needed.
 Run `uv run python try_scripts.py` from `script-demo`. The driver writes the
