@@ -69,7 +69,7 @@ class RouteTool(Tool):
 
     def command(self, request: ToolRequest, workspace: Path) -> Command:
         return Command(
-            argv=["python", "-m", "my_connector.route"],
+            argv=["python", str(Path(__file__).with_name("route.py"))],
             python=self.config.python,
             timeout_s=self.config.timeout_s,
             grace_s=self.config.grace_s,
@@ -231,6 +231,7 @@ check runs:
 ```python
 # my_connector/scoring.py
 from collections.abc import Sequence
+from pathlib import Path
 from typing import cast
 
 from pydantic import BaseModel, ConfigDict
@@ -253,7 +254,9 @@ class RouteIsValid(Check):
         return cast(RouteIsValid.Config, super().config)
 
     async def check(self, candidate: Candidate, ctx: CheckContext) -> CheckResult:
-        command = Command(argv=["python", "-m", "my_connector.validate"], python=self.config.python)
+        command = Command(
+            argv=["python", str(Path(__file__).with_name("validate.py"))], python=self.config.python
+        )
         out = await ctx.execute(command, candidate=candidate)
         if out.status != RunStatus.OK:  # fail closed
             return CheckResult(check=self.name, passed=False, reasons=["validator failed"])
@@ -378,18 +381,21 @@ breaks its contract:
   raise a storage error. Both readers work after workspace cleanup and until
   this Python process exits. They read the kit's process-local artifact store.
 
-Install the connector in the interpreter that runs the tool, for example with
-`uv sync`. The program runs with the workspace as its
-working directory and a fresh environment without `PYTHONPATH`, so the
-`pythonpath` setting of pytest or a source checkout is not enough: the driver
-imports your package, but `python -m my_connector.route` fails.
+The example commands locate each program beside its connector module with
+`Path(__file__).with_name(...)`. The program still runs in the executor's
+workspace, where its request and result paths resolve. Package those scripts
+with the connector, and install it on each worker for remote execution.
+A command written instead as `python -m my_connector.route` requires an
+installed connector: a source checkout or pytest's import path alone is
+insufficient because the workspace has no inherited `PYTHONPATH`.
 
-One complete test module, run with `pytest` (the `anyio` plugin comes with
-swarm-arena):
+The following conformance module uses only the installed core dependencies.
+Run each asynchronous check with the driver below:
 
+<!-- docs-test: file tests/test_conformance.py -->
 ```python
 # tests/test_conformance.py
-import pytest
+import warnings
 from swarm_arena import Goal
 from swarm_arena.testing import check_check, check_judge, check_tool, make_candidate
 from swarm_arena.tool import RunStatus, ToolOutput
@@ -397,7 +403,6 @@ from swarm_arena.tool import RunStatus, ToolOutput
 from my_connector.scoring import FewestSteps, RouteIsValid
 from my_connector.tools import RouteTool
 
-pytestmark = pytest.mark.anyio
 GOAL = Goal(id="ethanol", namespace="my-connector", inputs={"target": "CCO"})
 
 
@@ -421,8 +426,31 @@ async def test_judge_prefers_the_shorter_route_and_reports_bad_output() -> None:
     scores = await check_judge(FewestSteps(), GOAL, [short, long])
     assert max(scores, key=lambda score: score.key).candidate_id == short.id
     broken = make_candidate(ToolOutput(status=RunStatus.OK, data={}), goal=GOAL)
-    with pytest.warns(UserWarning, match=f"judge error for {broken.id}"):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", UserWarning)
         assert await check_judge(FewestSteps(), GOAL, [broken]) == []
+    assert any(
+        isinstance(warning.message, UserWarning)
+        and f"judge error for {broken.id}" in str(warning.message)
+        for warning in caught
+    )
+```
+
+```python
+import runpy
+
+import anyio
+
+checks = runpy.run_path("tests/test_conformance.py")
+
+
+async def run_checks() -> None:
+    await checks["test_tool_runs_and_follows_the_contract"]()
+    await checks["test_check_passes_a_route_and_fails_an_empty_one"]()
+    await checks["test_judge_prefers_the_shorter_route_and_reports_bad_output"]()
+
+
+anyio.run(run_checks)
 ```
 
 Run the tests from the directory that your file globs are relative to: the kit
@@ -475,7 +503,7 @@ until the first release, add the package with
 Use your connector test paths in the job. A Ray tool case takes this form,
 using the `RouteTool` from this guide:
 
-<!-- docs-test: requires ray -->
+<!-- docs-test: skip needs a separately owned Ray cluster and its connector CI fixture -->
 ```python
 import pytest
 
@@ -685,20 +713,27 @@ your own code that the kit passes on, such as a `KeyError` in `fingerprint()`,
 `ok` (`error`, `timeout`, `cancelled`, and so on) to that error as a note and
 raises the error unchanged. Read the stored logs without retaining a workspace:
 
+<!-- docs-test: file tests/test_logs.py -->
 ```python
 # tests/test_logs.py
-import pytest
 from swarm_arena.testing import check_tool, read_logs
 from swarm_arena.tool import RunStatus
 
 from my_connector.tools import RouteTool
 
 
-@pytest.mark.anyio
 async def test_tool_logs() -> None:
     out = await check_tool(RouteTool(), {"target": "CCO"})
     stdout, stderr = read_logs(out)
     assert out.status == RunStatus.OK, stderr.decode(errors="replace")
+```
+
+```python
+import runpy
+
+import anyio
+
+anyio.run(runpy.run_path("tests/test_logs.py")["test_tool_logs"])
 ```
 
 For a declared file, use its path from `out.files`, for example
