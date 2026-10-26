@@ -3278,7 +3278,6 @@ Other fixed values: `Learning.title` ≤ 120 characters, `Learning.text` ≤ 1,5
 
 21. Test-only dev dependency `pyyaml>=6` parses `.readthedocs.yaml` and the workflow files, M5.
 
-
 ### Delivered provider-state interface additions
 
 These rows supplement R4.13.1, R4.13.4, R4.13.10, R4.13.13 and R4.13.17.
