@@ -101,6 +101,46 @@ def steps_uses(job: dict[str, Any]) -> list[str]:
     return [step["uses"] for step in job["steps"] if "uses" in step]
 
 
+def shell_command(run: str) -> list[str]:
+    """
+    Parse one simple command line, discarding shell comments.
+
+    Only a single physical line with literal arguments is supported. Shell
+    operator and expansion characters are rejected, even inside quoted
+    arguments. Compound commands, redirection and substitution must be split
+    into separate workflow steps before these offline checks can inspect them.
+    Nothing is executed.
+
+    Parameters
+    ----------
+    run : str
+        Workflow step's run string.
+
+    Returns
+    -------
+    list[str]
+        The executable and its own arguments, with shell quotes removed.
+
+    Raises
+    ------
+    ValueError
+        If the command uses unsupported syntax or has unmatched quotes.
+
+    Examples
+    --------
+    >>> shell_command('uv sync --locked --group="docs" # install dependencies')
+    ['uv', 'sync', '--locked', '--group=docs']
+    """
+    if "\n" in run.strip() or "\r" in run.strip():
+        raise ValueError("expected one simple shell command")
+    lexer = shlex.shlex(run, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    command = list(lexer)
+    if any(set(argument) & set(";&|<>()$`{}") for argument in command):
+        raise ValueError("unsupported shell syntax")
+    return command
+
+
 @pytest.mark.parametrize("on_key", ["on", '"on"'])
 def test_load_yaml_and_triggers(tmp_path: Path, on_key: str) -> None:
     path = tmp_path / "workflow.yaml"
@@ -157,11 +197,103 @@ def test_rtd_config() -> None:
 
 def test_rtd_matches_docs_ci_job() -> None:
     job = load_yaml(REPO / ".github" / "workflows" / "ci.yml")["jobs"]["docs"]
-    commands = [shlex.split(run) for run in steps_run(job)]
+    commands = [shell_command(run) for run in steps_run(job)]
     assert any(
         command[:2] == ["uv", "sync"]
         and {"--locked", "--all-extras"} <= set(command)
-        and any(command[i : i + 2] == ["--group", "docs"] for i in range(len(command) - 1))
+        and (
+            "--group=docs" in command
+            or any(command[i : i + 2] == ["--group", "docs"] for i in range(len(command) - 1))
+        )
         for command in commands
     )
+    assert any(
+        command[:3] == ["uv", "run", "sphinx-build"] and "-W" in command for command in commands
+    )
     assert "3.13" in json.dumps(job)
+
+
+@pytest.mark.parametrize(
+    ("sync", "sphinx", "valid"),
+    [
+        pytest.param(
+            "uv sync --locked --all-extras --group docs",
+            "uv run sphinx-build -W docs docs/_build/html",
+            True,
+            id="current-command",
+        ),
+        pytest.param(
+            "uv sync --group docs --all-extras --locked",
+            "uv run sphinx-build docs docs/_build/html -W",
+            True,
+            id="reordered-arguments",
+        ),
+        pytest.param(
+            "uv sync --group=docs --locked --all-extras",
+            "uv run sphinx-build -W docs docs/_build/html",
+            True,
+            id="equals-group",
+        ),
+        pytest.param(
+            "uv sync --all-extras --group docs",
+            "uv run sphinx-build -W docs docs/_build/html",
+            False,
+            id="unlocked",
+        ),
+        pytest.param(
+            "uv sync --all-extras --group docs && echo --locked",
+            "uv run sphinx-build -W docs docs/_build/html",
+            False,
+            id="lock-in-other-command",
+        ),
+        pytest.param(
+            "uv sync --all-extras --group docs # --locked",
+            "uv run sphinx-build -W docs docs/_build/html",
+            False,
+            id="lock-in-comment",
+        ),
+        pytest.param(
+            "uv sync --locked --all-extras --group docs",
+            "uv run sphinx-build docs docs/_build/html",
+            False,
+            id="sphinx-without-warning-errors",
+        ),
+        pytest.param(
+            "uv sync --locked --all-extras --group docs",
+            "uv run sphinx-build docs docs/_build/html # -W",
+            False,
+            id="warning-flag-in-comment",
+        ),
+        pytest.param(
+            "uv sync --locked --all-extras --group docs",
+            "uv run sphinx-build docs docs/_build/html && echo -W",
+            False,
+            id="warning-flag-in-other-command",
+        ),
+    ],
+)
+def test_docs_ci_command_semantics(
+    monkeypatch: pytest.MonkeyPatch, sync: str, sphinx: str, valid: bool
+) -> None:
+    workflow = {
+        "jobs": {
+            "docs": {
+                "steps": [
+                    {"uses": "astral-sh/setup-uv@v10", "with": {"python-version": "3.13"}},
+                    {"run": sync},
+                    {"run": sphinx},
+                ]
+            }
+        }
+    }
+    monkeypatch.setitem(globals(), "load_yaml", lambda _: workflow)
+    if valid:
+        test_rtd_matches_docs_ci_job()
+    else:
+        with pytest.raises((AssertionError, ValueError)):
+            test_rtd_matches_docs_ci_job()
+
+
+def test_pyyaml_is_dev_dependency() -> None:
+    project = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+    assert "pyyaml>=6" in project["dependency-groups"]["dev"]
