@@ -1,4 +1,8 @@
+import builtins
 import importlib
+import importlib.machinery
+import importlib.util
+import os
 import re
 import sys
 import tempfile
@@ -187,19 +191,58 @@ _IO_EVENTS = frozenset(
 )
 
 
-def _importing() -> bool:
-    # Module files read (and bytecode written) by the import system are not
-    # component I/O, so a constructor may import on first use.
+def _importing(args: tuple[object, ...]) -> bool:
+    # Only importlib's own file operation is exempt. A module executing under
+    # bootstrap frames must not gain permission for its top-level file I/O.
     frame = sys._getframe(2)
-    while frame is not None:
-        if frame.f_code.co_filename.startswith("<frozen importlib._bootstrap"):
-            return True
+    if (
+        frame.f_code.co_filename != "<frozen importlib._bootstrap_external>"
+        or frame.f_code.co_name not in {"get_data", "_write_atomic"}
+    ):
+        return False
+    opened_arg = args[0]
+    if isinstance(opened_arg, int) and frame.f_code.co_name == "_write_atomic":
+        # FileIO wraps the descriptor just opened for this bytecode temp file.
+        if opened_arg != frame.f_locals.get("fd"):
+            return False
+        opened_arg = frame.f_locals["path_tmp"]
+    if not isinstance(opened_arg, (str, bytes)):
+        return False
+    opened = Path(os.path.abspath(os.fsdecode(opened_arg)))
+    if not any(opened.is_relative_to(os.path.abspath(entry)) for entry in sys.path):
+        return False
+    operation = frame
+    while frame is not None and frame.f_code.co_filename.startswith("<frozen importlib."):
+        origin = getattr(frame.f_locals.get("self"), "path", None)
+        if isinstance(origin, str):
+            source = Path(os.path.abspath(origin))
+            suffixes = (".py", ".pyc", ".pyi", *importlib.machinery.EXTENSION_SUFFIXES)
+            if not str(source).endswith(suffixes):
+                return False
+            candidates = {source}
+            if source.suffix in {".py", ".pyi"}:
+                candidates.add(Path(importlib.util.cache_from_source(str(source))))
+            if operation.f_code.co_name == "get_data":
+                # Audit open flags, including os.open, must describe a read.
+                flags = args[2]
+                return (
+                    opened in candidates
+                    and isinstance(flags, int)
+                    and not flags
+                    & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
+                )
+            cached = Path(os.path.abspath(operation.f_locals["path"]))
+            return (
+                cached in candidates
+                and cached.parent.name == "__pycache__"
+                and str(opened) == operation.f_locals["path_tmp"]
+            )
         frame = frame.f_back
     return False
 
 
 def _forbid(event: str, args: tuple[object, ...]) -> None:
-    if _IO_GUARD_ACTIVE and event in _IO_EVENTS and not (event == "open" and _importing()):
+    if _IO_GUARD_ACTIVE and event in _IO_EVENTS and not (event == "open" and _importing(args)):
         raise AssertionError(f"I/O in a component __init__ (§9 rule 3): {event}")
 
 
@@ -271,3 +314,33 @@ def test_plan_and_run_files_refuse_newer_versions(tmp_path: Path) -> None:
             load()
         assert "newer" in str(err.value)
         assert_secret_absent(err.value, "999", sanitized=True)
+
+
+@pytest.mark.parametrize("filename", ["payload.txt", "unrelated.py", "__pycache__/unrelated.pyc"])
+def test_io_guard_rejects_top_level_io_in_lazy_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: str
+) -> None:
+    global _IO_GUARD_ACTIVE
+
+    payload = tmp_path / filename
+    payload.parent.mkdir(exist_ok=True)
+    payload.write_text("payload", encoding="utf-8")
+    module = tmp_path / "lazy_io_probe.py"
+    module.write_text(
+        "import builtins\nbuiltins._compat_probe_started = True\n"
+        f"open({str(payload)!r}, 'rb').close()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(builtins, "_compat_probe_started", False, raising=False)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "lazy_io_probe", raising=False)
+    # Avoid testing importlib's cache-directory creation, which remains forbidden.
+    (tmp_path / "__pycache__").mkdir(exist_ok=True)
+    _IO_GUARD_ACTIVE = True
+    try:
+        with pytest.raises(AssertionError, match=r"I/O in a component.*open"):
+            importlib.import_module("lazy_io_probe")
+        assert vars(builtins)["_compat_probe_started"] is True
+    finally:
+        _IO_GUARD_ACTIVE = False
+        sys.modules.pop("lazy_io_probe", None)

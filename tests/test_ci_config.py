@@ -19,7 +19,7 @@ import tomllib
 import traceback
 import venv
 import zipfile
-from datetime import date
+from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Any, cast
 
@@ -269,14 +269,31 @@ def shell_words(line: str) -> list[str]:
     >>> shell_words("cmd --help#||true")
     ['cmd', '--help#', '||', 'true']
     """
+    quote = ""
+    escaped = False
+    word_start = True
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            word_start = False
+        elif quote:
+            if char == quote:
+                quote = ""
+        elif char in {"'", '"'}:
+            quote = char
+            word_start = False
+        elif char == "#" and word_start:
+            line = line[:index]
+            break
+        else:
+            word_start = char in " \t\r\n();<>|&"
     lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     lexer.commenters = ""
-    words = list(lexer)
-    for index, word in enumerate(words):
-        if word.startswith("#"):
-            return words[:index]
-    return words
+    return list(lexer)
 
 
 def shell_command(run: str) -> list[str]:
@@ -502,6 +519,7 @@ def test_upstream_workflow() -> None:
     assert set(workflow["jobs"]) == {"newest-llm-deps"}
     job = workflow["jobs"]["newest-llm-deps"]
     assert job["runs-on"] == "ubuntu-24.04"
+    assert job["timeout-minutes"] == 30
     assert steps_uses(job) == ["actions/checkout@v7", "astral-sh/setup-uv@v10"]
     commands = [shell_command(run) for run in steps_run(job)]
     venv, install, show, record, check = commands
@@ -856,7 +874,10 @@ def _release_record(
             released_on = date.fromisoformat(day)
         except ValueError:
             raise ValueError("release changelog date is invalid") from None
-        if released_on > date.today() or release_version in released:
+        if (
+            released_on > (datetime.now(UTC) + timedelta(hours=14)).date()
+            or release_version in released
+        ):
             raise ValueError("release changelog date or duplicate version is invalid")
         released.append(release_version)
     if not released or released[0] != version:
@@ -952,6 +973,10 @@ def _check_release(dist: Path, tag: str, commit: str, python: Path, record: Path
         ("uv sync --locked # install", ["uv", "sync", "--locked"]),
         ("cmd --help#||true", ["cmd", "--help#", "||", "true"]),
         ("cmd -v#;true", ["cmd", "-v#", ";", "true"]),
+        ("cmd '#' || true", ["cmd", "#", "||", "true"]),
+        (r"cmd \# || true", ["cmd", "#", "||", "true"]),
+        ("cmd ''# || true", ["cmd", "#", "||", "true"]),
+        ("cmd;# ' ignored", ["cmd", ";"]),
     ],
 )
 def test_shell_words_start_comments_only_at_a_word(line: str, words: list[str]) -> None:
@@ -996,9 +1021,9 @@ def test_release_build_job_checks_the_wheel() -> None:
     ):
         assert needed in runs
     assert steps_uses(job) == [
-        "actions/checkout@v7",
-        "astral-sh/setup-uv@v10",
-        "actions/upload-artifact@v7",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884",
+        "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
     ]
     commands = [shell_command(s) for s in steps_run(job) if s.startswith("uv sync ")]
     assert commands == [["uv", "sync", "--locked", "--all-groups"]]
@@ -1606,6 +1631,214 @@ def test_releasing_candidate_commands() -> None:
             "-v",
         ],
     ]
+
+
+@pytest.mark.parametrize("suffix", [" '#' || true", r" \# || true"])
+def test_release_smoke_rejects_literal_hash_masking(
+    monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    wf = copy.deepcopy(load_yaml(RELEASE))
+    for step in wf["jobs"]["build"]["steps"]:
+        if step.get("name") == "README quickstart from the wheel in an empty folder":
+            step["run"] = step["run"].rstrip() + suffix
+    monkeypatch.setitem(globals(), "load_yaml", lambda _: wf)
+    with pytest.raises(AssertionError):
+        test_release_build_job_checks_the_wheel()
+
+
+@pytest.mark.parametrize(
+    ("hour", "released_on", "valid"),
+    [(19, "2026-10-28", True), (19, "2026-10-29", False), (5, "2026-10-28", False)],
+)
+def test_release_date_uses_latest_calendar_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hour: int, released_on: str, valid: bool
+) -> None:
+    class FrozenDate(date):
+        @classmethod
+        def today(cls) -> "FrozenDate":
+            return cls(2026, 10, 27)
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> "FrozenDatetime":
+            assert tz is UTC
+            return cls(2026, 10, 27, hour, tzinfo=UTC)
+
+    monkeypatch.setitem(globals(), "date", FrozenDate)
+    monkeypatch.setitem(globals(), "datetime", FrozenDatetime)
+    dist = _release_fixture(tmp_path)
+    (tmp_path / "CHANGELOG.md").write_text(
+        f"## [Unreleased]\n\n## [0.1.0] - {released_on}\n", encoding="utf-8"
+    )
+    if valid:
+        assert _release_record(tmp_path, dist, "v0.1.0", "a" * 40, "0.1.0", "0.1.0", "0.1.0")
+    else:
+        with pytest.raises(ValueError, match="changelog date"):
+            _release_record(tmp_path, dist, "v0.1.0", "a" * 40, "0.1.0", "0.1.0", "0.1.0")
+
+
+def test_contributing_names_public_snapshot() -> None:
+    text = (REPO / "CONTRIBUTING.md").read_text(encoding="utf-8")
+    assert "`PUBLIC_ALL` in `tests/_surface.py`" in text
+    assert "spec §9 order" in text
+    assert "`PUBLIC`" not in text
+
+
+def test_release_build_action_pin_comments() -> None:
+    text = RELEASE.read_text(encoding="utf-8")
+    for action, sha, tag in (
+        ("actions/checkout", "3d3c42e5aac5ba805825da76410c181273ba90b1", "v7.0.1"),
+        ("astral-sh/setup-uv", "1c37ad07a6a961277cf70c0d37d6f313000f5884", "v10.3.0"),
+        ("actions/upload-artifact", "cf430e030ddbb5b0abf93d22962f4752f3646cd9", "v7.0.2"),
+    ):
+        assert f"{action}@{sha} # {tag}" in text
+
+
+def test_releasing_updates_both_jobs_action_pins() -> None:
+    step = " ".join(_releasing_step(7).split())
+    for phrase in (
+        "build job",
+        "publish job",
+        "actions/checkout",
+        "astral-sh/setup-uv",
+        "actions/upload-artifact",
+        "actions/download-artifact",
+        "pypa/gh-action-pypi-publish",
+        "git ls-remote",
+        "full commit SHAs",
+        "comment",
+        "release notes",
+        "test_release_build_job_checks_the_wheel",
+        "test_publish_job_is_least_privilege",
+        "test_release_build_action_pin_comments",
+    ):
+        assert phrase in step
+
+
+@pytest.mark.parametrize("canary", [False, True])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "import",
+        "runtime",
+        "mark",
+        "xfail",
+        "setup",
+        "teardown",
+        "deselect",
+        "live",
+        "unexpected-live",
+        "outside",
+    ],
+)
+def test_canary_rejects_bypassed_checks(tmp_path: Path, kind: str, canary: bool) -> None:
+    llm = tmp_path / "tests/llm"
+    llm.mkdir(parents=True)
+    (llm / "conftest.py").write_text(
+        (REPO / "tests/llm/conftest.py").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (tmp_path / "pytest.ini").write_text("[pytest]\nmarkers = llm_live\n", encoding="utf-8")
+    (tmp_path / "blocked_dependency.py").write_text(
+        'raise ModuleNotFoundError("blocked module", name="blocked_dependency")\n',
+        encoding="utf-8",
+    )
+    sources = {
+        "import": 'pytest.importorskip("blocked_dependency")\ndef test_probe(): pass\n',
+        "runtime": 'def test_probe(): pytest.importorskip("blocked_dependency")\n',
+        "mark": '@pytest.mark.skip(reason="synthetic skip")\ndef test_probe(): pass\n',
+        "xfail": '@pytest.mark.xfail(reason="synthetic xfail")\ndef test_probe(): assert False\n',
+        "setup": (
+            '@pytest.fixture(autouse=True)\ndef skip_setup(): pytest.skip("setup")\n'
+            "def test_probe(): pass\n"
+        ),
+        "teardown": (
+            "@pytest.fixture(autouse=True)\ndef skip_teardown():\n    yield\n"
+            '    pytest.skip("teardown")\ndef test_probe(): pass\n'
+        ),
+        "deselect": "def test_probe(): pass\n",
+        "live": "@pytest.mark.llm_live\ndef test_live_manager_round(): assert False\n",
+        "unexpected-live": "@pytest.mark.llm_live\ndef test_probe(): assert False\n",
+        "outside": 'def test_probe(): pytest.skip("outside llm")\n',
+    }
+    target = tmp_path / "tests" if kind == "outside" else llm
+    probe = target / ("test_manager.py" if kind == "live" else "test_probe.py")
+    probe.write_text("import pytest\n" + sources[kind], encoding="utf-8")
+    # A passing test keeps ordinary import-time skips from becoming NO_TESTS_COLLECTED.
+    passing = llm / "test_keep.py"
+    passing.write_text("def test_keep(): pass\n", encoding="utf-8")
+    env = dict(os.environ, PYTHONPATH=str(tmp_path), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
+    env.pop("PYTEST_ADDOPTS", None)
+    env.pop("SWARM_ARENA_UPSTREAM_CANARY", None)
+    if canary:
+        env["SWARM_ARENA_UPSTREAM_CANARY"] = "installed.json"
+    selection = ["-k", "test_keep"] if kind == "deselect" else []
+    if kind in {"live", "unexpected-live"}:
+        selection = ["-m", "not llm_live"]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-rs",
+            "-p",
+            "no:cacheprovider",
+            str(passing),
+            str(probe),
+            *selection,
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        encoding="utf-8",
+        timeout=30,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    if canary and kind not in {"live", "outside"}:
+        assert result.returncode == (2 if kind == "import" else 1), output
+        assert "upstream canary forbids" in output, output
+    else:
+        assert result.returncode == 0, output
+        assert any(word in output for word in ("skipped", "xfailed", "deselected")), output
+
+
+@pytest.mark.parametrize("bypass", ["blocked-import", "synthetic-skip"])
+def test_canary_rejects_review_reproductions(tmp_path: Path, bypass: str) -> None:
+    pytest.importorskip("agents")
+    record = tmp_path / "installed.json"
+    _record_upstream_versions(record)
+    if bypass == "blocked-import":
+        (tmp_path / "diskcache.py").write_text(
+            'raise ModuleNotFoundError("blocked diskcache", name="diskcache")\n',
+            encoding="utf-8",
+        )
+    script = """
+import pytest
+import sys
+class SyntheticSkip:
+    def pytest_collection_modifyitems(self, items):
+        for item in items:
+            if item.name == 'test_cache_constructor_parameters':
+                item.add_marker(pytest.mark.skip(reason='review synthetic skip'))
+plugins = [SyntheticSkip()] if sys.argv[1] == 'synthetic-skip' else []
+raise SystemExit(pytest.main([
+    '-q', '-rs', '-p', 'no:cacheprovider',
+    'tests/llm/test_upstream_facts.py', 'tests/llm/test_cache.py',
+], plugins=plugins))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, bypass],
+        cwd=REPO,
+        env=dict(os.environ, PYTHONPATH=str(tmp_path), SWARM_ARENA_UPSTREAM_CANARY=str(record)),
+        capture_output=True,
+        encoding="utf-8",
+        timeout=180,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert "upstream canary forbids" in output, output
 
 
 if __name__ == "__main__":

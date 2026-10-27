@@ -137,11 +137,14 @@
 6. **Deprecations.** Follow the [Versioning policy](docs/versioning.md), including
    the spec §9 rule 1 deprecation notice and versioning commitments.
 
-7. **Pinned publish actions.** The publish job, the only job that can mint a
-   PyPI token, uses `actions/download-artifact` and
-   `pypa/gh-action-pypi-publish` pinned to full commit SHAs, with the tag in a
-   comment. To update one, resolve the new tag with
-   `git ls-remote https://github.com/<owner>/<repo> 'refs/tags/<tag>^{}'`
-   (or `refs/tags/<tag>` for a lightweight tag), review the release notes, and
-   change the SHA, the comment and `test_publish_job_is_least_privilege`
-   together.
+7. **Pinned release actions.** The build job produces the bytes and hashes
+   that will be published, so `actions/checkout`, `astral-sh/setup-uv` and
+   `actions/upload-artifact` use full commit SHAs. The publish job, the only
+   job that can mint a PyPI token, likewise pins `actions/download-artifact`
+   and `pypa/gh-action-pypi-publish`. Each pin has the tag in a comment.
+   To update either job, resolve the new tag with
+   `git ls-remote https://github.com/<owner>/<repo> 'refs/tags/<tag>' 'refs/tags/<tag>^{}'`
+   (use the peeled commit for an annotated tag, or the tag ref for a lightweight
+   tag), review the release notes, and change the SHA and comment together with
+   `test_release_build_job_checks_the_wheel`, `test_release_build_action_pin_comments`
+   or `test_publish_job_is_least_privilege`, as appropriate for that job.

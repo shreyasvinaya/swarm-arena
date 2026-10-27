@@ -54,7 +54,7 @@ modules (a leading underscore), and a private module never imports from a facade
 When you add a public name:
 
 1. Add it to the facade's `__all__`.
-2. Add it to `PUBLIC` in `tests/test_public_api.py` (the `__all__` snapshot test).
+2. Add it to `PUBLIC_ALL` in `tests/_surface.py` (the `__all__` snapshot, in spec §9 order).
 3. Add one line to `CHANGELOG.md` under `## [Unreleased]`.
 
 ## Tools never start with `uv run`
