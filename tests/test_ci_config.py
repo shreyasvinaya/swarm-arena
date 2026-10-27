@@ -520,7 +520,7 @@ def test_upstream_workflow() -> None:
     job = workflow["jobs"]["newest-llm-deps"]
     assert job["runs-on"] == "ubuntu-24.04"
     assert job["timeout-minutes"] == 30
-    assert steps_uses(job) == ["actions/checkout@v7", "astral-sh/setup-uv@v10"]
+    assert steps_uses(job) == ["actions/checkout@v7", "astral-sh/setup-uv@v10.3.0"]
     commands = [shell_command(run) for run in steps_run(job)]
     venv, install, show, record, check = commands
     assert venv == ["uv", "venv", "--python", "3.13"]
@@ -1861,3 +1861,16 @@ if __name__ == "__main__":
         ):
             parser.error("release checks require dist, tag, commit, wheel-python and record")
         _check_release(args.dist, args.tag, args.commit, args.wheel_python, args.record)
+
+
+def test_setup_uv_refs_name_a_published_tag() -> None:
+    # astral-sh/setup-uv publishes only full version tags, so `@v10` does not resolve.
+    full = re.compile(r"astral-sh/setup-uv@(?:v\d+\.\d+\.\d+|[0-9a-f]{40})\b")
+    paths = [*(REPO / ".github" / "workflows").glob("*.yml"), *(REPO / "docs").glob("*.md")]
+    bad = {
+        f"{path.relative_to(REPO)}:{number}"
+        for path in paths
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if "astral-sh/setup-uv@" in line and not full.search(line)
+    }
+    assert bad == set()

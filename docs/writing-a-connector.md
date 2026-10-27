@@ -667,7 +667,7 @@ jobs:
       RAY_USAGE_STATS_ENABLED: "0"
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           python-version: "3.11"
       - run: uv sync --extra ray --extra llm --all-groups
