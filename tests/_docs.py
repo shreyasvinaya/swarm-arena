@@ -225,7 +225,10 @@ def _exit_gate(command: list[str], ready: Path, release: Path) -> list[str]:
             'exit "$__docs_status"'
         )
         body = command[-1] if command[-1].endswith("\n") else command[-1] + "\n"
-        return [*command[:-1], f"trap {shlex.quote(hold)} EXIT\n{body}__docs_completed=yes\n"]
+        # Keep the final status of a block that reaches its end without errexit
+        # (an AND-list, `!`, or `set +e`), as plain bash would exit with it.
+        end = '__docs_final=$?\n__docs_completed=yes\nexit "$__docs_final"\n'
+        return [*command[:-1], f"trap {shlex.quote(hold)} EXIT\n{body}{end}"]
     prelude = (
         "import atexit, pathlib, runpy, sys, time\n"
         "def _docs_hold_exit():\n"
