@@ -19,7 +19,18 @@ agents, prunes weak branches with recorded reasons, and ranks solutions.
 Use Python 3.11 or newer on POSIX. For releases, install the package in a uv project:
 
 ```sh
+uv init swarm-demo
+cd swarm-demo
 uv add swarm-arena
+source .venv/bin/activate
+```
+
+Alternatively, use a plain virtual environment in your working folder:
+
+```sh
+python -m venv .venv
+source .venv/bin/activate
+pip install swarm-arena
 ```
 
 Use the [source-install fallback](https://github.com/shreyasvinaya/swarm-arena#install) until 0.1.0 is on PyPI;
@@ -46,7 +57,14 @@ an owner decision to use the release candidate or wait for the final version.
 
 ## Run hello-world
 
-In an empty working folder, save these two files as `run.toml` and `plan.toml`.
+In the same activated shell, create a new empty folder:
+
+```sh
+mkdir hello-world
+cd hello-world
+```
+
+Save these two files as `run.toml` and `plan.toml` in that folder.
 The one-round `ScriptedManager` calls a standard-library `ScriptTool`.
 The `ScriptJudge` gives every result the constant demonstration score 1;
 this shows the scoring path, not a measure of greeting quality.

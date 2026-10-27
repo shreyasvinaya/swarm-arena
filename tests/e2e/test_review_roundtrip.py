@@ -2,13 +2,20 @@
 
 import csv
 import os
+import shutil
+import signal
 import subprocess
 import sys
+import time
+from contextlib import suppress
 from pathlib import Path
+from typing import Any
 
 import anyio
 import pytest
+from _docs import docs_bindir, run_command
 from _fakes.finished import FinishedRun, run_again
+from _fakes.process_cleanup import ProcessIdentity, process_table, snapshot_process_tree
 
 from swarm_arena._scoring.human_review import CSV_HEADER
 
@@ -71,35 +78,23 @@ def test_documented_arena_commands_run_as_written(
     tmp_path: Path, document: str, heading: str
 ) -> None:
     import re
-    import shutil
-    import signal
-    from contextlib import suppress
 
     root = Path(__file__).resolve().parents[2]
-    section = (root / document).read_text(encoding="utf-8").split(f"## {heading}\n", 1)[1]
+    text = (root / document).read_text(encoding="utf-8")
+    section = text.split(f"## {heading}\n", 1)[1]
     fence = re.search(r"^```(sh|bash)\n(.*?)^```", section, flags=re.MULTILINE | re.DOTALL)
     assert fence is not None, f"{document}: no sh or bash block under {heading}"
-    shell, block = fence.group(1), fence.group(2)
+    block = fence.group(2)
     example = tmp_path / "examples" / "rosenbrock"
     shutil.copytree(root / "examples" / "rosenbrock", example)
-    environment = dict(os.environ, UV_PROJECT=str(root), UV_NO_SYNC="1")
-    environment.pop("PYTHONPATH", None)
-    process = subprocess.Popen(
-        [shell, "-eu", "-c", block],
-        cwd=tmp_path,
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
+    stdout, _ = run_command(
+        ["bash", "-euo", "pipefail", "-c", block],
+        source=document,
+        line=text[: text.index(section) + fence.start()].count("\n") + 1,
+        workdir=tmp_path,
+        bindir=docs_bindir(),
+        timeout_s=90,
     )
-    try:
-        stdout, stderr = process.communicate(timeout=90)
-    finally:
-        with suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        process.communicate(timeout=60)
-    assert process.returncode == 0, stderr
     identifier = re.search(r"^run (\S+) at ", stdout, flags=re.MULTILINE)
     assert identifier is not None
     reviews = tmp_path / ".swarm-arena" / f"review-{identifier[1]}" / "review.csv"
@@ -110,3 +105,83 @@ def test_documented_arena_commands_run_as_written(
     assert "scores as human:alice" in stdout
     assert "(human:alice," in stdout
     assert "human,pinned" in stdout
+
+
+def test_arena_docs_timeout_reaps_separate_executor_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copytree = shutil.copytree
+    communicate = subprocess.Popen.communicate
+    captured: dict[int, ProcessIdentity] = {}
+    held: list[int] = []
+    forced = False
+
+    def held_example(src: Path, dst: Path, *args: Any, **kwargs: Any) -> Path:
+        result = copytree(src, dst, *args, **kwargs)
+        module = Path(dst) / "rosen.py"
+        if module.exists():
+            code = module.read_text(encoding="utf-8")
+            hold = (
+                "    import os, time\n    from pathlib import Path\n"
+                f"    Path({str(tmp_path)!r}, f'tool-ready-{{os.getpid()}}').touch()\n"
+                "    time.sleep(300)\n"
+            )
+            assert "    x, y = x0, y0\n" in code
+            module.write_text(
+                code.replace("    x, y = x0, y0\n", hold + "    x, y = x0, y0\n"), encoding="utf-8"
+            )
+        return Path(result)
+
+    def expire_after_tools_ready(
+        self: subprocess.Popen[str], input: str | None = None, timeout: float | None = None
+    ) -> tuple[str, str]:
+        nonlocal forced
+        if not forced and isinstance(self.args, list) and self.args[0] in {"sh", "bash"}:
+            forced = True
+            assert timeout == 90
+            deadline = time.monotonic() + 60
+            try:
+                while len(list(tmp_path.glob("tool-ready-*"))) < 2:
+                    assert self.poll() is None, "arena driver exited before tools were ready"
+                    assert time.monotonic() < deadline, "executor tools did not become ready"
+                    time.sleep(0.01)
+            finally:
+                captured.update(snapshot_process_tree(self.pid))
+            held.extend(
+                int(path.name.removeprefix("tool-ready-")) for path in tmp_path.glob("tool-ready-*")
+            )
+            assert len(held) == 2
+            assert all(captured[pid].pgid == pid != self.pid for pid in held)
+            return communicate(self, input=input, timeout=0.05)
+        return communicate(self, input=input, timeout=timeout)
+
+    monkeypatch.setattr(shutil, "copytree", held_example)
+    monkeypatch.setattr(subprocess.Popen, "communicate", expire_after_tools_ready)
+    try:
+        with pytest.raises(AssertionError, match=r"docs/arena\.md:\d+ timed out after 90s"):
+            test_documented_arena_commands_run_as_written(tmp_path, "docs/arena.md", "Command line")
+        assert forced
+        assert len(held) == 2
+        current = process_table()
+        assert {
+            pid: record
+            for pid, record in captured.items()
+            if pid in current and current[pid].started == record.started
+        } == {}
+    finally:
+        # Independent emergency cleanup runs only after the liveness assertion.
+        current = process_table()
+        for pid, record in reversed(captured.items()):
+            if pid in current and current[pid].started == record.started:
+                with suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+        deadline = time.monotonic() + 60
+        while True:
+            current = process_table()
+            if not any(
+                pid in current and current[pid].started == record.started
+                for pid, record in captured.items()
+            ):
+                break
+            assert time.monotonic() < deadline, "emergency executor cleanup did not finish"
+            time.sleep(0.01)

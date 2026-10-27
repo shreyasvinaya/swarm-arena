@@ -337,7 +337,7 @@ def run_command(
     Parameters
     ----------
     command : list of str
-        Target Python or bash command.
+        Target Python or bash command; bash sources the target activation script.
     source : str
         Source document path.
     line : int
@@ -364,10 +364,14 @@ def run_command(
     >>> callable(run_command)
     True
     """
+    env = block_env(workdir, bindir)
+    if command[0] == "bash":
+        # Shell examples follow the documented activation, without an injected venv PATH.
+        env["PATH"] = os.defpath
+        activate = shlex.quote(str(bindir / "activate"))
+        command = [*command[:-1], f"test -f {activate}\nsource {activate}\n{command[-1]}"]
     try:
-        rc, stdout, stderr = _execute(
-            command, workdir=workdir, env=block_env(workdir, bindir), timeout_s=timeout_s
-        )
+        rc, stdout, stderr = _execute(command, workdir=workdir, env=env, timeout_s=timeout_s)
     except subprocess.TimeoutExpired as error:
         raise AssertionError(
             f"{source}:{line} timed out after {timeout_s:g}s\n"

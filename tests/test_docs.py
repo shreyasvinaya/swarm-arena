@@ -61,6 +61,8 @@ INSTALL_COMMAND = re.compile(
     r"(?P=quote)"
 )
 INSTALL_GUIDANCE = "https://github.com/shreyasvinaya/swarm-arena#install"
+UV_INSTALL = "uv init swarm-demo\ncd swarm-demo\nuv add swarm-arena\nsource .venv/bin/activate\n"
+VENV_INSTALL = "python -m venv .venv\nsource .venv/bin/activate\npip install swarm-arena\n"
 FALLBACK = (
     "If 0.1.0 is not on PyPI yet, use "
     '`uv add "swarm-arena @ git+https://github.com/shreyasvinaya/swarm-arena"`'
@@ -144,6 +146,9 @@ def test_install_examples_and_hints_use_one_release_form() -> None:
         text = path.read_text(encoding="utf-8")
         if path == README:
             text = text.replace(FALLBACK, "", 1)
+        if path in {README, ROOT / "docs/getting-started.md"}:
+            # Only these complete, activated-venv instructions may use plain pip.
+            text = text.replace(f"```sh\n{VENV_INSTALL}```", "", 1)
         violations = _install_violations(text, python=path.suffix == ".py")
         if violations:
             stale[str(path.relative_to(ROOT))] = violations
@@ -347,7 +352,18 @@ def test_quickstarts_distinguish_release_and_source_installs(
 ) -> None:
     text = (ROOT / relative_path).read_text(encoding="utf-8")
     section = text.split(f"## {heading}\n", 1)[1].split("\n## ", 1)[0]
-    assert "```sh\nuv add swarm-arena\n```" in section
+    assert f"```sh\n{UV_INSTALL}```" in section
+    assert f"```sh\n{VENV_INSTALL}```" in section
+    commands = "\n".join(block.code for block in parse_blocks(text))
+    steps = [
+        UV_INSTALL,
+        VENV_INSTALL,
+        "mkdir hello-world\ncd hello-world",
+        "swarm-arena run --yes run.toml plan.toml",
+    ]
+    positions = [commands.index(step) for step in steps]
+    assert positions == sorted(positions)
+    assert "same activated shell" in text
     if relative_path == "README.md":
         assert FALLBACK in section
         assert "name-reservation placeholder" in section
@@ -790,6 +806,31 @@ def target_bin(tmp_path: Path) -> Path:
     )
     assert done.returncode == 0, done.stderr
     return tmp_path / "venv" / "bin"
+
+
+def test_shell_blocks_source_target_activate(
+    target_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PATH", os.defpath)
+    monkeypatch.setenv("OPENAI_API_KEY", "sentinel-secret")
+    activate = target_bin / "activate"
+    with activate.open("a", encoding="utf-8") as stream:
+        stream.write("\nexport DOCS_ACTIVATE_FILE_WAS_SOURCED=yes\n")
+    code = (
+        'test "${DOCS_ACTIVATE_FILE_WAS_SOURCED:-}" = yes\n'
+        f'test "${{VIRTUAL_ENV:-}}" = {shlex.quote(str(target_bin.parent))}\n'
+        f'test "$(command -v python)" = {shlex.quote(str(target_bin / "python"))}\n'
+        'test -z "${OPENAI_API_KEY:-}"\n'
+        "python -c "
+        + shlex.quote(f"import sys; assert sys.prefix == {str(target_bin.parent)!r}")
+        + "\n"
+    )
+    blocks = parse_blocks(f"<!-- docs-test: run -->\n```bash\n{code}```\n")
+    workdir = make_workdir(tmp_path, with_examples=False)
+    run_blocks(blocks, source="activation.md", workdir=workdir, bindir=target_bin)
+    activate.unlink()
+    with pytest.raises(AssertionError, match=r"activation\.md:2 exited"):
+        run_blocks(blocks, source="activation.md", workdir=workdir, bindir=target_bin)
 
 
 def test_target_interpreter_executes_blocks(target_bin: Path, tmp_path: Path) -> None:

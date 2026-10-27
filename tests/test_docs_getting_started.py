@@ -38,8 +38,22 @@ def test_required_facts() -> None:
 
 def test_hello_world_run_view_share(tmp_path: Path) -> None:
     text = page_path("Getting started").read_text(encoding="utf-8")
-    headings = ["## Run hello-world", "## View results", "## Share a review", "## Rosenbrock"]
+    headings = [
+        "## Install",
+        "## Run hello-world",
+        "## View results",
+        "## Share a review",
+        "## Rosenbrock",
+    ]
     positions = [text.index(heading) for heading in headings]
+    install = text[positions[0] : positions[1]]
+    assert (
+        "uv init swarm-demo\ncd swarm-demo\nuv add swarm-arena\nsource .venv/bin/activate"
+        in install
+    )
+    assert "python -m venv .venv\nsource .venv/bin/activate\npip install swarm-arena" in install
+    assert "same activated shell" in text[positions[1] : positions[2]]
+    assert "mkdir hello-world\ncd hello-world" in text[positions[1] : positions[2]]
     assert positions == sorted(positions)
     blocks = parse_blocks(text[: positions[-1]])
     assert [(block.lang, block.arg) for block in blocks if block.kind == "file"] == [

@@ -21,7 +21,18 @@
 Python 3.11+, Linux or macOS (POSIX). Install in a uv project:
 
 ```sh
+uv init swarm-demo
+cd swarm-demo
 uv add swarm-arena
+source .venv/bin/activate
+```
+
+Alternatively, use a plain virtual environment in your working folder:
+
+```sh
+python -m venv .venv
+source .venv/bin/activate
+pip install swarm-arena
 ```
 
 If 0.1.0 is not on PyPI yet, use `uv add "swarm-arena @ git+https://github.com/shreyasvinaya/swarm-arena"` (add the desired extras inside the quoted requirement).
@@ -55,7 +66,14 @@ uv add "swarm-arena[langfuse]"
 
 ### Run hello-world
 
-In an empty folder, save these two files as `run.toml` and `plan.toml`.
+In the same activated shell, create a new empty folder:
+
+```sh
+mkdir hello-world
+cd hello-world
+```
+
+Save these two files as `run.toml` and `plan.toml` in that folder.
 They need only the installed core package: no checkout, API key or network.
 One `ScriptedManager` drives a standard-library `ScriptTool` for one round.
 The `ScriptJudge` awards a constant demonstration score of 1; it is not a
