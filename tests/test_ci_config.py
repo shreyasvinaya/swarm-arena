@@ -1127,10 +1127,14 @@ def test_publish_job_is_least_privilege() -> None:
     assert job["if"] == "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
     assert job["environment"] == {"name": "pypi", "url": "https://pypi.org/p/swarm-arena"}
     assert job["permissions"] == {"id-token": "write"}
+    # The job that can mint a PyPI token runs only actions pinned to a commit.
     assert steps_uses(job) == [
-        "actions/download-artifact@v8",
-        "pypa/gh-action-pypi-publish@release/v1",
+        "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
+        "pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086",
     ]
+    text = RELEASE.read_text(encoding="utf-8")
+    assert "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2" in text
+    assert "pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3" in text
     assert job["steps"][0]["with"] == {"name": "release-dist", "path": "release"}
     assert job["steps"][-1]["with"] == {"packages-dir": "release/dist/"}
     assert "id-token" not in json.dumps(wf["jobs"]["build"])
