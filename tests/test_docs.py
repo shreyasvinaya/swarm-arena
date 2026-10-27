@@ -62,7 +62,7 @@ INSTALL_COMMAND = re.compile(
 )
 INSTALL_GUIDANCE = "https://github.com/shreyasvinaya/swarm-arena#install"
 UV_INSTALL = "uv init swarm-demo\ncd swarm-demo\nuv add swarm-arena\nsource .venv/bin/activate\n"
-VENV_INSTALL = "python -m venv .venv\nsource .venv/bin/activate\npip install swarm-arena\n"
+VENV_INSTALL = "python3 -m venv .venv\nsource .venv/bin/activate\npip install swarm-arena\n"
 FALLBACK = (
     "If 0.1.0 is not on PyPI yet, use "
     '`uv add "swarm-arena @ git+https://github.com/shreyasvinaya/swarm-arena"`'

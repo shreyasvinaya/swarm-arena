@@ -28,7 +28,7 @@ source .venv/bin/activate
 Alternatively, use a plain virtual environment in your working folder:
 
 ```sh
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install swarm-arena
 ```

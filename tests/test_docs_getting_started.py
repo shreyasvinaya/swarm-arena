@@ -51,7 +51,7 @@ def test_hello_world_run_view_share(tmp_path: Path) -> None:
         "uv init swarm-demo\ncd swarm-demo\nuv add swarm-arena\nsource .venv/bin/activate"
         in install
     )
-    assert "python -m venv .venv\nsource .venv/bin/activate\npip install swarm-arena" in install
+    assert "python3 -m venv .venv\nsource .venv/bin/activate\npip install swarm-arena" in install
     assert "same activated shell" in text[positions[1] : positions[2]]
     assert "mkdir hello-world\ncd hello-world" in text[positions[1] : positions[2]]
     assert positions == sorted(positions)
