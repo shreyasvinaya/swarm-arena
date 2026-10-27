@@ -1865,7 +1865,7 @@ if __name__ == "__main__":
 
 def test_setup_uv_refs_name_a_published_tag() -> None:
     # astral-sh/setup-uv publishes only full version tags, so `@v10` does not resolve.
-    full = re.compile(r"astral-sh/setup-uv@(?:v\d+\.\d+\.\d+|[0-9a-f]{40})(?=\s|#|$)")
+    full = re.compile(r"astral-sh/setup-uv@(?:v\d+\.\d+\.\d+|[0-9a-f]{40})(?=\s|$)")
     paths = [*(REPO / ".github" / "workflows").glob("*.yml"), *(REPO / "docs").glob("*.md")]
     bad = {
         f"{path.relative_to(REPO)}:{number}"
@@ -1883,8 +1883,10 @@ def test_setup_uv_refs_name_a_published_tag() -> None:
         ("- uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0", True),
         ("      - uses: astral-sh/setup-uv@v10", False),
         ("      - uses: astral-sh/setup-uv@v10.3.0^invalid", False),
+        # YAML keeps an attached '#' in the value; a comment needs a space first.
+        ("      - uses: astral-sh/setup-uv@v10.3.0#^invalid", False),
     ],
 )
 def test_setup_uv_ref_pattern(line: str, valid: bool) -> None:
-    full = re.compile(r"astral-sh/setup-uv@(?:v\d+\.\d+\.\d+|[0-9a-f]{40})(?=\s|#|$)")
+    full = re.compile(r"astral-sh/setup-uv@(?:v\d+\.\d+\.\d+|[0-9a-f]{40})(?=\s|$)")
     assert bool(full.search(line)) is valid
