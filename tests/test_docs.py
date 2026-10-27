@@ -735,6 +735,23 @@ def test_run_blocks_shares_files_between_blocks(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "code",
+    ['echo "$DOCS_UNSET_VARIABLE"\n', "source ./missing-file\n", "exit 3\n"],
+    ids=["unbound-variable", "missing-source", "explicit-exit"],
+)
+def test_bash_block_failure_keeps_its_status(tmp_path: Path, code: str) -> None:
+    # The exit handshake's trap must not replace the block's own exit status.
+    blocks = parse_blocks(f"<!-- docs-test: run -->\n```bash\n{code}```\n")
+    with pytest.raises(AssertionError, match=r"t\.md:2 exited [1-9]"):
+        run_blocks(
+            blocks,
+            source="t.md",
+            workdir=make_workdir(tmp_path, with_examples=False),
+            bindir=docs_bindir(),
+        )
+
+
 def test_run_blocks_reports_failing_line(tmp_path: Path) -> None:
     blocks = parse_blocks('text\n```python\nprint("out")\nraise SystemExit(3)\n```\n')
     with pytest.raises(AssertionError, match=r"t\.md:2 exited 3\nout"):

@@ -213,11 +213,19 @@ def block_env(workdir: Path, bindir: Path) -> dict[str, str]:
 def _exit_gate(command: list[str], ready: Path, release: Path) -> list[str]:
     """Hold normal Python/bash exit until the owner has snapshotted descendants."""
     if command[0] == "bash":
+        # Keep the block's own status. Bash 3.2 (macOS /bin/bash) reports 0 in an
+        # EXIT trap after a fatal error such as an unset variable, so a block that
+        # stops before its last line without a non-zero status counts as failed.
         hold = (
+            "__docs_status=$?; "
+            'if [ "$__docs_status" -eq 0 ] && [ "${__docs_completed:-}" != yes ]; '
+            "then __docs_status=1; fi; "
             f"touch {shlex.quote(str(ready))}; "
-            f"while ! test -e {shlex.quote(str(release))}; do sleep 0.01; done"
+            f"while ! test -e {shlex.quote(str(release))}; do sleep 0.01; done; "
+            'exit "$__docs_status"'
         )
-        return [*command[:-1], f"trap {shlex.quote(hold)} EXIT\n{command[-1]}"]
+        body = command[-1] if command[-1].endswith("\n") else command[-1] + "\n"
+        return [*command[:-1], f"trap {shlex.quote(hold)} EXIT\n{body}__docs_completed=yes\n"]
     prelude = (
         "import atexit, pathlib, runpy, sys, time\n"
         "def _docs_hold_exit():\n"
