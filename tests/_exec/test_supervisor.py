@@ -34,7 +34,8 @@ STUBBORN = (
     "import os, subprocess, sys, time\n"
     f"c = subprocess.Popen([sys.executable, '-c', {_GRANDCHILD!r}])\n"
     "while not os.path.exists('gc.ready'): time.sleep(0.01)\n"
-    "open('gc.pid', 'w').write(str(c.pid))\n"
+    # Publish the pid atomically: readiness waits for gc.pid to exist.
+    "open('gc.pid.tmp', 'w').write(str(c.pid)); os.replace('gc.pid.tmp', 'gc.pid')\n"
     "time.sleep(60)\n"
 )
 
@@ -304,8 +305,9 @@ async def test_stop_returns_early_when_group_is_gone(
 
 async def test_grandchildren_killed_on_cancel(tmp_path: Path) -> None:  # exit criterion
     code = (
-        "import subprocess, time; c = subprocess.Popen(['sleep', '60']); "
-        "open('gc.pid', 'w').write(str(c.pid)); time.sleep(60)"
+        "import os, subprocess, time; c = subprocess.Popen(['sleep', '60']); "
+        "open('gc.pid.tmp', 'w').write(str(c.pid)); os.replace('gc.pid.tmp', 'gc.pid'); "
+        "time.sleep(60)"
     )
     statuses: list[RunStatus] = []
 
