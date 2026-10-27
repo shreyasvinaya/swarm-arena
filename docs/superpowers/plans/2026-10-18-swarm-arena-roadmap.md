@@ -433,8 +433,25 @@ M3 invocation and integration additions to R3.1 (these extend the existing modul
 | `tests/_fakes/gateway.py` | Stdlib fake LiteLLM Proxy (strict-profile endpoints, keys, spend logs) | M4 |
 | `tests/_fakes/tools.py` | Small module-level tool functions and scripts used across tests; refs name them `_fakes.tools:<name>` (importable through `pythonpath = ["tests"]`, R5.3) | M1a |
 | `tests/llm/test_upstream_facts.py` | Offline pinned SDK, LiteLLM callbacks, pricing, cache identity, retry and tracing facts | M3 |
+| `tests/_surface.py` | The §9 table and import helpers shared by the surface tests; `deps_present` checks distribution metadata, including both `agents` and `litellm` for lazy testing names | M5 |
 | `tests/test_public_api.py` | One `__all__` snapshot test per public module | M1a (exact §9 in M5) |
 | `tests/test_docstrings.py` | numpydoc validation and a required `Examples` section for every public name and its public methods | M1a |
+| `tests/test_compat.py` | §9 rules 2, 3: frozen abstract methods, no I/O in `__init__`, newer `schema_version` refused | M5 |
+| `tests/test_ci_config.py` | Shared safe YAML/workflow helpers and Read the Docs configuration parity with the locked docs CI job | M5 |
+| `tests/_docs.py` | Shared docs block parser/runner, target-interpreter dependency probes (complete LLM dependencies), minimal no-key environment, per-worker Sphinx fixture, required-facts helper and stub pattern | M5 |
+| `tests/test_packaging.py` | Wheel contents and metadata, version agreement, changelog format, M5 | M5 |
+| `tests/test_docs.py` | Existing documentation regressions plus docs code-block harness, site structure, required facts, README quickstart, M5 | M1b (+M2 +M3 +M4 +M5) |
+| `tests/test_docs_getting_started.py` | Page-specific required facts and executable documentation regressions for `getting-started` | M5 |
+| `tests/test_docs_concepts.py` | Page-specific required facts and executable documentation regressions for `concepts` | M5 |
+| `tests/test_docs_own_files.py` | Page-specific required facts and executable documentation regressions for `own-files` | M5 |
+| `tests/test_docs_writing_a_connector.py` | Page-specific required facts and executable documentation regressions for `writing-a-connector` | M5 |
+| `tests/test_docs_planning_modes.py` | Page-specific required facts and executable documentation regressions for `planning-modes` | M5 |
+| `tests/test_docs_scoring_and_review.py` | Page-specific required facts and executable documentation regressions for `scoring-and-review` | M5 |
+| `tests/test_docs_limits_and_safety.py` | Page-specific required facts and executable documentation regressions for `limits-and-safety` | M5 |
+| `tests/test_docs_running_on_ray.py` | Page-specific required facts and executable documentation regressions for `running-on-ray` | M5 |
+| `tests/test_docs_arena.py` | Page-specific required facts and executable documentation regressions for `arena` | M5 |
+| `tests/test_docs_versioning.py` | Page-specific required facts and executable documentation regressions for `versioning` | M5 |
+| `tests/test_docs_roadmap.py` | Page-specific required facts and executable documentation regressions for `roadmap` | M5 |
 | `tests/test_import_isolation.py` | `import swarm_arena` (and each core facade) loads no optional dependency | M1a |
 | `tests/e2e/test_single_run.py` | M1a exit test | M1a |
 | `tests/e2e/test_rosenbrock.py`, `test_own_script.py`, `test_many_goals_parts.py`, `test_cli_lifecycle.py`, `test_crash_resume.py`, `test_fencing.py` | M1b exit tests | M1b |
@@ -1627,7 +1644,7 @@ def make_candidate(output: ToolOutput, *, request: ToolRequest | None = None, to
 # testing/_artifacts.py — M1a
 def read_output_file(output: ToolOutput, path: str) -> bytes: ...
 def read_logs(output: ToolOutput) -> tuple[bytes, bytes]: ...   # stdout, stderr; verified stored bytes
-# testing/_fake_model.py — M3 (lazy import of `agents`)
+# testing/_fake_model.py — M3 (lazy import through the llm facade; requires both `agents` and `litellm`)
 @dataclass(frozen=True, kw_only=True)
 class FakeTurn:
     text: str | None = None
@@ -3136,9 +3153,9 @@ These artifact models are distinct from
 
 - **Python:** 3.11 or newer, **POSIX** only (no Windows). `requires-python = ">=3.11"`.
 - **Async:** the anyio API on the **asyncio backend only** (§4.8). Tests pin `anyio_backend = "asyncio"`. `Swarm` raises on another backend. The CLI uses `anyio.run(..., backend="asyncio")`.
-- **Core dependencies:** `anyio>=4.15,<5`, `pydantic>=2`, `typing-extensions`. [plan] lower bounds: `pydantic>=2.11,<3`, `typing-extensions>=4.12`. `fsspec` (§7, §11) is not a direct core dependency; it comes with the `s3` extra through `s3fs` (deviation, R5.4 item 13).
+- **Core dependencies:** `anyio>=4.15,<5`, `pydantic>=2`, `typing-extensions`. Tested lower bounds: `pydantic>=2.14.0,<3`, `typing-extensions>=4.16.0`. `fsspec` (§7, §11) is not a direct core dependency; it comes with the `s3` extra through `s3fs` (deviation, R5.4 item 13).
 - **Extras:** `llm`: `openai-agents[litellm]>=0.24,<0.25` and `litellm>=1.107.0rc2,<1.108` (Ruling P39; R5.4 item 20; with `!=` pins for bad releases; an upper bound is raised only after the weekly upstream job passes on the newer release). `cache`: `litellm[caching,proxy]>=1.107.0rc2,<1.108`. `ray`: `ray[default]>=2.59,<3`. `s3`: `s3fs>=2023.12.1`, `aiobotocore>=2.16.0` (floors from M2 task 1). `langfuse`: `langfuse>=5,<6`, `openinference-instrumentation-openai-agents`. `a2a`: v2 (not declared in v1). The gateway client uses only the stdlib (`urllib`).
-- **Docs:** sphinx, sphinx-rtd-theme, numpydoc, myst-parser. [plan] `sphinx>=9.0,<10` (the 3.11 floor locks 9.0.x; RTD builds on 3.13), `sphinx-rtd-theme>=3.1`, `numpydoc>=1.11`, `myst-parser>=4`.
+- **Docs:** sphinx, sphinx-rtd-theme, numpydoc, myst-parser. [plan] `sphinx>=9.0,<10` (the 3.11 floor locks 9.0.x; RTD builds on 3.13), `sphinx-rtd-theme>=3.1`, `numpydoc>=1.11`, `myst-parser>=5.0.0`.
 - **Tooling:** uv (`uv init --lib`, src layout, `py.typed`, build backend `uv_build>=0.13.1,<0.14`), ruff with numpy docstring rules, ty pinned exactly, pytest 9 with anyio's plugin and `anyio_mode = "auto"`, `-W error::DeprecationWarning`, an `__all__` snapshot test per public module.
 - **The core never imports** `agents`, `litellm`, `ray`, `s3fs`, `langfuse`, or `a2a`. A tool program is never imported by the core or the driver, except a `FunctionTool` function (R5.4 item 12). Managers, judges, planners, and the board run in the driver; only tool runs and `ctx.execute` go to the executor.
 - **Never use `uv run`** to start a tool (it cannot forward SIGKILL). Call the venv's Python directly.
@@ -3199,6 +3216,12 @@ Other fixed values: `Learning.title` ≤ 120 characters, `Learning.text` ≤ 1,5
   [tool.ruff.lint.per-file-ignores]
   "tests/**" = ["D"]
   "examples/**" = ["D"]
+  # E402: core facades imported after _publish; llm exports follow its optional-import guard.
+  # RUF022: §9 order is the snapshot order, and it is not isort order.
+  "src/swarm_arena/__init__.py" = ["E402", "RUF022"]
+  "src/swarm_arena/{tool,scoring,manager,planning,board,executor,config,protocol}.py" = ["RUF022"]
+  "src/swarm_arena/llm/__init__.py" = ["E402", "RUF022"]
+  "src/swarm_arena/{ray,testing}/__init__.py" = ["RUF022"]
   [tool.ruff.lint.flake8-tidy-imports]
   ban-relative-imports = "all"
   [tool.ruff.lint.flake8-tidy-imports.banned-api]
@@ -3254,6 +3277,7 @@ Other fixed values: `Learning.title` ≤ 120 characters, `Learning.text` ≤ 1,5
 
 20. **Deviation from §11 (LLM dependency versions), Ruling P39:** use `openai-agents[litellm]>=0.24,<0.25` with `litellm>=1.107.0rc2,<1.108` for `llm` and `litellm[caching,proxy]>=1.107.0rc2,<1.108` for `cache`. The spec's 1.105 range cannot resolve with openai-agents 0.24; M3's upstream facts were re-checked at the pinned 1.107 release candidate. M5 release gate: move the lower bound to 1.107.0 final and re-run the upstream facts before the first release.
 
+21. Test-only dev dependency `pyyaml>=6` parses `.readthedocs.yaml` and the workflow files, M5.
 
 ### Delivered provider-state interface additions
 

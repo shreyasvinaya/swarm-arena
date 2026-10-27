@@ -1,16 +1,18 @@
 """Sphinx configuration for the swarm-arena docs."""
 
-import importlib.metadata
 from inspect import Parameter, Signature
 from inspect import signature as object_signature
 from typing import Any
 
 from sphinx.application import Sphinx
 
+import swarm_arena
+
 project = "swarm-arena"
 author = "Shreyas Vinaya"
 copyright = "2026, Shreyas Vinaya"
-release = importlib.metadata.version("swarm-arena")
+release = swarm_arena.__version__
+version = ".".join(release.split(".")[:2])
 
 extensions = ["sphinx.ext.autodoc", "numpydoc", "myst_parser"]
 html_theme = "sphinx_rtd_theme"

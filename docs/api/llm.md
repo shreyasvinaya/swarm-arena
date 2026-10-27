@@ -1,4 +1,6 @@
-# LLM integrations
+# swarm_arena.llm
+
+Needs the `llm` extra.
 
 Install `swarm-arena[llm]` to import this optional package. The `cache` extra
 adds response-cache backends; `langfuse` adds optional tracing dependencies.

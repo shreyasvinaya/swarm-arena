@@ -3,6 +3,11 @@
 Run tools, checks, and judges locally with your existing scripts. Start with
 [Try it offline](#try-it-offline); no Python subclass or model provider is needed.
 
+The workspace contract below is a **stable format**: scripts exchange versioned
+JSON files with the core without importing swarm-arena. The tool workspace,
+the check/judge workspace, and their reserved paths form that contract; see
+[Versioning policy](versioning.md) for how versioned formats change.
+
 ## File snapshots
 
 A goal or component can declare a `FileSet` with globs relative to the plan file:
@@ -82,7 +87,7 @@ overlay before creating the stage. Refusals identify the conflicting paths
 without including edit contents.
 
 Every parent, including the base parent, has read-only overlay and output files
-under `parents/<id>/`. An output file replaces an overlay or effective file
+under `parents/<candidate-id>/`. An output file replaces an overlay or effective file
 only at the exact same path. An output that respells a staged path fails the
 producing run. `data.json` always holds the parent's structured output; aliases such as
 `DATA.json` and `Data.json` are skipped at that level too. Parent ids must be
@@ -204,13 +209,16 @@ filesystem paths or artifact hashes as a way to select additional files.
 
 ## Try it offline
 
-Install this checkout in your project environment (Python 3.11+, POSIX):
+Install the package in your project environment (Python 3.11+, POSIX):
 
 ```sh
 uv init --python 3.11 script-demo
 cd script-demo
-uv add --editable /absolute/path/to/agent-swarm
+uv add swarm-arena
 ```
+
+Use the [installation fallback](https://github.com/shreyasvinaya/swarm-arena#install)
+until 0.1.0 is on PyPI.
 
 Save the following four files, creating their parent directories as needed.
 Run `uv run python try_scripts.py` from `script-demo`. The driver writes the
@@ -222,6 +230,7 @@ to this current directory and manages a local executor.
 
 The tool reads parameters and an editable problem file, then writes a result:
 
+<!-- docs-test: file problem/run.py -->
 ```python
 import json
 import os
@@ -237,6 +246,7 @@ Path(os.environ["SWARM_ARENA_RESULT"]).write_text(json.dumps({"data": {"loss": l
 
 The check sees the candidate's edited file and its recorded output:
 
+<!-- docs-test: file checks/check.py -->
 ```python
 import json
 import os
@@ -256,6 +266,7 @@ Path(os.environ["SWARM_ARENA_RESULT"]).write_text(
 
 The judge returns a loss; its configuration below makes smaller values better:
 
+<!-- docs-test: file judge/score.py -->
 ```python
 import json
 import os
@@ -269,6 +280,7 @@ Path(os.environ["SWARM_ARENA_RESULT"]).write_text(json.dumps({"value": output["d
 
 All imports use the public API:
 
+<!-- docs-test: file try_scripts.py -->
 ```python
 from pathlib import Path
 
@@ -317,6 +329,11 @@ if __name__ == "__main__":
 ```
 
 Expected output:
+
+<!-- docs-test: run -->
+```bash
+python try_scripts.py
+```
 
 ```text
 ok: loss=0.25, check=True, key=(-0.25,)
@@ -410,7 +427,7 @@ A tool starts in a fresh workspace with this layout:
 ```
 
 See [Workspace staging](#workspace-staging) for the staging order, exact-spelling
-replacement rule, respelling refusal, and overlay acceptance rules. For example,
+replacement rule, respelling refusal, and overlay rule. For example,
 a parent from another tool remains available under `parents/c1/` but does not replace
 `problem/ns_solver.phyk` at the root. A matching parent's editable change can
 be inherited and then replaced by the current edit.
@@ -430,12 +447,14 @@ manifest files and the working directory for `python -m run`. It also warns
 when rebuilt after snapshotting. The warning leaves execution and edit
 permissions unchanged.
 
-Check and judge private paths and the core's reserved paths are also excluded
-from edits and overlays. Protected names use canonical caseless folding;
+The command's script and check and judge private files are **never editable**.
+The core's reserved paths are also excluded from edits and overlays.
+Protected names use canonical caseless folding;
 editable globs remain case sensitive. For example, `./problem/RUN.py` in a
 command protects the root's `problem/run.py`. Use `editable=["problem/*.physk"]`
 to permit problem edits without allowing new Python modules beside that script.
-All workspace paths must be relative strict UTF-8 (no lone surrogates), without `..` or symlinks. Top-level
+Symlinks are rejected. All workspace paths must be relative strict UTF-8
+(no lone surrogates), without `..`. Top-level
 `swarm/`, `parents/`, and `candidate/` are reserved, including folded variants.
 For example, `out/plot.png` is a valid output path; `../plot.png` and
 `candidate/plot.png` are not. Distinct spellings with the same folded key are
@@ -501,6 +520,7 @@ valid `result.json`. Failed, timed-out, or invalid collection gives empty data,
 `partial=false`, and a note. Write partial results atomically so collection never
 sees half a JSON document:
 
+<!-- docs-test: file write_partial.py -->
 ```python
 import json
 import os
@@ -521,6 +541,7 @@ invocation. Check/judge jobs have empty team and agent values.
 `"python"` becomes the configured `python` interpreter or the current
 interpreter. Programs start directly, never through `uv run`.
 
+<!-- docs-test: file invocation_env.py -->
 ```python
 import os
 
@@ -546,7 +567,8 @@ read a value with `os.environ["ANTHROPIC_API_KEY"]`. The script must also avoid
 printing secrets to its own logs.
 
 Edits are UTF-8 text replacements, including additions that match `editable`.
-Each edit is limited by `limits.max_edit_bytes`, default **262,144 bytes**.
+Each edit is limited by `limits.max_edit_bytes`, default **256 KiB (262,144 bytes)**.
+The limit counts encoded UTF-8 bytes, rather than characters.
 Protected, private, reserved, and folded-colliding paths are refused. The exact
 `sha256:` plus 64 lowercase hexadecimal digits form is reserved for stored
 references and cannot be submitted as literal edit text.
@@ -583,6 +605,7 @@ solver file.
 
 Checks write a raw object, without the tool's `data` envelope:
 
+<!-- docs-test: file check_result.py -->
 ```python
 import json
 import os
@@ -666,14 +689,38 @@ The bring-your-own-script example in `examples/own_script/`
 runs a complete two-round line fit with `ScriptedManager`. From the repository
 root, run:
 
-```sh
-uv run swarm-arena run --yes examples/own_script/run.toml examples/own_script/plan.toml
+<!-- docs-test: run -->
+```bash
+swarm-arena run --yes examples/own_script/run.toml examples/own_script/plan.toml
 ```
 
 The completion line is `done: line-fit 1 finalists`. The final slope is `2.0`,
 the intercept is `1.0`, and both public and held-out MSE are `0.0`.
 Run artifacts live under `.swarm-arena/` relative to your working directory;
 the final document is `runs/<run-id>/goals/line-fit/solution.json` beneath it.
+
+Read the newest solution from that run. This search also works when roots are
+resolved relative to the configuration folder:
+
+```python
+import glob
+import json
+import os
+from pathlib import Path
+
+solutions = glob.glob("**/.swarm-arena/runs/*/goals/*/solution.json", recursive=True)
+assert solutions, "Run the line-fit example first"
+latest = max(solutions, key=os.path.getmtime)
+text = Path(latest).read_text(encoding="utf-8")
+solution = json.loads(text)
+assert solution["source_head"]
+assert solution["status"] == "ok"
+[finalist] = solution["finalists"]
+candidate = finalist["candidate"]
+assert candidate["output"]["status"] == "ok"
+assert candidate["output"]["data"] == {"slope": 2.0, "intercept": 1.0, "fit_error": 0.0}
+print(text)
+```
 
 The first agent edits the slope in round 1. The second agent uses
 `parents = "best"` in round 2 and edits the intercept. Their byte-identical

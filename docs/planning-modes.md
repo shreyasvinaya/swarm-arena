@@ -6,6 +6,16 @@ managers, checks, judges, pruning policy, and convergence settings. The offline
 [plan and Swarm API](api/swarm_arena.md), [planning API](api/planning.md), and
 [configuration API](api/config.md).
 
+| Mode | Entry point | Who decides the plan? |
+|---|---|---|
+| Manual | `Plan.load("plan.toml")` or Python constructors | You supply all components and settings. |
+| LLM | `LLMPlanner("planner")` | The model chooses from your approved catalog. |
+| Together | `CollaborativePlanner(LLMPlanner("planner"), reviewer)` | The model drafts; the reviewer returns `Approve`, `Feedback`, or `Edited`. Catalog restrictions still apply to edits. |
+| Autonomous | `Swarm(config, replanner=LLMPlanner("planner"))` | The engine requests revisions only between rounds, within the same human limits. |
+
+The deterministic pruning policy runs before the autonomous replanner. A
+replanner cannot change `RunConfig` or the frozen main goal.
+
 ## Manual TOML plans
 
 From a source checkout, run the integrated Rosenbrock example:
@@ -36,8 +46,9 @@ plan. Relative storage roots follow the command's working directory.
 Validate a manual plan and print its worst-case estimate and admission warnings
 without starting a run or asking for approval:
 
-```sh
-uv run swarm-arena plan examples/rosenbrock/run.toml examples/rosenbrock/plan.toml
+<!-- docs-test: run -->
+```bash
+swarm-arena plan examples/rosenbrock/run.toml examples/rosenbrock/plan.toml
 ```
 
 Manual admission checks non-human catalog references before importing them and
@@ -47,9 +58,10 @@ Every admission error is printed on stderr with exit 1.
 
 For model-generated planning, install the `llm` extra and supply a run configuration
 with a planner-role model alias, a human-approved `planner_catalog`, and enough
-token or USD budget for the planner. The catalog configuration in
-[LLM planning](#llm-planning) is also usable here after saving it with
-`config.dumps()` to `run.toml`. Create `goals/goal.toml` with just a `[goal]` table,
+token budget for the planner. Define its entries as described under
+[Define the planner catalog](#define-the-planner-catalog), add the model settings
+described under [LLM planning](#llm-planning), and save the complete configuration
+with `config.dumps()` to `run.toml`. Create `goals/goal.toml` with just a `[goal]` table,
 for example:
 
 ```toml
@@ -59,7 +71,9 @@ namespace = "optimization"
 title = "Find a good solution using the approved catalog"
 ```
 
-Then generate a plan, or review its TOML in the terminal before saving:
+Then generate a plan, or review its TOML in the terminal before saving. These
+commands need provider credentials and, for together mode, terminal review;
+offline file-provenance coverage is in `tests/e2e/test_llm_plan_file.py`.
 
 ```sh
 uv run swarm-arena plan --llm --model planner run.toml goals/goal.toml
@@ -171,7 +185,58 @@ checks an **already frozen** plan and returns warnings or raises `ValueError`;
 it refuses unresolved `FileSet` declarations. Use `Swarm.run` to admit source
 plans rather than treating `validate_plan` as a snapshot operation.
 
+The Rosenbrock plan has no source-file declarations to snapshot, so it can be
+validated directly. Put its local connector directory on Python's import path
+when calling `validate_plan` yourself; the CLI manages that import context for
+you. Run this from the repository root:
+
+```python
+import sys
+
+from swarm_arena import Plan, RunConfig, validate_plan
+
+plan = Plan.load("examples/rosenbrock/plan.toml")
+config = RunConfig.load("examples/rosenbrock/run.toml")
+sys.path.insert(0, str(plan.base_dir))
+warnings = validate_plan(plan, config)
+print(warnings)
+assert warnings == []
+```
+
+Validation applies to every mode. In addition to the provenance and frozen-file
+rules below, it checks:
+
+- Team, agent, round and concurrent-agent limits, including
+  `other_active_agents` when checking `max_agents_total` across goals.
+- Every component's typed `Config`, unique lowercase slug names, and a
+  nonblank rationale for every team and agent.
+- Every added or changed non-human `Ref`, at every nesting depth, against the
+  catalog before importing it. Unchanged human references at retained sites
+  can carry authority through admitted history.
+- Tool environment names against `RunConfig.secrets.allow`, including the
+  effective configuration after `RoundSpec.tool_overrides` and
+  `ConvergeSpec.round` are merged. Non-human overrides may set only authorized
+  fields; an unchanged carried-over human override retains its provenance.
+- A team for every part, valid team-to-part assignments, and team-mode
+  convergence when there are parts. A part inherits main scoring when its own
+  scoring fields are unset.
+- The r0 main `GoalKey` for revisions with history. For non-human revisions
+  with admitted history, all historical main checks and judges, the ranking
+  setting, and retained parts' scoring must remain unchanged; newly added parts
+  must leave their scoring fields unset to inherit main scoring. Removing a
+  part with all its teams is permitted; leaving a retained part without a team
+  is not.
+- Duplicate agent fingerprints: tool path, tool configuration and manager
+  model aliases, excluding instructions, names and rationales. At most
+  `max_agents_per_fingerprint` agents (default 2) may share one fingerprint.
+  Replicates also require a nondeterministic tool in every effective round.
+- Frozen manifests, private-file separation, and registered model capability,
+  role, token-cap and price checks. Validation returns warnings on success
+  and raises `ValueError` (specifically `PlanError`) on refusal.
+
 ## Provenance and revisions
+
+Provenance is set by the core, not by model-generated fields.
 
 `origin` distinguishes human plans from non-human proposals; `revision` and
 `parent_revision` describe their history. Human-created plans default to
@@ -204,6 +269,66 @@ Human-only component fields, including their validation aliases and nested
 references, cannot become planner-settable. Round tool overrides cannot change
 human-only fields, even in human plans. In non-human plans, overrides must also
 be explicitly catalog-settable; restating a fixed field is refused.
+
+### Define the planner catalog
+
+Each `CatalogEntry` has a unique `name`, component `kind`, import-path `ref`,
+human-written `description`, fixed `config`, and `settable` property schemas.
+The model chooses the entry name and supplies only allowed values. Script
+fields `command`, `python`, `files`, `env`, and `editable` are **never settable**;
+their aliases are protected too. Keep them in human-written fixed configuration.
+
+For example, this core-only catalog permits the planner to vary a pruning
+fraction while keeping its minimum retention fixed:
+
+```python
+from swarm_arena import RunConfig
+from swarm_arena.config import CatalogEntry, PlannerCatalog
+
+catalog = PlannerCatalog(
+    entries=[
+        CatalogEntry(
+            name="halve",
+            kind="policy",
+            ref="swarm_arena:SuccessiveHalving",
+            description="Keep the strongest agents and a passing agent per team.",
+            config={"min_per_team": 1},
+            settable={"keep": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}},
+        ),
+    ]
+)
+config = RunConfig(planner_catalog=catalog)
+assert config.planner_catalog.entries[0].settable_model()(keep=0.5).keep == 0.5
+```
+
+A planning configuration also needs entries for the tools, managers and judges
+the model may choose, plus a planner-role model alias and token budget for an
+LLM call. The policy-only catalog above is not a complete LLM configuration.
+
+The boundary can be checked without an LLM. Copy the manual plan, give it
+non-human provenance and a non-catalog tool, and validate against an empty
+catalog. The rejected tool need not even be importable:
+
+```python
+from swarm_arena import Plan, Ref, RunConfig, validate_plan
+from swarm_arena.config import PlannerCatalog
+
+plan = Plan.load("examples/rosenbrock/plan.toml")
+draft = plan.model_copy(deep=True, update={"origin": "llm"})
+draft.teams[0].agents[0] = (
+    draft.teams[0].agents[0].model_copy(update={"tool": Ref(path="unapproved_tools:Tool")})
+)
+config = RunConfig.load("examples/rosenbrock/run.toml").model_copy(
+    update={"planner_catalog": PlannerCatalog()}
+)
+try:
+    validate_plan(draft, config)
+except ValueError as error:
+    assert "catalog" in str(error)
+    print(error)
+else:
+    raise AssertionError("a non-catalog proposal must be refused")
+```
 
 ## Frozen files and catalog defaults
 
@@ -250,11 +375,20 @@ set, every used model alias needs a known price, from explicit catalog prices
 or the bundled price map. Unused catalog aliases need no price. `LLMPlanner`
 checks aliases before opening a standalone planning session or making a paid call.
 
+<!-- docs-test: skip needs configured model credentials and a provider planning call; offline coverage: tests/e2e/test_llm_plan_file.py -->
 ```python
+import anyio
+
 from swarm_arena.llm import LLMPlanner
 
-# config contains your model aliases, limits, and permitted component entries.
-plan = await LLMPlanner("planner").plan(goal, config, None)
+from swarm_arena import Goal, Plan, RunConfig
+
+
+async def create_plan(goal: Goal, config: RunConfig) -> Plan:
+    return await LLMPlanner("planner").plan(goal, config, None)
+
+
+plan = anyio.run(create_plan, Goal(id="research", namespace="toy"), RunConfig.load("run.toml"))
 ```
 
 The model selects catalog entry names and fills only their `settable` fields.
@@ -299,6 +433,26 @@ the fixed history supplied by the engine: scores, untrusted learning titles,
 pruning decisions, remaining budget, completed rounds and join failures.
 Join-failure replans use the same admission path as ordinary revisions.
 
+With a complete catalog and model configuration saved as `run.toml`:
+
+<!-- docs-test: skip needs configured model credentials and provider replanning; offline coverage: tests/e2e/test_autonomous_replan.py -->
+```python
+import anyio
+
+from swarm_arena import Plan, RunConfig, Swarm
+from swarm_arena.llm import LLMPlanner
+
+
+async def run_autonomous() -> None:
+    config = RunConfig.load("run.toml")
+    plan = Plan.load("plan.toml")
+    results = await Swarm(config, replanner=LLMPlanner("planner")).run(plan)
+    print(results)
+
+
+anyio.run(run_autonomous)
+```
+
 Replans keep all current plan-level checks and judges, ranking and policy;
 additional catalog checks may be appended. `keep_teams` and `keep_parts` retain
 named human components unchanged, including non-catalog ScriptTool teams and
@@ -336,8 +490,11 @@ and review.
 
 Using the same `goal` and catalog-backed `config` as LLM planning:
 
+<!-- docs-test: skip needs configured model credentials and review of a provider draft; offline coverage: tests/e2e/test_llm_plan_file.py -->
 ```python
-from swarm_arena import Plan
+import anyio
+
+from swarm_arena import Goal, Plan, RunConfig
 from swarm_arena.llm import Approve, CollaborativePlanner, LLMPlanner
 
 
@@ -347,8 +504,14 @@ class ApprovingReviewer:
         return Approve()
 
 
-planner = CollaborativePlanner(LLMPlanner("planner"), ApprovingReviewer())
-plan = await planner.plan(goal, config, None)
+async def create_reviewed_plan(goal: Goal, config: RunConfig) -> Plan:
+    planner = CollaborativePlanner(LLMPlanner("planner"), ApprovingReviewer())
+    return await planner.plan(goal, config, None)
+
+
+plan = anyio.run(
+    create_reviewed_plan, Goal(id="research", namespace="toy"), RunConfig.load("run.toml")
+)
 ```
 
 The private terminal adapter is provided for the plan CLI. It displays TOML

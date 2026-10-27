@@ -237,7 +237,7 @@ def test_missing_extra_has_safe_install_hint(
     monkeypatch.setattr(builtins, "__import__", missing)
     assert call("plan", "--llm", "--model", "planner", files.run, files.goal) == 1
     err = capsys.readouterr().err
-    assert 'uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"' in err
+    assert 'uv add "swarm-arena[llm]"' in err
     assert SECRET not in err
     assert not files.output().exists()
     assert not Path(files.config.run_root).exists()

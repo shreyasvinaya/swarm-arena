@@ -1,162 +1,168 @@
 import doctest
 import importlib
 import importlib.metadata
+import importlib.util
 import inspect
+import pkgutil
 import subprocess
 import sys
 import types
 
 import pytest
 from _fakes.dependencies import ray_dependency
+from _surface import (
+    DISTRIBUTIONS,
+    ENTRY_MODULES,
+    PUBLIC_ALL,
+    PUBLIC_SUBMODULES,
+    deps_present,
+    import_public,
+    public_object,
+    resolve,
+)
 from pydantic import BaseModel
 
 import swarm_arena
 from swarm_arena._facade import publish
 
-PUBLIC: dict[str, list[str]] = {
-    m: []
-    for m in (
-        "swarm_arena",
-        "swarm_arena.tool",
-        "swarm_arena.scoring",
-        "swarm_arena.manager",
-        "swarm_arena.planning",
-        "swarm_arena.board",
-        "swarm_arena.executor",
-        "swarm_arena.config",
-        "swarm_arena.protocol",
-        "swarm_arena.testing",
+
+@pytest.mark.parametrize("module", PUBLIC_ALL)
+def test_all_matches_spec(module: str) -> None:
+    assert import_public(module).__all__ == PUBLIC_ALL[module]
+
+
+@pytest.mark.parametrize("module", PUBLIC_ALL)
+def test_public_names_report_facade_module(module: str) -> None:
+    import_public(module)
+    objs = [(n, public_object(module, n)) for n in PUBLIC_ALL[module] if deps_present(module, n)]
+    classes = [(name, obj) for name, obj in objs if isinstance(obj, type)]
+    while classes:
+        name, cls = classes.pop()
+        prefix = cls.__qualname__ + "."
+        for attr, value in vars(cls).items():
+            if isinstance(value, type):
+                if not attr.startswith("_") and value.__qualname__.startswith(prefix):
+                    nested = (f"{name}.{attr}", value)
+                    objs.append(nested)
+                    classes.append(nested)
+                continue
+            if isinstance(value, classmethod | staticmethod):
+                value = value.__func__
+            elif isinstance(value, property):
+                value = value.fget
+            if inspect.isfunction(value) and value.__qualname__.startswith(prefix):
+                objs.append((f"{name}.{attr}", value))
+    assert [n for n, o in objs if o.__module__ != module] == []
+    assert [
+        n
+        for n, o in objs
+        if isinstance(o, type) and issubclass(o, BaseModel) and not o.__pydantic_complete__
+    ] == []
+
+
+def test_each_public_name_has_one_home() -> None:
+    names = [n for ns in PUBLIC_ALL.values() for n in ns]
+    assert sorted(n for n in set(names) if names.count(n) > 1) == []
+
+
+@pytest.mark.parametrize("module", PUBLIC_ALL)
+def test_facades_hold_only_imports_and_all(module: str) -> None:
+    mod = import_public(module)
+    allowed = set(mod.__all__) | (
+        PUBLIC_SUBMODULES | ENTRY_MODULES if module == "swarm_arena" else set()
     )
-}
-PUBLIC["swarm_arena"] += ["Chain", "KeepTopTeams", "Patience", "SuccessiveHalving"]
-PUBLIC["swarm_arena"] += ["ScriptedManager"]
-PUBLIC["swarm_arena"] += ["Swarm"]
-PUBLIC["swarm_arena.testing"] += ["check_manager"]
-PUBLIC["swarm_arena.testing"] += ["FakeModel", "FakeTurn"]
-PUBLIC["swarm_arena"] += ["Ref"]
-PUBLIC["swarm_arena"] += ["validate_plan"]
-PUBLIC["swarm_arena"] += ["Goal"]
-PUBLIC["swarm_arena"] += [
-    "Plan",
-    "PartSpec",
-    "TeamSpec",
-    "AgentSpec",
-    "RoundSpec",
-    "ConvergeSpec",
-    "Limits",
-    "Resources",
-]
-PUBLIC["swarm_arena.planning"] += [
-    "Decision",
-    "FlowSpec",
-    "History",
-    "Planner",
-    "Policy",
-    "RoundState",
-]
-PUBLIC["swarm_arena.board"] += ["Board", "BoardView"]
-PUBLIC["swarm_arena.board"] += ["ArenaBoard"]
-PUBLIC["swarm_arena.board"] += ["Curator"]
-PUBLIC["swarm_arena.board"] += ["Frontier", "GoalKey", "LineageGraph", "Row"]
-PUBLIC["swarm_arena.tool"] += [
-    "Command",
-    "CompletedRun",
-    "ToolRequest",
-    "ParentRef",
-    "ToolOutput",
-    "FileRef",
-    "FileSet",
-    "Usage",
-    "Estimate",
-    "RunStatus",
-]
-
-PUBLIC["swarm_arena"] += ["Score"]
-PUBLIC["swarm_arena.scoring"] += ["CheckResult"]
-PUBLIC["swarm_arena.board"] += ["Candidate", "Learning", "LLMCall"]
-PUBLIC["swarm_arena.manager"] += [
-    "AgentContext",
-    "AgentStatus",
-    "LimitReached",
-    "Manager",
-    "RoundReport",
-]
-PUBLIC["swarm_arena.protocol"] += [
-    "Message",
-    "Part",
-    "Artifact",
-    "Task",
-    "TaskStatus",
-    "TaskState",
-    "Role",
-]
-PUBLIC["swarm_arena.tool"] += ["Tool", "Action"]
-PUBLIC["swarm_arena.executor"] += ["Executor", "Job"]
-PUBLIC["swarm_arena.executor"] += ["LocalExecutor"]
-PUBLIC["swarm_arena"] += ["RunConfig"]
-PUBLIC["swarm_arena"] += ["ScriptTool"]
-PUBLIC["swarm_arena.config"] += [
-    "CachePolicy",
-    "CatalogEntry",
-    "GatewayConfig",
-    "ModelCatalog",
-    "ModelSpec",
-    "PlannerCatalog",
-    "SecretsPolicy",
-    "TracingConfig",
-]
+    assert {n for n in vars(mod) if not n.startswith("_")} - allowed == set()
 
 
-PUBLIC["swarm_arena.scoring"] += ["Check", "CheckContext", "Judge", "JudgeContext"]
+@pytest.mark.parametrize("module", PUBLIC_ALL)
+def test_facade_bodies_hold_only_sanctioned_statements(module: str) -> None:
+    import ast
+    from pathlib import Path
 
-
-PUBLIC["swarm_arena"] += ["FunctionTool"]
-
-
-PUBLIC["swarm_arena"] += ["ProgramJudge"]
-PUBLIC["swarm_arena.scoring"] += ["Lexicographic"]
-
-
+    sanctioned = {
+        "swarm_arena.llm": """
+_EXTRA_DEPS = ("agents", "litellm")
+for _dist, _module in (("openai-agents", "agents"), ("litellm", "litellm")):
+    try:
+        _metadata.version(_dist)
+    except _metadata.PackageNotFoundError:
+        raise ModuleNotFoundError(_MSG, name=_module) from None
 try:
-    importlib.metadata.version("openai-agents")
-    importlib.metadata.version("litellm")
-except importlib.metadata.PackageNotFoundError:
-    pass
-else:
-    PUBLIC["swarm_arena.llm"] = [
-        "AgentsSDKManager",
-        "BudgetExceeded",
-        "LLMCurator",
-        "LLMJudge",
-        "LLMPlanner",
-        "CollaborativePlanner",
-        "Reviewer",
-        "Approve",
-        "Feedback",
-        "Edited",
-    ]
+    from swarm_arena.llm import _catalog as _catalog
+    from swarm_arena.llm import _logger as _logger
+    import agents as _agents
+except ModuleNotFoundError as _exc:
+    if _exc.name in _EXTRA_DEPS:
+        raise ModuleNotFoundError(_MSG, name=_exc.name) from None
+    raise
+""",
+        "swarm_arena.testing": """
+_LAZY = ("FakeModel", "FakeTurn")
+def __getattr__(name: str) -> _Any:
+    if name not in _LAZY:
+        raise AttributeError(name)
+    _importlib.import_module("swarm_arena.llm")
+    obj = getattr(_importlib.import_module("swarm_arena.testing._fake_model"), name)
+    globals()[name] = obj
+    _publish(__name__, [name])
+    return obj
+def __dir__() -> list[str]:
+    return sorted({*globals(), *__all__})
+""",
+    }
+    allowed = [ast.dump(node) for node in ast.parse(sanctioned.get(module, "")).body]
+    publish_names = (
+        "[n for n in __all__ if n not in _LAZY]" if module == "swarm_arena.testing" else "__all__"
+    )
+    publish_call = ast.dump(ast.parse(f"_publish(__name__, {publish_names})").body[0])
+    spec = importlib.util.find_spec(module)
+    assert spec is not None
+    assert spec.origin is not None
+    tree = ast.parse(Path(spec.origin).read_text(encoding="utf-8"))
+    assert ast.get_docstring(tree) is not None
+    all_count = publish_count = 0
+    for node in tree.body[1:]:
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            continue
+        targets = (
+            node.targets
+            if isinstance(node, ast.Assign)
+            else [node.target]
+            if isinstance(node, ast.AnnAssign)
+            else []
+        )
+        if len(targets) == 1 and isinstance(targets[0], ast.Name) and targets[0].id == "__all__":
+            assert isinstance(node, ast.Assign | ast.AnnAssign)
+            assert node.value is not None
+            assert ast.literal_eval(node.value) == PUBLIC_ALL[module]
+            all_count += 1
+        elif ast.dump(node) == publish_call:
+            publish_count += 1
+        elif ast.dump(node) in allowed:
+            allowed.remove(ast.dump(node))
+        else:
+            pytest.fail(
+                f"{module}:{node.lineno}: unexpected facade statement {type(node).__name__}"
+            )
+    assert all_count == 1
+    assert publish_count == 1
+    assert allowed == []
 
 
-try:
-    importlib.metadata.version("ray")
-except importlib.metadata.PackageNotFoundError:
-    pass
-else:
-    PUBLIC["swarm_arena.ray"] = ["RayExecutor"]
-
-
-@pytest.mark.parametrize("module", sorted(PUBLIC))
-def test_all_snapshot(module: str) -> None:
-    names = importlib.import_module(module).__all__
-    assert sorted(names) == sorted(PUBLIC[module])
-    assert len(set(names)) == len(names)
+def test_no_other_public_modules() -> None:
+    top = {m.name for m in pkgutil.iter_modules(swarm_arena.__path__) if not m.name.startswith("_")}
+    assert top == PUBLIC_SUBMODULES | ENTRY_MODULES
+    for pkg in ("swarm_arena.llm", "swarm_arena.ray", "swarm_arena.testing"):
+        spec = importlib.util.find_spec(pkg)
+        assert spec is not None
+        assert spec.submodule_search_locations is not None
+        subs = {m.name for m in pkgutil.iter_modules(spec.submodule_search_locations)}
+        assert {s for s in subs if not s.startswith("_")} == set(), pkg
 
 
 @pytest.mark.parametrize("module", ["swarm_arena", "swarm_arena.llm", "swarm_arena.testing"])
 def test_facade_has_no_extra_public_names(module: str) -> None:
-    if module == "swarm_arena.llm":
-        pytest.importorskip("agents")
-    facade = importlib.import_module(module)
+    facade = import_public(module)
     children = {
         name
         for name, value in vars(facade).items()
@@ -166,22 +172,6 @@ def test_facade_has_no_extra_public_names(module: str) -> None:
         assert {name for name in names if not name.startswith("_")} <= set(
             facade.__all__
         ) | children
-
-
-@pytest.mark.parametrize("module", sorted(PUBLIC))
-def test_names_report_public_module(module: str) -> None:
-    mod = importlib.import_module(module)
-    for name in mod.__all__:
-        if module == "swarm_arena.testing" and name in {"FakeModel", "FakeTurn"}:
-            try:
-                importlib.metadata.version("openai-agents")
-            except importlib.metadata.PackageNotFoundError:
-                continue
-        obj = getattr(mod, name)
-        if isinstance(obj, type) or inspect.isfunction(obj):
-            assert obj.__module__ == module, name
-        if isinstance(obj, type) and issubclass(obj, BaseModel):
-            assert obj.__pydantic_complete__, name
 
 
 def test_version_is_package_metadata() -> None:
@@ -248,7 +238,7 @@ def test_publish_lets_doctest_find_method_examples(monkeypatch: pytest.MonkeyPat
 
 
 CORE = sorted(
-    set(PUBLIC) - {"swarm_arena", "swarm_arena.testing", "swarm_arena.llm", "swarm_arena.ray"}
+    set(PUBLIC_ALL) - {"swarm_arena", "swarm_arena.testing", "swarm_arena.llm", "swarm_arena.ray"}
 )
 
 
@@ -286,32 +276,25 @@ def test_publish_invalidates_original_class_source_location(
 
 def test_root_import_publishes_core_facades() -> None:  # __module__ never depends on import order
     code = f"import sys, swarm_arena; print(sorted(set({CORE!r}) - set(sys.modules)))"
-    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    done = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, encoding="utf-8", check=True
+    )
     assert done.stdout.strip() == "[]"
-
-
-PUBLIC["swarm_arena"] += ["ScriptCheck", "ScriptJudge"]
-
-PUBLIC["swarm_arena.testing"] += ["check_tool", "check_check", "check_judge", "make_candidate"]
-PUBLIC["swarm_arena.testing"] += ["read_logs", "read_output_file"]
-
-PUBLIC["swarm_arena.scoring"] += ["HumanReview"]
 
 
 @pytest.mark.parametrize("missing", ["agents", "litellm"])
 def test_llm_facade_names_the_extra_when_missing(missing: str) -> None:
     code = f"import sys; sys.modules[{missing!r}] = None; import swarm_arena.llm"
-    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
-    assert proc.returncode != 0
-    assert (
-        'uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"'
-        in proc.stderr
+    proc = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, encoding="utf-8", timeout=30
     )
+    assert proc.returncode != 0
+    assert 'uv add "swarm-arena[llm]"' in proc.stderr
     assert "ModuleNotFoundError" in proc.stderr
 
 
 def test_llm_facade_publishes_its_names() -> None:
-    llm = pytest.importorskip("swarm_arena.llm")
+    llm = import_public("swarm_arena.llm")
     assert all(getattr(llm, name).__module__ == "swarm_arena.llm" for name in llm.__all__)
 
 
@@ -331,14 +314,14 @@ try:
 except ModuleNotFoundError as error:
     assert error.name == {module!r}
     assert (
-        'uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"'
+        'uv add "swarm-arena[llm]"'
         in str(error)
     )
 else:
     raise AssertionError("missing extra imported")
 """
     subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=30
+        [sys.executable, "-c", code], capture_output=True, encoding="utf-8", check=True, timeout=30
     )
 
 
@@ -347,7 +330,7 @@ else:
     [("ModuleNotFoundError", "transitive_dependency"), ("ImportError", "agents")],
 )
 def test_llm_facade_preserves_other_import_errors(error_type: str, name: str) -> None:
-    pytest.importorskip("swarm_arena.llm")
+    import_public("swarm_arena.llm")
     code = f"""
 import builtins
 original = builtins.__import__
@@ -367,7 +350,7 @@ else:
     raise AssertionError("broken upstream imported")
 """
     subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=30
+        [sys.executable, "-c", code], capture_output=True, encoding="utf-8", check=True, timeout=30
     )
 
 
@@ -385,3 +368,146 @@ def test_ray_facade_publishes_methods() -> None:
         cls.submit.__module__,
         cls.confirm_dead.__module__,
     } == {"swarm_arena.ray"}
+
+
+@pytest.mark.parametrize("missing", [None, "openai-agents", "litellm", "ray"])
+@pytest.mark.parametrize(
+    ("module", "name", "required"),
+    [
+        ("swarm_arena", None, ()),
+        ("swarm_arena.testing", None, ()),
+        ("swarm_arena.testing", "read_logs", ()),
+        ("swarm_arena.testing", "FakeModel", ("openai-agents", "litellm")),
+        ("swarm_arena.testing", "FakeTurn", ("openai-agents", "litellm")),
+        ("swarm_arena.llm", None, ("openai-agents", "litellm")),
+        ("swarm_arena.ray", None, ("ray",)),
+    ],
+)
+def test_surface_dependencies_use_distribution_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    missing: str | None,
+    module: str,
+    name: str | None,
+    required: tuple[str, ...],
+) -> None:
+    checked: list[str] = []
+
+    def version(distribution: str) -> str:
+        checked.append(distribution)
+        if distribution == missing:
+            raise importlib.metadata.PackageNotFoundError(distribution)
+        return "0"
+
+    def no_probe(*args: object, **kwargs: object) -> None:
+        pytest.fail("dependency detection must not import or locate packages")
+
+    monkeypatch.setattr(importlib.metadata, "version", version)
+    monkeypatch.setattr(importlib, "import_module", no_probe)
+    monkeypatch.setattr(importlib.util, "find_spec", no_probe)
+    assert deps_present(module, name) == (missing not in required)
+    assert set(checked) <= set(required)
+    if missing not in required:
+        assert checked == list(required)
+
+
+@pytest.mark.parametrize("missing", DISTRIBUTIONS.values())
+def test_surface_import_skips_missing_extra(monkeypatch: pytest.MonkeyPatch, missing: str) -> None:
+    def version(distribution: str) -> str:
+        if distribution == missing:
+            raise importlib.metadata.PackageNotFoundError(distribution)
+        return "0"
+
+    monkeypatch.setattr(importlib.metadata, "version", version)
+    extra = "ray" if missing == "ray" else "llm"
+    with pytest.raises(pytest.skip.Exception, match=f"needs the {extra} extra"):
+        import_public(f"swarm_arena.{extra}")
+
+
+@pytest.mark.parametrize("missing", ["openai-agents", "litellm"])
+@pytest.mark.parametrize("name", ["FakeModel", "FakeTurn"])
+def test_surface_lazy_object_skips_either_missing_llm_dependency(
+    monkeypatch: pytest.MonkeyPatch, missing: str, name: str
+) -> None:
+    def version(distribution: str) -> str:
+        if distribution == missing:
+            raise importlib.metadata.PackageNotFoundError(distribution)
+        return "0"
+
+    monkeypatch.setattr(importlib.metadata, "version", version)
+    with pytest.raises(pytest.skip.Exception, match="needs the llm extra"):
+        public_object("swarm_arena.testing", name)
+    assert public_object("swarm_arena", "Goal") is swarm_arena.Goal
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ImportError("broken import"),
+        ModuleNotFoundError("broken vendor module", name="agents.models"),
+    ],
+)
+@pytest.mark.parametrize("loader", [import_public, resolve])
+def test_surface_helpers_preserve_installed_package_import_failures(
+    monkeypatch: pytest.MonkeyPatch, error: ImportError, loader: types.FunctionType
+) -> None:
+    def version(distribution: str) -> str:
+        return "0"
+
+    def importing(module: str) -> types.ModuleType:
+        raise error
+
+    monkeypatch.setattr(importlib.metadata, "version", version)
+    monkeypatch.setattr(importlib, "import_module", importing)
+    with pytest.raises(type(error)) as caught:
+        loader("swarm_arena.llm")
+    assert caught.value is error
+
+
+@pytest.mark.parametrize(
+    ("dotted", "expected"),
+    [
+        ("swarm_arena", swarm_arena),
+        ("swarm_arena.tool", swarm_arena.tool),
+        ("swarm_arena.Goal", swarm_arena.Goal),
+        ("swarm_arena.Ref.of", swarm_arena.Ref.of),
+        ("swarm_arena.ScriptTool.Config", swarm_arena.ScriptTool.Config),
+    ],
+)
+def test_surface_resolve_modules_and_nested_members(dotted: str, expected: object) -> None:
+    assert resolve(dotted) == expected
+
+
+def test_surface_resolve_reports_missing_module_and_attribute() -> None:
+    with pytest.raises(ModuleNotFoundError, match="nonexistent_surface_module"):
+        resolve("nonexistent_surface_module.Thing")
+    with pytest.raises(AttributeError, match="missing_surface_member"):
+        resolve("swarm_arena.Goal.missing_surface_member")
+
+
+@pytest.mark.parametrize("missing", ["openai-agents", "litellm", "ray"])
+def test_docstring_collector_does_not_import_missing_optional_dependencies(
+    monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    from test_docstrings import public_objects
+
+    original_version = importlib.metadata.version
+
+    def version(distribution: str) -> str:
+        if distribution == missing:
+            raise importlib.metadata.PackageNotFoundError(distribution)
+        return original_version(distribution)
+
+    original = importlib.import_module
+    extra = "ray" if missing == "ray" else "llm"
+
+    def importing(module: str) -> types.ModuleType:
+        assert module != f"swarm_arena.{extra}"
+        return original(module)
+
+    monkeypatch.setattr(importlib.metadata, "version", version)
+    monkeypatch.setattr(importlib, "import_module", importing)
+    names = [str(param.values[0]) for param in public_objects() if not param.marks]
+    assert not any(name.startswith(f"swarm_arena.{extra}.") for name in names)
+    if extra == "llm":
+        assert not any(name.startswith("swarm_arena.testing.Fake") for name in names)
+    assert "swarm_arena.testing.read_logs" in names

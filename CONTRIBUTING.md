@@ -54,7 +54,7 @@ modules (a leading underscore), and a private module never imports from a facade
 When you add a public name:
 
 1. Add it to the facade's `__all__`.
-2. Add it to `PUBLIC` in `tests/test_public_api.py` (the `__all__` snapshot test).
+2. Add it to `PUBLIC_ALL` in `tests/_surface.py` (the `__all__` snapshot, in spec §9 order).
 3. Add one line to `CHANGELOG.md` under `## [Unreleased]`.
 
 ## Tools never start with `uv run`
@@ -139,3 +139,31 @@ PYTHON
 Use an empty download directory for each refresh. Review and commit the resulting
 file. Durations are scheduling hints, never test timeouts or grounds for skipping
 a test. New tests without measurements receive pytest-split's mean estimate.
+
+## Upstream bounds
+
+The weekly `upstream` workflow tests the newest resolvable `openai-agents` and
+`litellm` every Monday at 06:00 UTC, and can also be dispatched manually. Raise an
+upper bound in `pyproject.toml` only after this job passes on the newer release
+(design §11). A release found bad gets a `!=` pin.
+
+`upstream-overrides.txt` follows the lower bounds of `pyproject.toml`, unions the
+`llm` and `cache` extras, and retains every exclusion. Only `<`, `<=`, and `==`
+constraints are lifted. `test_overrides_lift_only_upper_bounds` enforces this;
+production requirements and `uv.lock` stay unchanged by a canary run.
+
+The job creates a Python 3.13 environment, installs with `uv pip install` and the
+overrides, and reports the installed versions. It then calls `.venv/bin/python`
+directly: `uv run` or `uv sync` would restore the locked environment. The test-only
+`SWARM_ARENA_UPSTREAM_CANARY=upstream-installed.json` setting selects the lifted
+version policy only for that pytest step. The record is written immediately
+after installation and must match the test interpreter's exact installed
+versions, so a later resync fails the check. If the newest versions are still
+within the production bounds, that is a valid canary too. Normal tests enforce
+the production pins; both modes retain all retry, fallback, inventory, and
+unrelated dependency checks.
+
+With GitHub Actions email notifications enabled, a failed scheduled run emails
+the person who last changed its cron schedule (initially the workflow creator).
+Re-enabling a disabled schedule transfers notifications to the person who
+re-enabled it. See [GitHub's notification rules](https://docs.github.com/en/actions/concepts/workflows-and-actions/notifications-for-workflow-runs).

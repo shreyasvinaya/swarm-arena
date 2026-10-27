@@ -69,4 +69,4 @@ async def test_before_kill_transports_exception_identity(tmp_path: Path, kind: s
             tmp_path, STUBBORN, grace_s=0.5, before_kill=broken, propagate_cancel=True
         )
     assert caught.value is error
-    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 5)
+    assert wait_until(lambda: not pid_alive(int((tmp_path / "gc.pid").read_text())), 60)

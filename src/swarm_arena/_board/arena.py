@@ -822,7 +822,7 @@ class ArenaBoard(Board):
         >>> with TemporaryDirectory() as root:
         ...     board = ArenaBoard(arena_root=root, cache_dir=root + "/cache")
         ...     view = board.snapshot(Goal(id="g", namespace="toy").key(), Frontier())
-        ...     assert view._visible_candidate_ids() == frozenset()
+        ...     assert view.leaderboard(view.goal, judge="program") == []
         ...     board.close()
         """
         frontier = frontier.model_copy(deep=True)

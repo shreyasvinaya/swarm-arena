@@ -4,6 +4,135 @@ The current release runs local swarms with manual plans, scripted and LLM manage
 checks, judges, and pruning policies. This page explains how they fit together;
 see the [public API](api/swarm_arena.md) for their interfaces.
 
+| Concept | Role |
+| --- | --- |
+| `Goal` | The problem: description, structured inputs and frozen files. |
+| `RunConfig` | Human-only limits, catalogs, execution, storage and secrets policy. |
+| `Plan` | Versioned teams, agents, checks, judges, rounds and convergence. |
+| `Tool` | Runs one program and collects its output. |
+| `Check` | Passes or fails one candidate before judging. |
+| `Judge` | Scores a batch of candidates that passed their checks. |
+| `Manager` | Chooses one agent's actions through `AgentContext`. |
+| `Planner` | Creates or revises a plan. |
+| `Policy` | Chooses survivors between rounds and records why. |
+| `Executor` | Runs jobs locally or on Ray. |
+| `Board` | Reads and indexes results, scores, learnings and lineage. |
+| `Curator` | Optionally merges near-duplicate learnings at a round boundary. |
+| `Swarm` | Runs one or more plans under one run configuration. |
+
+## RunConfig and Plan
+
+`RunConfig` holds the safety rails separately from the plan: hard limits,
+the model catalog, the planner catalog, executor, board, optional curator,
+storage roots and secret policy. Only a human writes it; a replanner cannot
+loosen its limits. A `Plan` describes one goal's approaches, with teams,
+agents, checks, judges, ranking, pruning policy, rounds and convergence.
+Accepted revisions are recorded for replay and resume.
+
+An agent's stable address is `goal/team/agent`. An address removed by a
+revision cannot be reused in a later revision. Renaming an agent creates a
+new identity. Lineage and per-agent accounting depend on this continuity.
+
+## References by import path
+
+Each component is stored as a `Ref` with an import path (`module:Class`),
+JSON-serializable `config`, and an optional `name`. Names distinguish checks
+and judges and select the ranking judge. `Ref.build` validates the component's
+nested `Config` before construction. Python component instances are converted
+to these same references, so plans serialize to TOML and workers can rebuild
+components in another process.
+
+A lambda or local function is rejected because it has no stable import path
+that a fresh worker can resolve. Component classes must also be importable;
+definitions in `__main__` cannot be referenced. `Ref.of` takes a component
+class or instance, not a raw function; `FunctionTool` wraps an importable
+module-level function.
+
+Save this helper as `concepts_tools.py` beside your driver:
+
+<!-- docs-test: file concepts_tools.py -->
+```python
+def greet(name: str) -> dict[str, str]:
+    """
+    Build a greeting as JSON-compatible tool data.
+
+    Parameters
+    ----------
+    name : str
+        Person to greet.
+
+    Returns
+    -------
+    dict of str to str
+        Greeting data.
+
+    Examples
+    --------
+    >>> greet("world")
+    {'message': 'hello world'}
+    """
+    return {"message": f"hello {name}"}
+```
+
+Build a one-team plan from instances. This example serializes the plan without
+starting a run or calling a provider; the module file makes its tool importable.
+
+```python
+from pathlib import Path
+
+from concepts_tools import greet
+from swarm_arena import AgentSpec, FunctionTool, Goal, Plan, Ref, ScriptedManager, TeamSpec
+
+assert greet("world") == {"message": "hello world"}
+plan = Plan(
+    goal=Goal(id="hello", namespace="hello"),
+    teams=[
+        TeamSpec(
+            name="local",
+            rationale="Greet using a module-level function.",
+            agents=[
+                AgentSpec(
+                    name="greeter",
+                    rationale="Use a fixed offline request.",
+                    tool=FunctionTool(greet),
+                    manager=ScriptedManager(requests=[{"round": 1, "inputs": {"name": "world"}}]),
+                )
+            ],
+        )
+    ],
+    judges=[],
+)
+serialized = plan.dumps()
+restored = Plan.loads(serialized, base_dir=Path.cwd())
+assert restored.teams[0].agents[0].tool.config["function"] == "concepts_tools:greet"
+print(plan.dumps())
+try:
+    Ref.of(lambda x: x)
+except TypeError as error:
+    assert str(error) == "not a component"
+    print(type(error).__name__, str(error))
+else:
+    raise AssertionError("a raw function must not become a component reference")
+```
+
+Plans written by an LLM may add or change only components authorized by the
+human's planner catalog, with fixed fields preserved and only declared
+`settable` fields changed. Human plans may use any importable component.
+See [Planning modes](planning-modes.md) for the full admission rules.
+
+## Data types
+
+The public data types use Pydantic validation; stored envelopes carry
+`schema_version`. `FileSet` captures files by path and SHA-256, while `FileRef`
+identifies an output artifact. `ToolRequest` carries inputs, parents and edits;
+`ToolOutput` carries status, JSON data, files and `Usage`. A `Candidate` adds
+the producing run, goal, team, agent, round, checks and provenance. `Score`
+holds a finite ranking key and a human-facing value. `Amount` tracks token
+and dollar budgets, while `Usage` describes consumption. `Learning` records
+shared text and candidate evidence. These records connect results to the
+work and accounting that produced them; the [API reference](api/index.md)
+lists their fields.
+
 ## Goal
 
 A `Goal` is one hard problem. `id` and `namespace` are lowercase slugs: the
@@ -25,6 +154,27 @@ from swarm_arena import Goal
 goal = Goal(id="ns-viscosity", namespace="physika", inputs={"grid": 64})
 assert goal.key().namespace == "physika"
 ```
+
+## Many goals and parts
+
+One run can solve many goals: pass a list of plans to
+`await Swarm(config).run([plan_a, plan_b])`, or pass several plan files to
+`swarm-arena run run.toml plan_a.toml plan_b.toml`. Each goal has its own
+round barriers, pruning policy and `solution.json`. Goals run independently
+within `max_concurrent_goals` and the run-wide `max_agents_total`; per-goal
+limits still apply. The shared work budget is split using `goal_weights`
+(equal by default), and unused budget is redistributed when goals finish.
+Goals in the same namespace can share learnings at round boundaries.
+
+`Plan.parts` supports split, solve, join within one goal. Each `PartSpec`
+declares a sub-goal; a team's `part` assigns it to that group. Checks, judges
+and ranking can be overridden per part. Policies rank only within a group
+and protect its last team, so parts do not compete against one another.
+With parts, convergence must use `mode="team"`: the join agents receive
+the top `parents_per_part` candidates of each part, and their output is
+checked and judged against the main goal. A failed join may trigger a bounded
+autonomous replan if rounds, budget and join attempts remain; otherwise the
+goal has no joined result. See [Planning modes](planning-modes.md).
 
 ## Tool
 
@@ -148,11 +298,15 @@ executes configured requests without a model. A tool exception becomes an error
 candidate; an ordinary manager exception ends only that agent's round.
 Registered ownership and terminal cleanup failures retain their core stop behavior.
 
+See the [installation fallback](https://github.com/shreyasvinaya/swarm-arena#install)
+until 0.1.0 is on PyPI.
+
 `AgentsSDKManager` uses the optional Agents SDK integration (`uv add
-"swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`) to choose
+"swarm-arena[llm]"`) to choose
 these actions. Its `model` is an alias in the
 run configuration's model catalog and must permit the `manager` role:
 
+<!-- docs-test: requires llm -->
 ```python
 from swarm_arena import Ref
 from swarm_arena.manager import Manager
@@ -219,6 +373,14 @@ agents get read-only `seed_parents`, prepended to their explicit parents. Check
 feedback permissions still apply to those parents. See the
 [manager API](api/manager.md) and [scoring guide](scoring-and-review.md).
 
+## Planner
+
+A `Planner` creates a plan or proposes its next revision using the goal,
+human configuration and optional history. Manual, LLM, collaborative and
+autonomous planning share the same admission checks; an LLM cannot write
+`RunConfig` or bypass its planner catalog. See
+[Planning modes](planning-modes.md) and the [planning API](api/planning.md).
+
 ## Policy
 
 A `Policy` uses `RoundState` to choose which teams or agents to prune after a
@@ -238,6 +400,14 @@ cross-run arena data. The journal remains the durable authority, and run state
 is reconstructed on resume. Managers access permitted views through
 `AgentContext`, with read caps and a UTF-8-byte-bounded digest. See the
 [arena guide](arena.md) and [board API](api/board.md).
+
+## Curator
+
+A `Curator` optionally merges near-duplicate learnings at a round boundary,
+keeping their evidence and recording a curation receipt. It is configured in
+the human's `RunConfig`; no curator runs by default. Synchronous hooks run
+in abandonable daemon workers; async hooks must cooperate with cancellation.
+See [Curation](arena.md#curation) and the [board API](api/board.md).
 
 ## Swarm
 
@@ -262,7 +432,7 @@ or changing limits, and [Planning modes](planning-modes.md) for runnable plans.
 ## Models
 
 Install the optional integration with
-`uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`. The human's
+`uv add "swarm-arena[llm]"`. The human's
 `RunConfig` declares the provider models available to LLM components:
 
 ```toml
@@ -334,8 +504,11 @@ establish that both complete calls fit.
 
 ## Caching
 
-Provider prompt caching is enabled by default. Stable instructions, tools, the
-frozen goal and its reference files precede changing round facts.
+Provider prompt caching is on by default in the model configuration. Stable
+instructions, tools, the frozen goal and its reference files precede changing
+round facts. swarm-arena sends supported cache hints but does not enforce
+provider minimum prompt lengths or guarantee a cache hit; consult the selected
+provider's policy for prompts shorter than the provider's minimum.
 
 | Provider | Prompt-cache behavior |
 | --- | --- |
@@ -354,7 +527,7 @@ configuration error; use the installed settings or start a new process.
 Role read/write switches and namespaces remain per scope and may differ between runs.
 
 Response caching is optional: install `swarm-arena[cache]` as well as the `llm`
-extra (`uv add "swarm-arena[llm,cache] @ git+https://github.com/shreyasvinaya/swarm-arena"`).
+extra (`uv add "swarm-arena[llm,cache]"`).
 Configure `RunConfig.cache` in TOML:
 
 ```toml
@@ -438,7 +611,9 @@ Configure the destination using Langfuse's own `LANGFUSE_PUBLIC_KEY`,
 `LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` (or `LANGFUSE_HOST`) environment
 variables. Keep credential values out of the plan and run configuration.
 With `langfuse = false` (the default), swarm-arena sends no tracing data to a
-vendor. Credentials alone do not enable export. This remains true after an
+vendor: nothing goes to any vendor through tracing until Langfuse is explicitly
+configured and enabled. Model requests still go to the provider you choose.
+Credentials alone do not enable export. This remains true after an
 enabled run and when enabled and disabled scopes run concurrently in one
 process. The Agents SDK's default OpenAI trace exporter is not installed by
 swarm-arena; enabled export uses an exclusive OpenInference processor.

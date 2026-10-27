@@ -1767,3 +1767,50 @@ def plain_tool(x: float) -> dict[str, float]:
     {'y': 9.0}
     """
     return {"y": x * x}
+
+
+def compat_probe(x: float) -> dict[str, float]:
+    """
+    Return one numeric input for construction compatibility checks.
+
+    Parameters
+    ----------
+    x : float
+        Numeric input.
+
+    Returns
+    -------
+    dict[str, float]
+        The unchanged input under its name.
+
+    Examples
+    --------
+    >>> compat_probe(2.0)
+    {'x': 2.0}
+    """
+    return {"x": x}
+
+
+def compat_judge(goal: Goal, candidate: Candidate) -> Score:
+    """
+    Return a constant score for construction compatibility checks.
+
+    Parameters
+    ----------
+    goal : Goal
+        Goal accepted by the judge contract.
+    candidate : Candidate
+        Candidate accepted by the judge contract.
+
+    Returns
+    -------
+    Score
+        A maximizing score of one.
+
+    Examples
+    --------
+    >>> goal = Goal(id="g", namespace="compat", description="probe")
+    >>> compat_judge(goal, cand()) == Score.maximize(1.0)
+    True
+    """
+    return Score.maximize(1.0)

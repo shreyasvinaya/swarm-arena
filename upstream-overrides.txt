@@ -1,0 +1,3 @@
+# Lift upper bounds for the weekly canary; guarded by test_overrides_lift_only_upper_bounds.
+openai-agents[litellm]>=0.24
+litellm[caching,proxy]>=1.107.0rc2

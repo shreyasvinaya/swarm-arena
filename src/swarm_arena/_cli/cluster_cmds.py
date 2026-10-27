@@ -13,7 +13,7 @@ from swarm_arena._errors import ConfigError, _core_error, _exception_type_name, 
 
 _RAY_EXTRA_HINT = (
     "submit needs the 'ray' extra: uv add "
-    '"swarm-arena[ray] @ git+https://github.com/shreyasvinaya/swarm-arena"'
+    '"swarm-arena[ray]"; see https://github.com/shreyasvinaya/swarm-arena#install'
 )
 
 

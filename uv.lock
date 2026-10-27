@@ -4660,7 +4660,7 @@ wheels = [
 
 [[package]]
 name = "swarm-arena"
-version = "0.1.0.dev0"
+version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
@@ -4695,6 +4695,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-split" },
     { name = "pytest-xdist" },
+    { name = "pyyaml" },
     { name = "ruff" },
     { name = "tenacity" },
     { name = "ty" },
@@ -4730,6 +4731,7 @@ dev = [
     { name = "pytest", specifier = ">=9,<10" },
     { name = "pytest-split", specifier = ">=0.11" },
     { name = "pytest-xdist", specifier = ">=3.8,<4" },
+    { name = "pyyaml", specifier = ">=6" },
     { name = "ruff", specifier = "==0.17.1" },
     { name = "tenacity", specifier = ">=9.2.1" },
     { name = "ty", specifier = "==0.0.89" },

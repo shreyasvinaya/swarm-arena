@@ -29,12 +29,13 @@ schema is incompatible, rebuild the disposable cache with `swarm-arena reindex`.
 
 ## What the arena stores
 
-Run journals are the record. The shared arena contains pointers and human
-review and curation objects:
+Each run has one journal, which records its candidates, scores, learnings,
+decisions, and lineage. The shared arena contains pointers and human review
+and curation objects:
 
 ```text
 run_root/<run-id>/
-  owner.json
+  control/owner.json
   journal/e<epoch>-<seq>.jsonl
 arena_root/<namespace>/
   runs/<run-id>.json
@@ -43,9 +44,15 @@ arena_root/<namespace>/
 ```
 
 Pointers, journal segments, reviews, and curation objects are write-once. The
-run's mutable `owner.json` names its committed journal head. Only the chain
+run's mutable `control/owner.json` names its committed journal head. Only the chain
 reachable from that head counts; orphan segments never enter a view. Empty
 review and curation objects are valid and remain part of recorded frontiers.
+
+Independent runs write their own journals and uniquely named arena objects,
+so they need no shared writer lock or database server. Each run still has one
+leased owner, and each local SQLite cache has a lifetime lock. Keep caches
+local to each machine; do not share a SQLite cache on NFS. Readers need access
+to every referenced `run_root`, not just to the arena pointers.
 
 `put_candidate`, `put_score`, and `put_learning` retain local
 hints after the core journals an item. They do not write the journal or publish
@@ -55,6 +62,12 @@ a second copy of the journaled decision. Hidden learnings are excluded from norm
 including those fallbacks.
 
 ## Snapshots and frontiers
+
+Sharing happens at round boundaries. Each goal commits its round's items by
+the barrier; another goal sees them at its next round-start frontier, a delay
+of at most one round for that reader when the shared storage is reachable.
+This is not a wall-clock latency bound. Reads span the namespace, including
+past runs, while pruning, convergence, and budget decisions use this run only.
 
 `frontier()` makes one authority read per run and records its exact committed
 head along with the names of the included human objects. Broken neighboring
@@ -186,12 +199,19 @@ rule. Hidden learnings do not participate. Duplicate refusals identify learning
 IDs without echoing titles or bodies.
 
 ```python
-learning = await ctx.post_learning(
-    title="Fitting log(nu) converged in 8 iterations",
-    text="The raw-nu fit took 24 iterations on the same grid.",
-    evidence=[candidate.id],
-    refines=[previous_learning.id],
-)
+from swarm_arena.board import Candidate, Learning
+from swarm_arena.manager import AgentContext
+
+
+async def post_result(
+    ctx: AgentContext, candidate: Candidate, previous_learning: Learning
+) -> Learning:
+    return await ctx.post_learning(
+        title="Fitting log(nu) converged in 8 iterations",
+        text="The raw-nu fit took 24 iterations on the same grid.",
+        evidence=[candidate.id],
+        refines=[previous_learning.id],
+    )
 ```
 
 Posting charges one action turn. Invalid posts allocate no learning ID and do
@@ -211,7 +231,7 @@ namespace has its own `<namespace>.sqlite` file, opened only on first use.
 The cache is disposable and can be rebuilt from reachable recorded storage.
 It is safe to delete only when no swarm-arena process uses it. The reindex
 command refuses while any process holds a cache lifetime lock. Run
-`uv run swarm-arena reindex --config "$ARENA_CONFIG"` after the command-line
+`swarm-arena reindex --config examples/rosenbrock/run.toml` after the command-line
 example below to rebuild its caches. `close()` releases
 all cache connections and their locks. Board state and cache operations are
 synchronized across worker and caller threads.
@@ -229,8 +249,11 @@ Each of `run_root`, `arena_root`, and `artifact_root` can be a local path or an
 `s3://bucket/prefix` root. Install S3 support with:
 
 ```console
-uv add 'swarm-arena[s3]'
+uv add "swarm-arena[s3]"
 ```
+
+See the [installation fallback](https://github.com/shreyasvinaya/swarm-arena#install)
+until 0.1.0 is on PyPI.
 
 For example, set the roots in your run configuration:
 
@@ -376,9 +399,10 @@ paid curation. Curation does not change join-retry or pending-replan state.
 ### LLM curator
 
 Install the optional integration with
-`uv add "swarm-arena[llm] @ git+https://github.com/shreyasvinaya/swarm-arena"`,
+`uv add "swarm-arena[llm]"`,
 then configure an approved model with the `curator` role:
 
+<!-- docs-test: requires llm -->
 ```python
 from swarm_arena import Limits, Ref, RunConfig
 from swarm_arena.config import ModelCatalog, ModelSpec
@@ -502,42 +526,77 @@ rubric/panel hashes. Tab-separated rows contain rank, candidate ID, run ID,
 on stderr. Exit codes are 0 for success, 1 for runtime errors, 2 for usage,
 and 130 for interruption.
 
-From the source checkout root, after `uv sync --all-extras --all-groups`, this
-complete example runs the included Rosenbrock plan, captures the run ID from its
-output, and captures a newly added learning ID before pinning it:
+From the source checkout root, prepare the environment with
+`uv sync --all-extras --all-groups`, then activate it with
+`source .venv/bin/activate`. The example below runs the included Rosenbrock plan
+twice against the same arena. Its plan uses namespace `toy` and goal
+`rosenbrock`; we use that goal name in a human learning and search for it.
+Generated run and learning IDs come from command output, not placeholders.
 
-```sh
+<!-- docs-test: run -->
+```bash
 ARENA_CONFIG=examples/rosenbrock/run.toml
-ARENA_RUN_OUTPUT=$(uv run swarm-arena run --yes "$ARENA_CONFIG" examples/rosenbrock/plan.toml)
+ARENA_RUN_OUTPUT=$(swarm-arena run --yes "$ARENA_CONFIG" examples/rosenbrock/plan.toml)
 printf '%s\n' "$ARENA_RUN_OUTPUT"
 # The CLI's "run ID at DIRECTORY" line supplies the generated run ID.
 ARENA_RUN_ID=$(printf '%s\n' "$ARENA_RUN_OUTPUT" | awk '$1 == "run" {print $2}')
-uv run swarm-arena leaderboard "$ARENA_RUN_ID" --config "$ARENA_CONFIG"
-ARENA_LEARNING_ID=$(uv run swarm-arena learnings add --namespace toy --title "Rosenbrock baseline" --text "Compare gradient descent and random search." --author alice --config "$ARENA_CONFIG")
-uv run swarm-arena learnings pin "$ARENA_LEARNING_ID" --namespace toy --author alice --config "$ARENA_CONFIG"
-uv run swarm-arena board search "Rosenbrock baseline" --namespace toy --human --pinned --config "$ARENA_CONFIG"
-uv run swarm-arena review export "$ARENA_RUN_ID" --out ".swarm-arena/review-$ARENA_RUN_ID" --config "$ARENA_CONFIG"
+ARENA_SECOND_OUTPUT=$(swarm-arena run --yes "$ARENA_CONFIG" examples/rosenbrock/plan.toml)
+printf '%s\n' "$ARENA_SECOND_OUTPUT"
+ARENA_SECOND_ID=$(printf '%s\n' "$ARENA_SECOND_OUTPUT" | awk '$1 == "run" {print $2}')
+test -n "$ARENA_RUN_ID" && test -n "$ARENA_SECOND_ID"
+test "$ARENA_RUN_ID" != "$ARENA_SECOND_ID"
+swarm-arena leaderboard toy --config "$ARENA_CONFIG"
+ARENA_LEARNING_ID=$(swarm-arena learnings add --namespace toy --title "Rosenbrock baseline" --text "Compare gradient descent and random search." --author alice --config "$ARENA_CONFIG")
+swarm-arena learnings pin "$ARENA_LEARNING_ID" --namespace toy --author alice --config "$ARENA_CONFIG"
+swarm-arena board search "rosenbrock" --namespace toy --human --pinned --config "$ARENA_CONFIG"
+swarm-arena board show "$ARENA_LEARNING_ID" --namespace toy --config "$ARENA_CONFIG"
+swarm-arena learnings hide "$ARENA_LEARNING_ID" --namespace toy --author alice --config "$ARENA_CONFIG"
+swarm-arena review export "$ARENA_RUN_ID" --out ".swarm-arena/review-$ARENA_RUN_ID" --config "$ARENA_CONFIG"
 # For this demonstration, accept every exported candidate with score 1.
 # For a real review, edit those verdict/score cells in a spreadsheet instead.
-uv run python - "$ARENA_RUN_ID" <<'PY'
+python - "$ARENA_RUN_ID" <<'PY'
 import csv
 import sys
 from pathlib import Path
 
 path = Path(".swarm-arena") / f"review-{sys.argv[1]}" / "review.csv"
-with path.open(newline="") as stream:
+with path.open(newline="", encoding="utf-8") as stream:
     reader = csv.DictReader(stream)
     columns, rows = reader.fieldnames, list(reader)
 for row in rows:
     row["verdict"], row["score"] = "accept", "1"
-with path.open("w", newline="") as stream:
+with path.open("w", newline="", encoding="utf-8") as stream:
     writer = csv.DictWriter(stream, fieldnames=columns)
     writer.writeheader()
     writer.writerows(rows)
 PY
-uv run swarm-arena review import "$ARENA_RUN_ID" ".swarm-arena/review-$ARENA_RUN_ID/review.csv" --reviewer alice --config "$ARENA_CONFIG"
-uv run swarm-arena leaderboard "$ARENA_RUN_ID" --by human:alice --config "$ARENA_CONFIG"
+swarm-arena review import "$ARENA_RUN_ID" ".swarm-arena/review-$ARENA_RUN_ID/review.csv" --reviewer alice --config "$ARENA_CONFIG"
+swarm-arena leaderboard "$ARENA_RUN_ID" --by human:alice --config "$ARENA_CONFIG"
+ARENA_CANDIDATE_ID=$(python - "$ARENA_RUN_ID" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(".swarm-arena/runs") / sys.argv[1] / "goals/rosenbrock/solution.json"
+solution = json.loads(path.read_text(encoding="utf-8"))
+assert solution["status"] == "ok" and solution["finalists"]
+print(solution["finalists"][0]["candidate"]["id"])
+PY
+)
+swarm-arena board show "$ARENA_CANDIDATE_ID" --namespace toy --config "$ARENA_CONFIG"
+swarm-arena trace "$ARENA_CANDIDATE_ID" --namespace toy --config "$ARENA_CONFIG"
+ARENA_BEFORE=$(swarm-arena leaderboard toy --config "$ARENA_CONFIG")
+swarm-arena reindex --namespace toy --config "$ARENA_CONFIG"
+ARENA_AFTER=$(swarm-arena leaderboard toy --config "$ARENA_CONFIG")
+test "$ARENA_BEFORE" = "$ARENA_AFTER"
 ```
+
+The namespace leaderboard includes both runs; the human review applies only to
+the selected run. Pinning highlights a learning, while hiding removes it from
+ordinary reads without deleting its history. Reindex rebuilds the disposable
+cache and leaves the leaderboard unchanged. To share this arena across machines,
+provision reachable run, arena, and artifact roots and access credentials; the
+review CSV itself does not copy or synchronize those roots.
 
 Trace includes the executing revision's planner calls, the manager call recorded
 in `requested_by_call`, the tool run and its internal calls, checks, recorded
@@ -568,8 +627,12 @@ is preserved; viewing a plan does not resolve files or import producer plugins.
 From the example setup above, serve its namespace locally:
 
 ```bash
-uv run swarm-arena board serve toy --config "$ARENA_CONFIG" --author alice
+swarm-arena board serve toy --config examples/rosenbrock/run.toml --author alice
 ```
+
+This command blocks while the viewer is open, so it is not run by the offline
+docs examples. The bounded `leaderboard`, `board search`, `board show`, and
+`trace` commands above exercise the same committed arena data.
 
 You can also pass a recorded run ID in place of `toy`; the index then
 filters to that run by default. `--host` defaults to `127.0.0.1`, and `--port`
@@ -643,8 +706,8 @@ producer.
 
 Large arenas still retain committed event/replay data in memory, and fixed views
 materialize candidate models. Refresh I/O can repeat across namespace caches.
-Memory and I/O therefore grow with arena history; reducing these costs is planned
-for M3/M4.
+Memory and I/O therefore grow with arena history. Incremental replay and batched
+lookups reduce repeated work, but large arenas still need capacity planning.
 
 A run ID supplied to `leaderboard` or `board serve` is resolved from stored runs
 or arena pointers before treating the target as a namespace. Custom IDs such as

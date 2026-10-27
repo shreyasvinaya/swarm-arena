@@ -300,7 +300,7 @@ def setup_langfuse(tracing: TracingConfig) -> None:
             raise _core_error(
                 ConfigError,
                 "Langfuse tracing requires swarm-arena[langfuse]: "
-                'uv add "swarm-arena[langfuse] @ git+https://github.com/shreyasvinaya/swarm-arena"',
+                'uv add "swarm-arena[langfuse]"; see https://github.com/shreyasvinaya/swarm-arena#install',
             ) from None
 
         class ConsentSampler(Sampler):

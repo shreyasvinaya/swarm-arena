@@ -94,7 +94,8 @@ class S3Store(Store):
         except ImportError:
             raise _core_error(
                 ConditionalWritesUnsupported,
-                "s3:// storage needs the s3 extra: uv add 'swarm-arena[s3]'",
+                's3:// storage needs the s3 extra: uv add "swarm-arena[s3]"; '
+                "see https://github.com/shreyasvinaya/swarm-arena#install",
             ) from None
         try:
             parsed = urlsplit(url)
@@ -220,7 +221,8 @@ class S3Store(Store):
         if parameter not in self._conditional_params():
             raise _core_error(
                 ConditionalWritesUnsupported,
-                f"S3 PutObject requires {parameter}; upgrade swarm-arena[s3]",
+                f'S3 PutObject requires {parameter}; uv add --upgrade "swarm-arena[s3]"; '
+                "see https://github.com/shreyasvinaya/swarm-arena#install",
             ) from None
         for attempt in range(4):
             try:

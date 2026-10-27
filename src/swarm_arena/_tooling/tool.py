@@ -146,7 +146,8 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        The :class:`Tool` example calls ``tool.preflight()`` without I/O.
+        >>> from swarm_arena import ScriptTool
+        >>> ScriptTool(command=["echo"]).preflight()
         """
 
     def is_deterministic(self, request: ToolRequest) -> bool:
@@ -165,8 +166,24 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        The :class:`Tool` example calls ``tool.is_deterministic(ToolRequest())``
-        and returns True.
+        >>> from pathlib import Path
+        >>> from pydantic import BaseModel
+        >>> from swarm_arena.tool import Command, CompletedRun, Tool, ToolOutput, ToolRequest
+        >>> class Inputs(BaseModel):
+        ...     n: int = 0
+        >>> class ExampleTool(Tool):
+        ...     name = "example"
+        ...     description = "An in-memory example."
+        ...     input_model = Inputs
+        ...     def command(self, request: ToolRequest, workspace: Path) -> Command:
+        ...         return Command(argv=["echo", "example"])
+        ...     def collect(self, request: ToolRequest, workspace: Path,
+        ...                 run: CompletedRun) -> ToolOutput:
+        ...         return ToolOutput(status=run.status)
+        >>> tool = ExampleTool()
+
+        >>> tool.is_deterministic(ToolRequest())
+        True
         """
         return True
 
@@ -181,7 +198,9 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        The :class:`Tool` example calls ``tool.editable()`` and returns ``()``.
+        >>> from swarm_arena import FunctionTool
+        >>> FunctionTool("my_package.tools:solve").editable()
+        ()
         """
         return ()
 
@@ -201,8 +220,10 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        The :class:`Tool` example calls ``tool.estimate(ToolRequest())`` and
-        checks that the result is None.
+        >>> from swarm_arena import ScriptTool
+        >>> from swarm_arena.tool import ToolRequest
+        >>> ScriptTool(command=["echo"]).estimate(ToolRequest()) is None
+        True
         """
         return None
 
@@ -217,8 +238,24 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        The :class:`Tool` example calls ``tool.providers()`` and returns an
-        empty frozenset.
+        >>> from pathlib import Path
+        >>> from pydantic import BaseModel
+        >>> from swarm_arena.tool import Command, CompletedRun, Tool, ToolOutput, ToolRequest
+        >>> class Inputs(BaseModel):
+        ...     n: int = 0
+        >>> class ExampleTool(Tool):
+        ...     name = "example"
+        ...     description = "An in-memory example."
+        ...     input_model = Inputs
+        ...     def command(self, request: ToolRequest, workspace: Path) -> Command:
+        ...         return Command(argv=["echo", "example"])
+        ...     def collect(self, request: ToolRequest, workspace: Path,
+        ...                 run: CompletedRun) -> ToolOutput:
+        ...         return ToolOutput(status=run.status)
+        >>> tool = ExampleTool()
+
+        >>> tool.providers()
+        frozenset()
         """
         return frozenset()
 
@@ -238,8 +275,15 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        The :class:`Tool` example calls ``tool.fingerprint(output)`` and checks
-        the digest length.
+        >>> from swarm_arena import ScriptTool
+        >>> from swarm_arena.tool import ToolOutput
+        >>> tool = ScriptTool(command=["echo"])
+        >>> first = ToolOutput(status="ok", data={"a": 1, "b": 2})
+        >>> reordered = ToolOutput(status="ok", data={"b": 2, "a": 1})
+        >>> len(tool.fingerprint(first))
+        64
+        >>> tool.fingerprint(first) == tool.fingerprint(reordered)
+        True
         """
         return sha256_hex(canonical_json(output.data))
 
@@ -254,7 +298,9 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        The :class:`Tool` example calls ``tool.extra_actions()`` and returns ``()``.
+        >>> from swarm_arena import FunctionTool
+        >>> FunctionTool("my_package.tools:solve").extra_actions()
+        ()
         """
         return ()
 
@@ -269,8 +315,24 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        The :class:`Tool` example calls ``tool.get_input_model()`` and validates
-        an empty mapping with the returned model.
+        >>> from pathlib import Path
+        >>> from pydantic import BaseModel
+        >>> from swarm_arena.tool import Command, CompletedRun, Tool, ToolOutput, ToolRequest
+        >>> class Inputs(BaseModel):
+        ...     n: int = 0
+        >>> class ExampleTool(Tool):
+        ...     name = "example"
+        ...     description = "An in-memory example."
+        ...     input_model = Inputs
+        ...     def command(self, request: ToolRequest, workspace: Path) -> Command:
+        ...         return Command(argv=["echo", "example"])
+        ...     def collect(self, request: ToolRequest, workspace: Path,
+        ...                 run: CompletedRun) -> ToolOutput:
+        ...         return ToolOutput(status=run.status)
+        >>> tool = ExampleTool()
+
+        >>> tool.get_input_model().model_validate({}).model_dump()
+        {'n': 0}
         """
         return type(self).input_model
 
@@ -285,8 +347,24 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        The :class:`Tool` example calls ``tool.get_description()`` and returns
-        the concrete tool's description.
+        >>> from pathlib import Path
+        >>> from pydantic import BaseModel
+        >>> from swarm_arena.tool import Command, CompletedRun, Tool, ToolOutput, ToolRequest
+        >>> class Inputs(BaseModel):
+        ...     n: int = 0
+        >>> class ExampleTool(Tool):
+        ...     name = "example"
+        ...     description = "An in-memory example."
+        ...     input_model = Inputs
+        ...     def command(self, request: ToolRequest, workspace: Path) -> Command:
+        ...         return Command(argv=["echo", "example"])
+        ...     def collect(self, request: ToolRequest, workspace: Path,
+        ...                 run: CompletedRun) -> ToolOutput:
+        ...         return ToolOutput(status=run.status)
+        >>> tool = ExampleTool()
+
+        >>> tool.get_description()
+        'An in-memory example.'
         """
         return type(self).description
 
@@ -337,7 +415,22 @@ class Tool(Configurable, ABC):
 
         Examples
         --------
-        >>> output = tool.collect(request, workspace, run)  # doctest: +SKIP
+        >>> from datetime import UTC, datetime
+        >>> from pathlib import Path
+        >>> from swarm_arena.tool import Command, CompletedRun, Tool, ToolOutput, ToolRequest
+        >>> class ExampleTool(Tool):
+        ...     def command(self, request: ToolRequest, workspace: Path) -> Command:
+        ...         return Command(argv=["echo", "example"])
+        ...     def collect(self, request: ToolRequest, workspace: Path,
+        ...                 run: CompletedRun) -> ToolOutput:
+        ...         return ToolOutput(status=run.status, data={"returncode": run.returncode})
+        >>> now = datetime(2026, 10, 18, tzinfo=UTC)
+        >>> run = CompletedRun(returncode=0, status="ok",
+        ...     stdout_path=Path("stdout"), stderr_path=Path("stderr"),
+        ...     started_at=now, ended_at=now)
+        >>> output = ExampleTool().collect(ToolRequest(), Path("."), run)
+        >>> output.status.value, output.data
+        ('ok', {'returncode': 0})
         """
 
     def _own_files(self) -> dict[str, str]:

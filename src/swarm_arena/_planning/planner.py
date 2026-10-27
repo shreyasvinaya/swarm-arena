@@ -76,6 +76,16 @@ class Planner(ABC):
 
         Examples
         --------
-        >>> proposal = await planner.plan(goal, config, history=None)  # doctest: +SKIP
+        >>> import asyncio
+        >>> from swarm_arena import Goal, Plan, Ref, RunConfig
+        >>> from swarm_arena.planning import History, Planner
+        >>> class FixedPlanner(Planner):
+        ...     async def plan(self, goal: Goal, config: RunConfig,
+        ...                    history: History | None) -> Plan:
+        ...         return Plan(goal=goal, teams=[], judges=[Ref(path="demo:Judge")])
+        >>> goal = Goal(id="g", namespace="example")
+        >>> proposal = asyncio.run(FixedPlanner().plan(goal, RunConfig(), history=None))
+        >>> proposal.goal.id, len(proposal.teams)
+        ('g', 0)
         """
         raise NotImplementedError

@@ -5,6 +5,15 @@ them. See the [public API](api/swarm_arena.md),
 [configuration API](api/config.md), [manager API](api/manager.md), and
 [executor API](api/executor.md).
 
+## Choose the scale of a run
+
+Start with the small default teams and give every agent a concrete rationale.
+`max_agents_per_fingerprint` caps duplicate tool/configuration/manager-model
+combinations; changing instructions alone does not create a new fingerprint.
+Pruning gives survivors larger later-round shares, while an autonomous replanner
+can add agents to strong teams only within human limits. Review the estimate
+before accepting more parallel work.
+
 ## Defaults
 
 | Limit | Default |
@@ -47,12 +56,24 @@ role permissions, manager function calling, output caps, and prices under a
 dollar cap; structured roles without response-schema support receive a warning
 and use the two-stage fallback.
 
+Built-in LLM managers, judges, planners and curators require an explicit
+`max_tokens` cap; its unset default is suitable for the offline examples.
+
 The optional `Limits.max_usd` run cap must be positive and no greater than
 1,000,000,000 USD. Leaving it unset means there is no configured dollar cap.
 Budget balances still support only the inclusive range from -1,000,000,000
 to 1,000,000,000 USD, preserving exact accounting in whole micro-dollars.
 Construction and arithmetic refuse amounts outside that range. Allocations
 round down to whole micro-dollars, with the remainder retained in the parent pool.
+
+Inspect all defaults and serialize an explicit budget with the public models:
+
+```python
+from swarm_arena import Limits, RunConfig
+
+print(Limits())
+print(RunConfig(limits=Limits(max_usd=5.0, max_tokens=2_000_000)).dumps())
+```
 
 ```python
 from swarm_arena import Limits, RunConfig
@@ -63,6 +84,22 @@ assert config.reserve_fraction == 0.15
 ```
 
 ## Approval and budget allocation
+
+The CLI prints its estimate before asking for approval. Interactive runs need
+an affirmative answer; `--yes` explicitly accepts the estimate. With no terminal
+input and no `--yes`, it exits with usage code 2 before creating a run folder.
+This can be checked offline in a fresh directory containing the repository's
+`examples/` tree:
+
+<!-- docs-test: run -->
+```bash
+if swarm-arena run examples/rosenbrock/run.toml examples/rosenbrock/plan.toml < /dev/null; then
+    exit 1
+else
+    test $? -eq 2
+fi
+test -z "$(find . -path '*/.swarm-arena/runs' -print -quit)"
+```
 
 Before publishing run snapshots, `Swarm.run` admits plans into temporary artifact
 storage and estimates work using effective tools and empty future inputs.
@@ -145,6 +182,20 @@ correct estimates, reported usage, and its own provider caps. The optional
 gateway on the pinned LiteLLM range provides only a soft cap, as described below. Reported overspend is recorded
 and can exhaust the budget. Usage beyond the supported accounting range
 terminally exhausts the whole run, even with unset caps.
+
+“Total spend can never go over the run cap because of a crash” describes this
+reservation-ledger crash bound: recovery never refunds unconfirmed work or
+creates fresh budget from a lost settlement. It is not a promise about actual
+provider invoices when tool estimates are wrong. A takeover, including
+`--force`, adds no unreserved allowance: the old owner loses commit authority
+and can spend only through previously committed work and tranches.
+
+Without a hard cap, the worst-case overspend is the error in the estimates of runs in flight.
+Reported overspends are journaled; unrecoverable usage stays estimated. Pass
+provider caps into external tools and report their usage in `ToolOutput.usage`
+or `result.json` when no gateway is present. See
+[Running on Ray](running-on-ray.md#gateway-reservations) for gateway reservation
+and reconciliation details; the pinned gateway remains soft-capped.
 
 ## LLM gateway: hard and soft caps
 
@@ -497,8 +548,8 @@ and `solution.json` show only the latest lifecycle.
 
 ## Local isolation and secrets
 
-**v1 sandboxing is not strong isolation.** Local jobs run as your OS user with
-fresh workspaces, process groups, resource limits, bounded output, and an
+**This is not strong isolation.** The v1 sandbox runs local jobs as your OS user with
+fresh workspaces, process groups, resource limits (`rlimits`), bounded output, and an
 environment allowlist. They can still access resources allowed to that user.
 Judge-private files are withheld from tool staging, not protected against
 arbitrary same-user code. Use trusted programs; containers are future work.

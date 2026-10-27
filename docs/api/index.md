@@ -1,5 +1,8 @@
 # API reference
 
+Everything in the `__all__` of the top level and of the public submodules is public.
+Everything else is private.
+
 ```{toctree}
 :maxdepth: 1
 
@@ -11,8 +14,8 @@ planning
 board
 executor
 config
-protocol
-testing
 llm
 ray
+protocol
+testing
 ```

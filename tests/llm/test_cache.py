@@ -147,7 +147,7 @@ def test_require_cache_extra_names_the_extra(monkeypatch: pytest.MonkeyPatch, mo
         require_cache_extra(policy)
     assert str(caught.value) == (
         f"missing {module}; "
-        'uv add "swarm-arena[llm,cache] @ git+https://github.com/shreyasvinaya/swarm-arena"'
+        'uv add "swarm-arena[llm,cache]"; see https://github.com/shreyasvinaya/swarm-arena#install'
     )
 
 

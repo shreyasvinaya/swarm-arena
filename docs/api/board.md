@@ -2,7 +2,7 @@
 
 ```{eval-rst}
 .. automodule:: swarm_arena.board
-   :members: Candidate, Frontier, GoalKey, LLMCall, Learning, LineageGraph, Row
+   :members: ArenaBoard, Frontier, Learning, Candidate, LLMCall, GoalKey, Row, LineageGraph, Curator
 
 .. autoclass:: swarm_arena.board.Board
    :members:
