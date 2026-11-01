@@ -67,6 +67,17 @@ def test_decision_merge_unions_and_keeps_first_reason() -> None:
     assert Decision(no_result="first").merge(right).no_result == "first"
 
 
+def test_decision_merge_keeps_first_decision_order() -> None:
+    left = Decision(prune={"t2": "r1", "t1": "r2"})
+    right = Decision(prune={"t3": "r3", "t1": "r4", "t0/a": "r5"})
+    assert list(left.merge(right).prune.items()) == [
+        ("t2", "r1"),
+        ("t1", "r2"),
+        ("t3", "r3"),
+        ("t0/a", "r5"),
+    ]
+
+
 @pytest.mark.parametrize(
     ("first", "second", "expected"), [("", "", ""), ("", "B", "B"), ("A", "", "A")]
 )
