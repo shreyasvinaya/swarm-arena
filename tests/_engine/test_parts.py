@@ -4,6 +4,7 @@ import pytest
 
 from swarm_arena import Goal, PartSpec, Plan, Ref, TeamSpec
 from swarm_arena._engine.parts import (
+    group_goals,
     join_failure_reasons,
     join_parents,
     kept_best,
@@ -99,6 +100,13 @@ def test_team_goal_and_scoring_overrides_are_import_free() -> None:
     assert part_scoring(plan, "a") == ([], [], "other")
     assert part_scoring(plan, None) == (plan.checks, plan.judges, "program")
     assert kept_best(_state_two_parts().model_copy(update={"ranking_identity": {}}), "a") is None
+
+
+def test_group_goals_map_each_declared_group_to_its_goal() -> None:
+    plan = _parts_plan()
+    assert group_goals(plan) == {"": plan.goal, "a": plan.parts[0].goal, "b": plan.parts[1].goal}
+    for team in plan.teams:
+        assert group_goals(plan)[team.part or ""] == team_goal(plan, team)
 
 
 @pytest.mark.parametrize("helper", [team_goal, part_scoring])

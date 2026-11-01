@@ -29,7 +29,7 @@ from swarm_arena._budget.llm_scope import LLMScope, llm_scope
 from swarm_arena._budget.tranche import Tranche
 from swarm_arena._engine import stops as provider_module
 from swarm_arena._engine.admission import RunAdmission
-from swarm_arena._engine.parts import part_scoring, team_goal
+from swarm_arena._engine.parts import group_goals, part_scoring, team_goal
 from swarm_arena._engine.stops import (
     ProviderStops,
     RunClock,
@@ -607,6 +607,7 @@ class RoundRunner:
             private_paths=private_paths,
             rankings=rankings,
             sibling_views=siblings,
+            group_goals=group_goals(self.plan),
             seed_parents=self.seed_parents,
             started_runs=self.started_runs.get(key, 0),
             gateway=deps.gateway,

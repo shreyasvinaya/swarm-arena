@@ -1025,6 +1025,10 @@ class AgentContext:
 
         return self._on_loop(read)
 
+    def _candidate_goal(self, candidate: Candidate) -> Goal:
+        """Select the goal of the candidate's group, which holds the files it ran on."""
+        return self._rt.group_goals.get(candidate.part or "", self._rt.goal)
+
     def _read_artifact(self, sha256: str) -> bytes:
         """Authorize snapshot and own file digests without a prior charged lookup."""
 
@@ -1034,7 +1038,8 @@ class AgentContext:
             candidates = [rt.view.get_candidate(id) for id in rt.view._visible_candidate_ids()]
             for candidate in [*candidates, *rt.own]:
                 if isinstance(candidate, Candidate):
-                    allowed.update(effective_files(rt.goal, candidate).values())
+                    goal = self._candidate_goal(candidate)
+                    allowed.update(effective_files(goal, candidate).values())
             if sha256 not in allowed:
                 raise _core_signal(SoftError("file not in your view"))
 

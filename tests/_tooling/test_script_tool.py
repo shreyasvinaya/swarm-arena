@@ -108,9 +108,11 @@ class FakeView:
         goal_manifest: dict[str, str],
         candidates: dict[str, Candidate],
         blobs: dict[str, bytes],
+        group_goals: dict[str, Goal] | None = None,
     ) -> None:
         self._goal = Goal(id="g", namespace="n", files=FileSet(manifest=goal_manifest))
         self.candidates = candidates
+        self.group_goals = group_goals or {}
         self.blobs = blobs
         self.reads: list[str] = []
         self.event_loop_thread = get_ident()
@@ -123,6 +125,9 @@ class FakeView:
         if id not in self.candidates:
             raise SoftError(f"no such candidate: {id}")
         return self.candidates[id]
+
+    def _candidate_goal(self, candidate: Candidate) -> Goal:
+        return self.group_goals.get(candidate.part or "", self._goal)
 
     def _read_artifact(self, sha256: str) -> bytes:
         assert get_ident() != self.event_loop_thread
@@ -434,6 +439,36 @@ async def test_list_and_read_files() -> None:
         await read_file.handler(context, ReadFileArgs(path="problem/new.txt", candidate="c1"))
     assert_secret_absent(caught.value, SECRET, sanitized=True)
     assert view.reads == [HA2, HA, HN]
+
+
+async def test_candidate_files_use_the_candidate_goal() -> None:
+    # A part candidate seen by a main-goal (for example converge) agent ran on
+    # its part goal, so the viewer's own goal files must not appear in its view.
+    part_goal = Goal(
+        id="p", namespace="n", files=FileSet(manifest={"part/a.txt": HA, "part/run.py": HR})
+    )
+    view = FakeView(
+        goal_manifest={"main/join.py": HN},
+        candidates={"c1": cand(part="p", overlay={"part/a.txt": HA2})},
+        blobs={HA: b"a1", HA2: b"a2", HR: b"run", HN: b"join"},
+        group_goals={"p": part_goal},
+    )
+    list_files, read_file = ScriptTool(command=["x"]).extra_actions()
+    assert await list_files.handler(view, ListFilesArgs(candidate="c1")) == {
+        "files": ["part/a.txt", "part/run.py"]
+    }
+    assert await read_file.handler(view, ReadFileArgs(path="part/run.py", candidate="c1")) == {
+        "path": "part/run.py",
+        "content": "run",
+    }
+    assert await read_file.handler(view, ReadFileArgs(path="part/a.txt", candidate="c1")) == {
+        "path": "part/a.txt",
+        "content": "a2",
+    }
+    with pytest.raises(SoftError, match=r"no such file: main/join\.py"):
+        await read_file.handler(view, ReadFileArgs(path="main/join.py", candidate="c1"))
+    assert await list_files.handler(view, ListFilesArgs()) == {"files": ["main/join.py"]}
+    assert view.reads == [HR, HA2]
 
 
 async def test_file_actions_respect_candidate_view() -> None:

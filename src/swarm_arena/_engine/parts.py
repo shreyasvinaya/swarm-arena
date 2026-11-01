@@ -48,6 +48,32 @@ def team_goal(plan: Plan, team: TeamSpec) -> Goal:
     return plan.goal if team.part is None else _part(plan, team.part).goal
 
 
+def group_goals(plan: Plan) -> dict[str, Goal]:
+    """
+    Map every declared group to the goal its candidates run on.
+
+    Parameters
+    ----------
+    plan : Plan
+        Current plan revision.
+
+    Returns
+    -------
+    dict[str, Goal]
+        The main goal under the empty key and each part goal under its part name,
+        matching ``team_goal`` for a team of that group.
+
+    Examples
+    --------
+    >>> from swarm_arena import Goal, PartSpec, Plan
+    >>> plan = Plan(goal=Goal(id="g", namespace="n"), teams=[], judges=[],
+    ...             parts=[PartSpec(name="a", goal=Goal(id="ga", namespace="n"))])
+    >>> {group: goal.id for group, goal in group_goals(plan).items()}
+    {'': 'g', 'a': 'ga'}
+    """
+    return {"": plan.goal, **{part.name: part.goal for part in plan.parts}}
+
+
 def part_scoring(plan: Plan, part: str | None) -> tuple[list[Ref], list[Ref], str]:
     """
     Select scoring references and an explicit ranking name without imports.

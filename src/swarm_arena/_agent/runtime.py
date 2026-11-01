@@ -148,6 +148,10 @@ class AgentRuntime:
         Group to ranking judge name for all declared current groups. The main group key is empty.
     sibling_views : Mapping[str, BoardView], optional
         Fixed declared sibling capabilities; the main group key is empty.
+    group_goals : Mapping[str, Goal], optional
+        Group to goal for all declared current groups; the main group key is empty.
+        A candidate's effective files start from its own group's goal; a group
+        missing here falls back to ``goal``.
     started_runs : int, default=0
         Starts whose durable tool_start or tool_dispatch returned in this round.
         On resume the runner restores the current goal/team/agent/round count
@@ -214,6 +218,7 @@ class AgentRuntime:
     private_paths: frozenset[str] = frozenset()
     rankings: Mapping[str, str] = field(default_factory=dict)
     sibling_views: Mapping[str, BoardView] = field(default_factory=dict)
+    group_goals: Mapping[str, Goal] = field(default_factory=dict)
     gateway: KeyManager | None = None
 
     def __post_init__(self) -> None:
