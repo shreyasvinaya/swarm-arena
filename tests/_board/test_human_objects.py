@@ -222,6 +222,16 @@ def test_read_rejects_curation_score(tmp_path: Path) -> None:
         read_human_object(arena, key)
 
 
+def test_read_rejects_learning_from_another_namespace(tmp_path: Path) -> None:
+    arena = LocalStore(tmp_path)
+    key = human_object_key("toy", "curation", NAME)
+    learning = _learning().model_copy(update={"namespace": "other"})
+    obj = HumanObject(kind="add", learning=learning, author="human:a")
+    arena.create(key, canonical_json(obj.model_dump(mode="json")) + b"\n")
+    with pytest.raises(ValueError, match="human learning namespace does not match object"):
+        read_human_object(arena, key)
+
+
 @pytest.mark.parametrize("length", [65, 256])
 def test_review_key_rejects_overlong_reviewer(length: int) -> None:
     with pytest.raises(ValueError, match="reviewer"):
