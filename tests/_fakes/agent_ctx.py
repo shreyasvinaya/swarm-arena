@@ -169,6 +169,12 @@ class FakeAgentContext:
             item.model_copy(deep=True) for item in self.scores if item.candidate_id == candidate_id
         ]
 
+    def _result_scores(self, candidate_id: str) -> list[Score]:
+        self._raise("_result_scores")
+        return [
+            item.model_copy(deep=True) for item in self.scores if item.candidate_id == candidate_id
+        ]
+
     def search_learnings(
         self,
         query: str,

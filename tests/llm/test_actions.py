@@ -48,7 +48,7 @@ from swarm_arena._errors import (
 from swarm_arena._model.base import FrozenModel, JsonValue
 from swarm_arena._model.canonical import canonical_json
 from swarm_arena._store.base import open_store
-from swarm_arena.board import Row
+from swarm_arena.board import Candidate, Row
 from swarm_arena.llm._actions import MAX_RESULT_CHARS, build_tools, candidate_view
 from swarm_arena.llm._hooks import _prepare, _unwrap_control
 from swarm_arena.llm._linking import CallLinks, ManagerDeps
@@ -848,6 +848,26 @@ async def test_real_reads_keep_feedback_redaction_and_charges(ctx_env: CtxEnv) -
     assert "private-reason" not in result
     assert "secret" not in result
     assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (2, 2)
+
+
+@pytest.mark.parametrize("max_reads", [0, 10])
+async def test_own_results_charge_no_board_read_or_extra_turn(
+    ctx_env: CtxEnv, max_reads: int
+) -> None:
+    limits = Limits(max_turns_per_round=2, max_board_reads_per_round=max_reads)
+    ctx = ctx_env.ctx(limits=limits)
+    tools, deps = await _prepare(partial(tool_set, ctx))
+    first = decoded(await invoke(tools, deps, "run_tool", {"inputs": {"x": 1.0}}))
+    second = decoded(await invoke(tools, deps, "run_tool", {"inputs": {"x": 2.0}}))
+    assert [first["inputs"], second["inputs"]] == [{"x": 1.0}, {"x": 2.0}]
+    assert first["status"] == second["status"] == "ok"
+    assert first["scores"] == second["scores"] == []
+    mine = decoded(await invoke(tools, deps, "my_candidates", {}))
+    assert [item["id"] for item in mine] == [first["id"], second["id"]]
+    assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (2, 0)
+    assert [c.read_ids for c in ctx_env.rt.own if isinstance(c, Candidate)] == [[], []]
+    await invoke(tools, deps, "finish_round", {"summary": "done"})
+    assert deps.summary == "done"
 
 
 async def test_schema_hooks_run_in_abandonable_preparation() -> None:

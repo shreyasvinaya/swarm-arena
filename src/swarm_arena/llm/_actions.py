@@ -109,7 +109,7 @@ def candidate_view(candidate: Candidate, scores: Sequence[Score]) -> dict[str, A
         Candidate already feedback-redacted by AgentContext. Its producing
         policy decides whether check reasons are visible.
     scores : Sequence[Score]
-        Scores obtained through AgentContext.scores_of for this candidate.
+        Manager-visible snapshot scores for this candidate.
 
     Returns
     -------
@@ -193,6 +193,11 @@ def _candidate_result(ctx: AgentContext, candidate: Candidate) -> dict[str, Any]
     return candidate_view(candidate, ctx.scores_of(candidate.id))
 
 
+def _own_result(ctx: AgentContext, candidate: Candidate) -> dict[str, Any]:
+    """View an own result; run_tool and my_candidates are not board reads."""
+    return candidate_view(candidate, ctx._result_scores(candidate.id))
+
+
 def _fit_learning_evidence(result: dict[str, Any]) -> dict[str, Any]:
     """Keep the longest evidence prefix that fits alongside the learning text."""
     evidence = result["evidence"]
@@ -220,7 +225,7 @@ def _fit_learning_evidence(result: dict[str, Any]) -> dict[str, Any]:
 def _read_result(ctx: AgentContext, name: str, args: dict[str, Any]) -> Any:
     """Marshal real published reads through AgentContext's captured loop token."""
     if name == "my_candidates":
-        return [_candidate_result(ctx, candidate) for candidate in ctx.my_candidates()]
+        return [_own_result(ctx, candidate) for candidate in ctx.my_candidates()]
     if name == "get_candidate":
         return _candidate_result(ctx, ctx.get_candidate(args["id"]))
     if name == "search_learnings":
@@ -289,7 +294,7 @@ async def _act(
     if name == "run_tool":
         with requesting_call(deps.links.get(tool_call_id)):
             candidate = await ctx.run_tool(**args)
-        return await _prepare(lambda: _render(_candidate_result(ctx, candidate)))
+        return await _prepare(lambda: _render(_own_result(ctx, candidate)))
     if name == "post_learning":
         with requesting_call(deps.links.get(tool_call_id)):
             learning = await ctx.post_learning(**args)
