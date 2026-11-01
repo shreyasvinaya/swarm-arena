@@ -710,8 +710,9 @@ For example, a tool can write
 `{"data": {}, "failed_provider": "anthropic"}` to its result file. Agents using
 Anthropic through either their manager or tool pause; unrelated agents continue.
 The optional LLM adapter recognizes authentication, permission, rate-limit,
-connection, timeout and service failures. Credit failures use structured error
-fields first, with a message fallback confined to the adapter. Generic request-error
+connection, timeout and service failures, including any HTTP 5xx status such as
+502 Bad Gateway. An HTTP 402 status is a credit failure. Other credit failures
+use structured error fields first, with a message fallback confined to the adapter. Generic request-error
 types do not suppress the credit-balance fallback; a specific identifying code
 takes precedence. Provider messages
 are never copied into engine errors or provider events.
