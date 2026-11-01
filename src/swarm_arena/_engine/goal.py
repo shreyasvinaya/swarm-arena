@@ -1991,6 +1991,8 @@ class GoalRunner:
         and rejections identify the first round to which they apply. Recovery
         completes a pending replan before starting that round. Final selection
         records its lifecycle reason independently of the live stop flags.
+        A stop or limit that leaves no passing candidate journals ``no_result``
+        with the no-result reason and ``goal_finished`` with the stop reason.
         A terminal policy checkpoint restores its effect and completes any
         owed round closure before constructing managers or judges. New revisions
         pass bounded preflight before publication. Recovery replays already
@@ -2047,6 +2049,9 @@ class GoalRunner:
                 boundary.propagate_control(error)
                 raise
         self._stop()
+        # A stop or limit stays the lifecycle's termination reason when it leaves
+        # nothing to select, so resume can continue the goal like any stopped goal.
+        end_reason = self.reason if self.status == "stopped" else None
         if not finalists and not (self.final_parts and any(self.final_parts.values())):
             if self.status != "no_result":
                 self.status, self.reason = (
@@ -2069,7 +2074,10 @@ class GoalRunner:
         with anyio.CancelScope(shield=True):
             self.deps.provider_stops._release_goal(self.goal_id)
             await self.deps.journal.append_durable(
-                self._draft(EventType.GOAL_FINISHED, reason=self.reason)
+                self._draft(
+                    EventType.GOAL_FINISHED,
+                    reason=end_reason if end_reason is not None else self.reason,
+                )
             )
             await self.deps.ledger.end_goal(self.goal_id)
         await self._refresh()

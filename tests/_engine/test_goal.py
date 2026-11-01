@@ -2704,9 +2704,7 @@ async def test_llm_judge_usage_overflow_finishes_run(
     events = all_events(config)
     assert not [e for e in events if e.type == "judge_error"]
     assert [e for e in events if e.type == "round_closed"]
-    assert next(e for e in events if e.type == "goal_finished").payload["reason"] == (
-        "no passing candidate" if (source, ranking) == ("1", "panel") else "run budget"
-    )
+    assert next(e for e in events if e.type == "goal_finished").payload["reason"] == "run budget"
     assert (Path(config.run_root) / "overflow/goals/g/solution.json").exists()
     assert bool(result["g"]) is (ranking == "y")
     assert calls == ([] if source == "tool" else ["1", "0"] if source == "0" else ["1"])
