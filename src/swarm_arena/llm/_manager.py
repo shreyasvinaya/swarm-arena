@@ -3,9 +3,15 @@
 from typing import Any, cast
 
 import anyio
-from agents import Agent, ModelSettings, Runner
+from agents import (
+    Agent,
+    FunctionToolResult,
+    ModelSettings,
+    RunContextWrapper,
+    Runner,
+    ToolsToFinalOutputResult,
+)
 from agents import RunConfig as SDKRunConfig
-from agents.agent import StopAtTools
 from agents.exceptions import MaxTurnsExceeded
 from pydantic import Field
 
@@ -37,6 +43,16 @@ async def _interrupted_drain(scope: LLMScope) -> None:
         raise _stop_cleanup_error() from None
 
 
+def _stop_after_accepted_finish(
+    context: RunContextWrapper[ManagerDeps], results: list[FunctionToolResult]
+) -> ToolsToFinalOutputResult:
+    """Stop only after an accepted finish_round; a rejected one lets the model retry."""
+    summary = context.context.summary
+    if summary is None:
+        return ToolsToFinalOutputResult(is_final_output=False)
+    return ToolsToFinalOutputResult(is_final_output=True, final_output=summary)
+
+
 async def _finish_accounting(scope: LLMScope, *, interrupted: bool) -> None:
     if interrupted:
         await _interrupted_drain(scope)
@@ -56,7 +72,8 @@ class AgentsSDKManager(Manager):
 
     The core supplies an LLM scope and authorized AgentContext. Conversation
     history is discarded between rounds; private notes and fixed board views
-    carry useful state forward. Calling ``finish_round`` ends the conversation.
+    carry useful state forward. An accepted ``finish_round`` call ends the
+    conversation; one with invalid arguments returns a soft tool error instead.
     Every exit drains call accounting before returning to the scope owner.
 
     Parameters
@@ -223,7 +240,7 @@ class AgentsSDKManager(Manager):
                     model_settings=ModelSettings(
                         parallel_tool_calls=self.config.parallel_tool_calls
                     ),
-                    tool_use_behavior=StopAtTools(stop_at_tool_names=["finish_round"]),
+                    tool_use_behavior=_stop_after_accepted_finish,
                 )
                 return agent, round_input(ctx, seed_inputs=self.config.seed_inputs)
 
