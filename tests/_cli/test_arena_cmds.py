@@ -193,6 +193,38 @@ def test_reindex_cmd(finished_run: FinishedRun, capsys: pytest.CaptureFixture[st
     assert f"{finished_run.namespace}: 1 runs" in capsys.readouterr().out
 
 
+def test_reindex_cmd_prints_each_namespace_run_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from _fakes.journals import FakeRun, add_pointer
+
+    from swarm_arena import Ref, RunConfig
+
+    arena = tmp_path / "arena"
+    cache = tmp_path / "cache"
+    for namespace, run_id in (("toy", "toy-1"), ("toy", "toy-2"), ("hello", "hello-1")):
+        run = FakeRun(str(tmp_path / "runs"), run_id, namespace=namespace)
+        run.commit(run.plan(), run.candidate(f"c-{run_id}"))
+        run._lease.release()
+        add_pointer(str(arena), run)
+    config = RunConfig(
+        run_root=str(tmp_path / "runs"),
+        arena_root=str(arena),
+        board=Ref(
+            path="swarm_arena.board:ArenaBoard",
+            config={"arena_root": str(arena), "cache_dir": str(cache)},
+        ),
+    )
+    config_path = tmp_path / "run.toml"
+    config_path.write_text(config.dumps())
+    cfg = ["--config", str(config_path)]
+    assert main(["reindex", "--namespace", "toy", "--namespace", "hello", *cfg]) == 0
+    assert capsys.readouterr().out == "hello: 1 runs\ntoy: 2 runs\n"
+    cache.joinpath("empty.sqlite").write_bytes(b"stale database")
+    assert main(["reindex", *cfg]) == 0
+    assert capsys.readouterr().out == "empty: 0 runs\nhello: 1 runs\ntoy: 2 runs\n"
+
+
 def test_arena_cmds_need_arena_board(
     finished_run: FinishedRun, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

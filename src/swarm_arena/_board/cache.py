@@ -328,12 +328,10 @@ class ArenaCache:
                     self._closed = True
                     self._ingest_states.clear()
 
-    def _diagnostics(self) -> tuple[int, tuple[str, ...]]:
-        """Return committed run counts and cached identifier-only warnings."""
+    def _diagnostics(self) -> tuple[str, ...]:
+        """Return cached identifier-only warnings."""
         with self._lock:
-            return self._conn.execute("SELECT count(*) FROM runs").fetchone()[0], tuple(
-                self.warnings
-            )
+            return tuple(self.warnings)
 
     @contextmanager
     def _read_scope(self, frontier: Frontier) -> Generator[None]:

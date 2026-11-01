@@ -281,14 +281,14 @@ class ArenaBoard(Board):
         return self.config.arena_root, self._cache_dir()
 
     def _diagnostics(self) -> tuple[dict[str, int], tuple[str, ...]]:
-        """Collect committed cache counts and value-free warnings on a worker."""
+        """Collect selected namespaces' run counts and value-free warnings on a worker."""
         with self._refresh_lock:
-            counts = {}
+            # Every cache ingests every marked run, so count pointer membership instead.
+            sources = self._read_state().source_namespaces.values()
+            counts = {ns: sum(ns in names for names in sources) for ns in self._namespaces}
             warnings = []
-            for namespace, cache in self._caches.items():
-                count, messages = cache._diagnostics()
-                counts[namespace] = count
-                warnings.extend(messages)
+            for cache in self._caches.values():
+                warnings.extend(cache._diagnostics())
             return counts, tuple(warnings)
 
     @contextmanager
