@@ -554,6 +554,33 @@ def test_resume_missing_saved_config_reports_error(
     assert "Traceback" not in err
 
 
+@pytest.mark.parametrize("raised", [{"max_usd": 20.0}, {"run_timeout_s": 90000.0}])
+def test_plain_resume_keeps_limits_raised_by_an_earlier_override(
+    example: Example,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    raised: dict[str, float],
+) -> None:
+    from _fakes.run import events
+
+    saved = RunConfig.load(example.run_toml)
+    saved = saved.model_copy(update={"limits": saved.limits.model_copy(update={"max_usd": 10.0})})
+    example.run_toml.write_text(saved.dumps())
+    assert main(["run", "--yes", str(example.run_toml), str(example.plan_toml)]) == 0
+    run_dir = next(example.run_root.iterdir())
+    bigger = saved.model_copy(update={"limits": saved.limits.model_copy(update=raised)})
+    bigger_toml = tmp_path / "bigger.toml"
+    bigger_toml.write_text(bigger.dumps())
+    assert main(["resume", str(run_dir), "--config", str(bigger_toml)]) == 0
+    capsys.readouterr()
+    assert main(["resume", str(run_dir)]) == 0
+    assert capsys.readouterr().out.splitlines() == ["done: g 1 finalists"]
+    assert RunConfig.load(run_dir / "run.toml") == saved
+    assert [e.payload["new"] for e in events(saved, "limits_changed")] == [
+        bigger.limits.model_dump(mode="json")
+    ]
+
+
 def test_newer_solution_version_is_rejected(
     example: Example,
     monkeypatch: pytest.MonkeyPatch,
