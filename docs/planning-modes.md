@@ -454,11 +454,13 @@ anyio.run(run_autonomous)
 ```
 
 Replans keep all current plan-level checks and judges, ranking and policy;
-additional catalog checks may be appended. `keep_teams` and `keep_parts` retain
-named human components unchanged, including non-catalog ScriptTool teams and
-part-specific checks, judges and ranking. A kept name must exist and cannot
-also be newly defined. New parts inherit main scoring and can use only the
-main goal's frozen files, never judge-private files.
+additional catalog checks may be appended. A null output `converge` keeps the
+current `ConvergeSpec`; otherwise the output sets only its mode, `top_n` and
+team, and every other convergence setting is kept. `keep_teams` and
+`keep_parts` retain named human components unchanged, including non-catalog
+ScriptTool teams and part-specific checks, judges and ranking. A kept name
+must exist and cannot also be newly defined. New parts inherit main scoring and
+can use only the main goal's frozen files, never judge-private files.
 
 An explicit new round schedule includes completed rounds, including completed
 implicit rounds. Empty output rounds retain the current schedule. Every draft

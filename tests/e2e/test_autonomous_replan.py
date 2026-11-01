@@ -10,7 +10,7 @@ from _fakes.planners import SequencePlanner
 from _fakes.planning_llm import planner_config, planner_output
 from _fakes.run import events, run_dir
 
-from swarm_arena import ConvergeSpec, Limits, PartSpec, Plan, Ref, RunConfig, Swarm
+from swarm_arena import ConvergeSpec, Limits, PartSpec, Plan, Ref, RoundSpec, RunConfig, Swarm
 from swarm_arena.llm import LLMPlanner
 from swarm_arena.planning import Planner
 from swarm_arena.testing import FakeModel, FakeTurn
@@ -136,6 +136,23 @@ async def test_replan_keeping_the_human_scriptjudge_is_accepted(tmp_path: Path) 
 
 async def test_replan_keeping_the_human_team_and_a_checked_part_is_accepted(tmp_path: Path) -> None:
     await _assert_kept(tmp_path, True)
+
+
+async def test_replan_restating_converge_keeps_human_converge_settings(tmp_path: Path) -> None:
+    plan, config = setup(tmp_path)
+    converge = ConvergeSpec(
+        top_n=1, distinct=False, min_improvement=0.5, round=RoundSpec(tool_timeout_s=30.0)
+    )
+    plan = plan.model_copy(update={"converge": converge})
+    draft = output()
+    draft["converge"] = {"mode": "select", "top_n": 1}
+    FakeModel([FakeTurn(text=json.dumps(draft))]).register("planner")
+    await Swarm(config, replanner=LLMPlanner("planner")).run(plan)
+    revisions = events(config, "plan_revision")
+    assert [e.payload["plan"]["revision"] for e in revisions] == [0, 1]
+    r0, r1 = [Plan.model_validate(e.payload["plan"]) for e in revisions]
+    assert r1.origin == "autonomous"
+    assert r1.converge == r0.converge == converge
 
 
 async def test_autonomous_revision_clears_external_planning_session(tmp_path: Path) -> None:
