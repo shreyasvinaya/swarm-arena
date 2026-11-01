@@ -657,7 +657,9 @@ async def execute_tool_run(
     Execute one validated request with durable reservation and completion.
 
     User hooks, validators, and serializers run in abandonable daemon threads.
-    Detached preparation precedes atomic repeat and run-count admission.
+    Detached preparation precedes atomic repeat and run-count admission. An
+    identical deterministic request first waits for the agent's in-flight run,
+    then follows the sequential repeat rules.
     Internal round cancellation retains partial output; outer cancellation
     before completion propagates. Optional fingerprinting receives a deep copy
     and waits at most ten seconds outside the completion shield. Interrupted
@@ -712,6 +714,7 @@ async def execute_tool_run(
     )
     allocation_request = request
     index: int | None = None
+    run: anyio.Event | None = None
     boundary = _Outcome()
     try:
         if not deterministic:
@@ -721,6 +724,8 @@ async def execute_tool_run(
         key = repeat_key(
             goal_key=rt.goal_key, tool_ref=rt.tool_ref, request=request, deterministic=deterministic
         )
+        if deterministic:
+            await rt.repeats.wait_runs(key)
         outcome = rt.repeats.lookup(
             key,
             agent=f"{rt.team.name}/{rt.spec.name}",
@@ -737,6 +742,8 @@ async def execute_tool_run(
         if outcome.action in {"return_own", "link"}:
             assert outcome.candidate is not None
             return outcome.candidate
+        if deterministic:
+            run = rt.repeats.begin_run(key)
         if rt.counters.tool_runs >= rt.limits.max_tool_runs_per_round:
             raise _core_signal(
                 LimitReached("max_tool_runs_per_round", "tool runs used up for this round")
@@ -791,6 +798,8 @@ async def execute_tool_run(
     finally:
         if index is not None:
             rt.repeats.release(rt, allocation_request, index)
+        if run is not None:
+            rt.repeats.end_run(key, run)
 
 
 async def _run(

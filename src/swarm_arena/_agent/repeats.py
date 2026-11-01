@@ -4,6 +4,8 @@ from collections.abc import Iterable
 from collections.abc import Set as AbstractSet
 from typing import TYPE_CHECKING, Literal
 
+import anyio
+
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._errors import SoftError, _core_signal, _exception_type_name
 from swarm_arena._journal.event import EventDraft, EventType
@@ -127,7 +129,9 @@ class RepeatIndex:
     -----
     The round runner creates an index per agent. It supplies only earlier-round
     results and that agent's resumed entries, preserving snapshot visibility.
-    Reservations and lookups run on the loop with no intervening await.
+    Reservations and lookups run on the loop with no intervening await. An
+    identical deterministic request waits for the agent's in-flight run of its
+    key, so parallel and sequential repeats get the same decision.
 
     Examples
     --------
@@ -145,6 +149,7 @@ class RepeatIndex:
         self._entries: dict[str, list[Candidate]] = {}
         self._candidates: list[Candidate] = []
         self._pending: set[str] = set()
+        self._running: dict[str, anyio.Event] = {}
         # Keep the original objects alive until release, so identity cannot be reused.
         self._allocations: dict[tuple[int, int, int], tuple[AgentRuntime, ToolRequest, str]] = {}
         for key, candidate in entries:
@@ -266,6 +271,83 @@ class RepeatIndex:
         if other is not None:
             return RepeatOutcome(action="link", candidate=other)
         return RepeatOutcome(action="run", hint=hint)
+
+    def begin_run(self, key: str) -> anyio.Event:
+        """
+        Mark a deterministic run of the key in flight until its end_run.
+
+        Call it right after lookup permits the run, with no intervening await.
+
+        Parameters
+        ----------
+        key : str
+            Repeat key of the admitted run.
+
+        Returns
+        -------
+        anyio.Event
+            Token for end_run; it is set when the run ends.
+
+        Examples
+        --------
+        >>> import anyio
+        >>> async def main() -> None:
+        ...     idx = RepeatIndex("r")
+        ...     run = idx.begin_run("k")
+        ...     idx.end_run("k", run)
+        ...     await idx.wait_runs("k")
+        >>> anyio.run(main)
+        """
+        run = anyio.Event()
+        self._running[key] = run
+        return run
+
+    def end_run(self, key: str, run: anyio.Event) -> None:
+        """
+        End an in-flight run and wake its waiters, idempotently.
+
+        Parameters
+        ----------
+        key : str
+            Repeat key passed to begin_run.
+        run : anyio.Event
+            Token from begin_run; a stale token leaves a newer run in flight.
+
+        Examples
+        --------
+        >>> import anyio
+        >>> async def main() -> bool:
+        ...     idx = RepeatIndex("r")
+        ...     run = idx.begin_run("k")
+        ...     idx.end_run("k", run)
+        ...     idx.end_run("k", run)
+        ...     return run.is_set()
+        >>> anyio.run(main)
+        True
+        """
+        if self._running.get(key) is run:
+            del self._running[key]
+        run.set()
+
+    async def wait_runs(self, key: str) -> None:
+        """
+        Wait until no run of the key is in flight.
+
+        On return, lookup sees the ended runs' results. A waiter that then runs
+        must call begin_run before its next await.
+
+        Parameters
+        ----------
+        key : str
+            Repeat key to wait for.
+
+        Examples
+        --------
+        >>> import anyio
+        >>> anyio.run(RepeatIndex("r").wait_runs, "k")
+        """
+        while (run := self._running.get(key)) is not None:
+            await run.wait()
 
     def candidates_of(self, agent: str) -> list[Candidate]:
         """

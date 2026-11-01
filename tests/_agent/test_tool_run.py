@@ -24,6 +24,7 @@ from swarm_arena._journal.event import EventType
 from swarm_arena._journal.lease import read_owner
 from swarm_arena._model.canonical import sha256_hex
 from swarm_arena._model.plan import Resources
+from swarm_arena._model.results import Candidate
 from swarm_arena._model.tooling import RunStatus, ToolOutput
 from swarm_arena._tooling.tool import Tool, effective_tool_timeout, tool_grace
 from swarm_arena.executor import Executor, Job
@@ -617,6 +618,68 @@ async def test_parallel_requests_share_last_run_slot(rt_env: RtEnv) -> None:
     assert errors[0].limit == "max_tool_runs_per_round"
     assert rt.counters.tool_runs == 1
     assert len(rt_env.events("tool_end")) == 1
+
+
+async def _run_or_refuse(rt: AgentRuntime, results: list[Candidate | SoftError]) -> None:
+    try:
+        results.append(
+            await execute_tool_run(rt, {"x": 1.0}, parents=(), replicate=None, edits=None)
+        )
+    except SoftError as error:
+        results.append(error)
+
+
+async def test_parallel_identical_deterministic_requests_refuse_the_repeat(
+    rt_env: RtEnv,
+) -> None:
+    results: list[Candidate | SoftError] = []
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(_run_or_refuse, rt_env.rt, results)
+        tg.start_soon(_run_or_refuse, rt_env.rt, results)
+    candidates = [result for result in results if isinstance(result, Candidate)]
+    refusals = [result for result in results if isinstance(result, SoftError)]
+    assert len(candidates) == 1
+    assert [str(error) for error in refusals] == [f"repeat refused: {candidates[0].id}"]
+    assert rt_env.rt.counters.tool_runs == 1
+    await rt_env.rt.journal.commit()
+    assert len(rt_env.events("tool_end")) == 1
+    assert len(rt_env.events("reserve")) == 1
+    assert [e.payload["refused"] for e in rt_env.events("watchdog")] == [candidates[0].id]
+
+
+class _TimeoutFirstExecutor(Executor):
+    def __init__(self, delegate: Executor) -> None:
+        super().__init__()
+        self.delegate = delegate
+        self.submits = 0
+
+    async def submit(self, job: Job) -> ToolOutput:
+        self.submits += 1
+        if self.submits == 1:
+            return ToolOutput(status=RunStatus.TIMEOUT)
+        return await self.delegate.submit(job)
+
+    async def capacity(self) -> Resources | None:
+        return await self.delegate.capacity()
+
+    async def aclose(self) -> None:
+        await self.delegate.aclose()
+
+
+async def test_parallel_identical_request_runs_after_an_uncounted_in_flight_result(
+    rt_env: RtEnv,
+) -> None:
+    rt = dataclasses.replace(rt_env.rt, executor=_TimeoutFirstExecutor(rt_env.rt.executor))
+    results: list[Candidate | SoftError] = []
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(_run_or_refuse, rt, results)
+        tg.start_soon(_run_or_refuse, rt, results)
+    assert all(isinstance(result, Candidate) for result in results)
+    statuses = [result.output.status for result in results if isinstance(result, Candidate)]
+    assert statuses == [RunStatus.TIMEOUT, RunStatus.OK]
+    assert rt.counters.tool_runs == 2
+    await rt.journal.commit()
+    assert rt_env.events("watchdog") == []
 
 
 @pytest.mark.parametrize("where", ["constructor", "command"])
