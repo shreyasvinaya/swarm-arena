@@ -166,6 +166,37 @@ def test_learnings_pin_hide_add_write_one_object_each(
     assert target in capsys.readouterr().out
 
 
+def test_board_show_hidden_learning_for_curation(
+    finished_run: FinishedRun, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ns = finished_run.namespace
+    assert _call(finished_run, "board", "search", "", "--namespace", ns) == 0
+    target = _rows(capsys.readouterr().out)[0][0]
+    assert _call(finished_run, "board", "show", target, "--namespace", ns) == 0
+    before = capsys.readouterr().out
+    assert (
+        _call(finished_run, "learnings", "hide", target, "--namespace", ns, "--author", "alice")
+        == 0
+    )
+    capsys.readouterr()
+    assert _call(finished_run, "board", "show", target, "--namespace", ns) == 0
+    shown = capsys.readouterr().out
+    assert shown.startswith(f"{target}: ")
+    assert "hidden" in shown.split("\nmarkers: ")[1].splitlines()[0]
+    assert shown.split("\nevidence:\n")[1] == before.split("\nevidence:\n")[1]
+    assert "hidden" not in before.split("\nmarkers: ")[1].splitlines()[0]
+
+
+def test_board_show_unknown_learning_names_it(
+    finished_run: FinishedRun, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert (
+        _call(finished_run, "board", "show", "L-missing", "--namespace", finished_run.namespace)
+        == 1
+    )
+    assert "unknown learning L-missing" in capsys.readouterr().err
+
+
 def test_learnings_pin_unknown_id_writes_nothing(
     finished_run: FinishedRun, capsys: pytest.CaptureFixture[str]
 ) -> None:
