@@ -24,8 +24,8 @@ _PREFIX_UNSAFE: Final = re.compile(r"[^A-Za-z0-9._-]")
 _PREFIX_MAX: Final = 64
 _DIR_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _PROC_FD: Final = "/proc/self/fd"
-_UNSAFE_ROOT: Final = (
-    "workspace root is not safe: it and every parent directory must be owned by this user "
+_UNSAFE: Final = (
+    "{} is not safe: it and every parent directory must be owned by this user "
     "or root, and not writable by group or others unless sticky (like /tmp)"
 )
 
@@ -43,18 +43,23 @@ def _only_owner_can_change(info: os.stat_result) -> bool:
     return not shared or bool(info.st_mode & stat.S_ISVTX)
 
 
+def _private_directory(path: Path, name: str) -> Path:
+    """Create a directory as 0700 if needed; refuse one that another user could change."""
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = path.resolve(strict=True)
+        safe = all(_only_owner_can_change(os.stat(entry)) for entry in (path, *path.parents))
+    except OSError:
+        raise _core_error(RuntimeError, f"cannot create the {name}") from None
+    if not safe:
+        raise _core_error(RuntimeError, _UNSAFE.format(name))
+    return path
+
+
 def _workspace_root(configured: str | None) -> Path:
     """Create the workspace root if needed; refuse one that another user could change."""
     root = Path(configured).expanduser() if configured is not None else _default_root()
-    try:
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        root = root.resolve(strict=True)
-        safe = all(_only_owner_can_change(os.stat(path)) for path in (root, *root.parents))
-    except OSError:
-        raise _core_error(RuntimeError, "cannot create the workspace root") from None
-    if not safe:
-        raise _core_error(RuntimeError, _UNSAFE_ROOT)
-    return root
+    return _private_directory(root, "workspace root")
 
 
 def _open_workspace(configured: str | None, job: Job) -> tuple[Path, ArtifactStore]:

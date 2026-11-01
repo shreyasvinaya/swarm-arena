@@ -1500,6 +1500,35 @@ async def test_import_stop_during_takeover_response(
     assert not any(e.type == EventType.REVIEW_IMPORTED for e in _events(review_run.store))
 
 
+async def test_import_refuses_a_shared_local_journal_directory(
+    review_run: FakeRun,
+    run_config: RunConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    import tempfile
+
+    from swarm_arena._model.canonical import utc_now
+
+    temp = tmp_path / "temp"
+    journals = temp / f"swarm-arena-{os.getuid()}" / "journals"
+    journals.mkdir(parents=True)
+    journals.chmod(0o777)
+    victim = tmp_path / "victim"
+    victim.write_text("export SAFE=1\n")
+    (journals / f"{review_run.run_id}-e2.jsonl").symlink_to(victim)
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
+    with pytest.raises(RuntimeError, match=r"^local journal directory is not safe: "):
+        await HumanReview("alice").import_csv(review_run.run_id, _file(tmp_path), config=run_config)
+    assert victim.read_text() == "export SAFE=1\n"
+    owner = read_owner(review_run.store)
+    assert owner is not None
+    assert owner[0].expires_at <= utc_now()
+    assert not _reviews(run_config)
+    assert not any(e.type == EventType.REVIEW_IMPORTED for e in _events(review_run.store))
+
+
 async def test_import_stop_at_preparation_entry_has_stopped_outcome(
     review_run: FakeRun,
     run_config: RunConfig,
@@ -1509,16 +1538,17 @@ async def test_import_stop_at_preparation_entry_has_stopped_outcome(
     import anyio
     from _fakes.lease_acquisition import stop_at_phase_entry
 
+    from swarm_arena._engine import run as run_module
     from swarm_arena._model.canonical import utc_now
 
     trigger, latched = stop_at_phase_entry(monkeypatch)
-    gettempdir = human_review.gettempdir
+    local_journal_path = run_module._local_journal_path
 
-    def tempdir() -> str:
+    def journal_path(run_id: str, epoch: int) -> Path:
         trigger.set()
-        return gettempdir()
+        return local_journal_path(run_id, epoch)
 
-    monkeypatch.setattr(human_review, "gettempdir", tempdir)
+    monkeypatch.setattr(run_module, "_local_journal_path", journal_path)
     with anyio.fail_after(60), pytest.raises(RuntimeError, match=r"^review import stopped$"):
         await HumanReview("alice").import_csv(
             review_run.run_id,
