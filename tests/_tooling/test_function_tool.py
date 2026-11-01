@@ -105,7 +105,7 @@ def test_keyword_only_and_resolved_annotations() -> None:
 
 def test_command_argv() -> None:
     cmd = FunctionTool(add).command(ToolRequest(), Path("/ws"))
-    tests_dir = str(Path(fake_tools.__file__).resolve().parents[1])
+    tests_dir = str(Path(fake_tools.__file__).absolute().parents[1])
     assert cmd == Command(
         argv=[
             "python",
@@ -118,9 +118,9 @@ def test_command_argv() -> None:
         ]
     )
     assert import_root("swarm_arena._model.canonical") == str(
-        Path(swarm_arena.__file__).resolve().parents[1]
+        Path(swarm_arena.__file__).absolute().parents[1]
     )
-    assert import_root("swarm_arena") == str(Path(swarm_arena.__file__).resolve().parents[1])
+    assert import_root("swarm_arena") == str(Path(swarm_arena.__file__).absolute().parents[1])
     timed = FunctionTool(add, timeout_s=3, grace_s=0.5).command(ToolRequest(), Path("/ws"))
     assert (timed.timeout_s, timed.grace_s) == (3, 0.5)
 
@@ -245,7 +245,7 @@ def test_preflight_rejects_stdlib_module_alias() -> None:
         FunctionTool("os.path:basename").preflight()
     assert str(caught.value) == expected
     assert_secret_absent(caught.value, SECRET)
-    assert import_root("os.path") == str(Path(os.path.__file__).resolve().parent)
+    assert import_root("os.path") == str(Path(os.path.__file__).absolute().parent)
 
 
 def test_preflight_rejects_package_module_alias(
@@ -332,11 +332,11 @@ def test_import_root_finds_a_sourceless_package(
     try:
         module = importlib.import_module("sourceless_function_package")
         assert Path(module.__file__ or "").name == "__init__.pyc"
-        assert import_root("sourceless_function_package") == str(tmp_path.resolve())
+        assert import_root("sourceless_function_package") == str(tmp_path)
         command = FunctionTool("sourceless_function_package:solve").command(ToolRequest(), tmp_path)
         assert command.argv[-3:] == [
             "--import-root",
-            str(tmp_path.resolve()),
+            str(tmp_path),
             "sourceless_function_package:solve",
         ]
     finally:
@@ -356,7 +356,70 @@ def test_import_root_finds_an_extension_package(
     )
     module.__file__ = str(init)
     monkeypatch.setitem(sys.modules, "extension_function_package", module)
-    assert import_root("extension_function_package") == str(tmp_path.resolve())
+    assert import_root("extension_function_package") == str(tmp_path)
+
+
+_SYMLINK_SOLVE = "def solve(x: int) -> dict[str, int]:\n    return {'x': x}\n"
+
+
+def _link_renamed_module(linked: Path, store: Path) -> str:
+    """Link ``linked/symlinked_function_module.py`` to a differently named file."""
+    (store / "solver_v2.py").write_text(_SYMLINK_SOLVE)
+    (linked / "symlinked_function_module.py").symlink_to(store / "solver_v2.py")
+    return "symlinked_function_module:solve"
+
+
+def _link_renamed_package(linked: Path, store: Path) -> str:
+    """Link ``linked/symlinked_function_package`` to a differently named directory."""
+    package = store / "abc123-symlinked_function_package"
+    package.mkdir()
+    (package / "__init__.py").touch()
+    (package / "core.py").write_text(_SYMLINK_SOLVE)
+    (linked / "symlinked_function_package").symlink_to(package, target_is_directory=True)
+    return "symlinked_function_package.core:solve"
+
+
+def _link_module_with_sibling(linked: Path, store: Path) -> str:
+    """Link a same-name module that imports a sibling found only next to the link."""
+    (linked / "symlinked_function_helper.py").write_text(_SYMLINK_SOLVE)
+    (store / "symlinked_function_user.py").write_text(
+        "from symlinked_function_helper import solve\n"
+    )
+    (linked / "symlinked_function_user.py").symlink_to(store / "symlinked_function_user.py")
+    return "symlinked_function_user:solve"
+
+
+@pytest.mark.parametrize(
+    "link", [_link_renamed_module, _link_renamed_package, _link_module_with_sibling]
+)
+async def test_import_root_keeps_symlinked_module_locations(
+    local_executor: LocalExecutor,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    link: Callable[[Path, Path], str],
+) -> None:  # the root is the sys.path entry the driver imported from, not a link target
+    linked, store = tmp_path / "linked", tmp_path / "store"
+    linked.mkdir()
+    store.mkdir()
+    function = link(linked, store)
+    module_name = function.split(":", 1)[0]
+    monkeypatch.syspath_prepend(str(linked))
+    try:
+        tool = FunctionTool(function)
+        tool.preflight()
+        assert import_root(module_name) == str(linked)
+        assert tool.command(ToolRequest(), tmp_path).argv[-3:] == [
+            "--import-root",
+            str(linked),
+            function,
+        ]
+        req = ToolRequest(inputs={"x": 7})
+        out = await local_executor.submit(function_job(tmp_path, tool, req))
+        assert (out.status, out.data) == (RunStatus.OK, {"x": 7})
+    finally:
+        for name in list(sys.modules):
+            if name.startswith("symlinked_function_"):
+                del sys.modules[name]
 
 
 @pytest.mark.parametrize(
