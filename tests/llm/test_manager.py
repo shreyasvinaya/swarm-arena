@@ -289,7 +289,7 @@ async def test_no_output_type_and_finish_round_stops(
         assert agent.output_type is None
         assert not agent.handoffs
         assert all(isinstance(tool, FunctionTool) for tool in agent.tools)
-        assert agent.tool_use_behavior == {"stop_at_tool_names": ["finish_round"]}
+        assert agent.tool_use_behavior is _manager._stop_after_accepted_finish
         assert kwargs["run_config"].tracing_disabled
         return await original(agent, *args, **kwargs)
 
@@ -1284,6 +1284,34 @@ async def test_first_finish_round_summary_is_preserved(
             report = await AgentsSDKManager(model="opus").run_round(context())
         assert report.summary == summaries[0]
         assert len(fake.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("arguments", "error"),
+    [
+        ({"text": "oops"}, "summary: missing; <field>: extra_forbidden"),
+        ({"summary": 42}, "summary: string_type"),
+        ({}, "summary: missing"),
+    ],
+    ids=["extra-key", "wrong-type", "empty"],
+)
+async def test_rejected_finish_round_lets_the_model_fix_its_call(
+    tmp_path: Path, arguments: dict[str, JsonValue], error: str
+) -> None:
+    fake = register(
+        [FakeTurn(tool_calls=(("finish_round", arguments),)), finish("fixed"), finish("unused")]
+    )
+    async with open_llm_run(tmp_path, config=config()) as run:
+        with llm_scope(run.scope("manager")):
+            report = await AgentsSDKManager(model="opus").run_round(context())
+        assert report == RoundReport(summary="fixed")
+        assert len(fake.calls) == 2
+        outputs = [
+            json.loads(item["output"])
+            for item in fake.calls[1]["input"]
+            if isinstance(item, dict) and item.get("type") == "function_call_output"
+        ]
+        assert outputs == [{"error": error}]
 
 
 async def test_later_finish_round_call_returns_a_soft_tool_error() -> None:
