@@ -789,16 +789,21 @@ def is_provider_failure(exc: BaseException) -> bool:
             litellm.RateLimitError,
             litellm.ServiceUnavailableError,
             litellm.InternalServerError,
+            litellm.BadGatewayError,
             litellm.APIConnectionError,
             litellm.Timeout,
         ),
     ):
         return True
+    # LiteLLM maps some provider replies (for example OpenRouter credit
+    # exhaustion and outages) to a generic APIError that carries only the
+    # upstream HTTP status, so judge the status of every status-bearing type.
+    if isinstance(exc, (litellm.APIError, litellm.BadRequestError)):
+        status = getattr(exc, "status_code", None)
+        if type(status) is int and (status in {401, 402, 403, 429} or status >= 500):
+            return True
     if not isinstance(exc, litellm.BadRequestError):
         return False
-    status = getattr(exc, "status_code", None)
-    if type(status) is int and (status in {401, 402, 403, 429} or status >= 500):
-        return True
     codes: list[str] = []
     body = getattr(exc, "body", None)
     for obj in (exc, body, body.get("error") if isinstance(body, dict) else None):

@@ -1009,6 +1009,7 @@ async def test_admission_gate_refusal_releases_unused_reservation(
         "APIConnectionError",
         "Timeout",
         "BadRequestError",
+        "BadGatewayError",
     ],
 )
 async def test_provider_failures_are_classified(
@@ -1068,6 +1069,48 @@ async def test_provider_failures_are_classified(
             )
 
         assert await anyio.to_thread.run_sync(artifacts_are_safe)
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [(402, True), (500, True), (502, True), (529, True), (400, False), (404, False)],
+)
+async def test_status_bearing_api_errors_are_classified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: int, expected: bool
+) -> None:
+    # LiteLLM maps OpenRouter credit exhaustion and outages to a plain APIError
+    # that carries only the upstream HTTP status.
+    import litellm
+
+    from swarm_arena._errors import ProviderFailed, _core_category
+    from swarm_arena.llm._hooks import is_provider_failure
+
+    error = litellm.APIError(
+        status_code=status,
+        message="private-sentinel",
+        model="private-model",
+        llm_provider="openrouter",
+    )
+    assert is_provider_failure(error) is expected
+    fake = FakeModel([])
+
+    async def fail(*args: Any, **kwargs: Any) -> ModelResponse:
+        raise error
+
+    monkeypatch.setattr(fake, "get_response", fail)
+    raised: type[Exception] = ProviderFailed if expected else litellm.APIError
+    async with open_llm_run(tmp_path, config=config()) as run:
+        scope = run.scope("manager")
+        with llm_scope(scope), pytest.raises(raised) as caught:
+            await invoke(metered(fake))
+        if expected:
+            assert isinstance(caught.value, ProviderFailed)
+            assert caught.value.provider == SPEC.provider
+            assert _core_category(caught.value) is _SignalCategory.PROVIDER
+            assert_secret_absent(caught.value, "private-sentinel")
+        else:
+            assert caught.value is error
+        await drain(scope, wait=False)
 
 
 async def test_other_errors_are_not_provider_failures(
