@@ -13,7 +13,7 @@ from pydantic import BaseModel, ValidationError
 from swarm_arena._agent.manager import LimitReached
 from swarm_arena._agent.runtime import AgentRuntime
 from swarm_arena._agent.tool_run import Inflight, _inflight, _prepare_sync, execute_tool_run
-from swarm_arena._board.arena import ArenaView
+from swarm_arena._board.arena import ArenaView, candidate_group
 from swarm_arena._board.learnings import LEARNING_GUIDE, vet_learning
 from swarm_arena._budget.amount import USD_LIMIT
 from swarm_arena._budget.llm_scope import current_requesting_call
@@ -1026,8 +1026,20 @@ class AgentContext:
         return self._on_loop(read)
 
     def _candidate_goal(self, candidate: Candidate) -> Goal:
-        """Select the goal of the candidate's group, which holds the files it ran on."""
-        return self._rt.group_goals.get(candidate.part or "", self._rt.goal)
+        """Select the goal of the candidate's group, which holds the files it ran on.
+
+        The stored part label is producer-local: an earlier revision or run may
+        have used it for another goal. Own results belong to the agent's group,
+        and snapshot results to the group the fixed view selected them into.
+        """
+
+        def select() -> Goal:
+            rt = self._rt
+            own = any(isinstance(c, Candidate) and c.id == candidate.id for c in rt.own)
+            group = rt.part if own else candidate_group(rt.view, candidate.id)
+            return rt.group_goals.get(group or "", rt.goal)
+
+        return self._on_loop(select)
 
     def _read_artifact(self, sha256: str) -> bytes:
         """Authorize snapshot and own file digests without a prior charged lookup."""

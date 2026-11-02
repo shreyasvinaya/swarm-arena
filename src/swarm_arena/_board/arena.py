@@ -8,7 +8,7 @@ from copy import copy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Condition, RLock, get_ident
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from swarm_arena._board.base import Board, BoardView
 from swarm_arena._board.cache import ArenaCache, LearningFilter, Position, goal_key_digest
@@ -1561,6 +1561,13 @@ class ArenaView(BoardView):
                 raise KeyError(id)
             return rows[0][0]
 
+    def _candidate_group(self, id: str) -> str | None:
+        """Return the current group whose producing key selected a visible candidate."""
+        with self._read():
+            if id not in self._candidate_ids:
+                raise KeyError(id)
+            return self._candidate_groups[id]
+
     def get_learning(self, id: str) -> Learning:
         """Return a namespace learning only when visible at this frontier."""
         with self._read():
@@ -1587,6 +1594,54 @@ class ArenaView(BoardView):
                 return {c.id: c for c, _ in self._pairs(selected)}
 
             return _lineage(read, candidate_id)
+
+
+@runtime_checkable
+class _CandidateGroups(Protocol):
+    """Preserve a fixed view's group assignment through identifier-read wrappers."""
+
+    def _candidate_group(self, id: str) -> str | None:
+        """Return the current group the view selected a visible candidate into."""
+        ...
+
+
+def candidate_group(view: BoardView, id: str) -> str | None:
+    """
+    Return the current declared group a fixed view selected a candidate into.
+
+    An arena view selects candidates by their immutable producing goal key, so
+    the group comes from the view's current plan. The stored ``Candidate.part``
+    is the producer's label, which an earlier revision or run may have given to
+    a different goal. Other views have no such mapping and keep the stored label.
+
+    Parameters
+    ----------
+    view : BoardView
+        Fixed snapshot holding the candidate.
+    id : str
+        Visible candidate identifier.
+
+    Returns
+    -------
+    str or None
+        Current part name, or None for the main group.
+
+    Raises
+    ------
+    KeyError
+        If the candidate is not in the view.
+
+    Examples
+    --------
+    >>> from unittest.mock import Mock
+    >>> view = Mock(spec=BoardView)
+    >>> view.get_candidate.return_value = Mock(part="a")
+    >>> candidate_group(view, "c-1")
+    'a'
+    """
+    if isinstance(view, _CandidateGroups):
+        return view._candidate_group(id)
+    return view.get_candidate(id).part
 
 
 def past_run_repeat_entries(view: BoardView, run_id: str) -> list[tuple[str, Candidate]]:
