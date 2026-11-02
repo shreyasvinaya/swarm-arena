@@ -3,6 +3,7 @@ from dataclasses import dataclass, field, replace
 from typing import cast
 from unittest.mock import Mock
 
+import anyio
 import pytest
 
 from swarm_arena import Goal, Limits, RoundSpec, ScriptTool
@@ -208,6 +209,46 @@ def test_lookup_rules(
 def test_nondeterministic_always_runs() -> None:
     idx = RepeatIndex("this-run", [("k", _c(RunStatus.OK, agent="t/a"))])
     assert idx.lookup("k", agent="t/a", deterministic=False).action == "run"
+
+
+async def test_wait_runs_returns_after_the_in_flight_run_ends() -> None:
+    idx = RepeatIndex("this-run")
+    await idx.wait_runs("k")  # nothing in flight
+    run = idx.begin_run("k")
+    waited: list[str] = []
+
+    async def wait() -> None:
+        await idx.wait_runs("k")
+        waited.append(idx.lookup("k", agent="t/a", deterministic=True).action)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(wait)
+        await anyio.wait_all_tasks_blocked()
+        assert waited == []
+        idx.add("k", _c(RunStatus.OK, agent="t/a"))
+        idx.end_run("k", run)
+    assert waited == ["refuse"]
+
+
+async def test_wait_runs_follows_a_newer_run_and_ignores_a_stale_end() -> None:
+    idx = RepeatIndex("this-run")
+    first = idx.begin_run("k")
+    done: list[bool] = []
+
+    async def wait() -> None:
+        await idx.wait_runs("k")
+        done.append(True)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(wait)
+        await anyio.wait_all_tasks_blocked()
+        idx.end_run("k", first)
+        second = idx.begin_run("k")  # a woken waiter's rerun, before this waiter resumes
+        idx.end_run("k", first)  # idempotent; the newer run stays in flight
+        await anyio.wait_all_tasks_blocked()
+        assert done == []
+        idx.end_run("k", second)
+    assert done == [True]
 
 
 def test_add_records_own_entries() -> None:
