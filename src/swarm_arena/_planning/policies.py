@@ -352,7 +352,8 @@ class Chain(Policy):
     Merge policies in order, keeping the first reason for each pruning target.
 
     References are resolved and cached on first use. Construction never imports
-    member components. The merged decision is guarded again for group survival.
+    member components. The merged decision is guarded again for group survival,
+    so when a group's last live team must be kept, earlier members' prunes win.
 
     Parameters
     ----------
