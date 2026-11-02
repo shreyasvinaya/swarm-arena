@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from swarm_arena._model.planning_types import Decision, RoundState
 from swarm_arena._model.ref import Configurable
 from swarm_arena._model.results import AgentStatus
+from swarm_arena._scoring import ranking
 
 _INACTIVE = frozenset({AgentStatus.PRUNED, AgentStatus.STOPPED, AgentStatus.WATCHDOG_STOPPED})
 
@@ -71,9 +72,26 @@ def _live_agents(state: RoundState) -> dict[str, list[str]]:
     }
 
 
+def _selectable(state: RoundState, group: str | None) -> bool:
+    """Report whether convergence can select one of a group's scored candidates."""
+    if group is not None or not state.plan.converge.allow_partial:
+        # Parts join only complete candidates, as policies rank them.
+        return bool(state.ranked(group))
+    identity = state.ranking_identity.get(None)
+    return identity is not None and bool(
+        ranking.ranked(
+            (candidate for candidate in state.candidates if candidate.part is None),
+            state.scores,
+            identity=identity,
+            fidelity=None,
+            allow_partial=True,
+        )
+    )
+
+
 def guard(decision: Decision, state: RoundState) -> Decision:
     """
-    Drop unsafe prunes and mark an empty final ranking as no result.
+    Drop unsafe prunes and mark a final round with nothing to select as no result.
 
     Parameters
     ----------
@@ -86,7 +104,10 @@ def guard(decision: Decision, state: RoundState) -> Decision:
     -------
     Decision
         A new decision preserving starved agents and at least one live team
-        per group. Neither the input decision nor the round state is modified.
+        per group. On the final round, ``no_result`` is set when no group has
+        a candidate that convergence could select: a complete passing one, or
+        for the main goal a scored partial one when ``converge.allow_partial``
+        is set. Neither the input decision nor the round state is modified.
 
     Examples
     --------
@@ -116,6 +137,6 @@ def guard(decision: Decision, state: RoundState) -> Decision:
         remaining[team].difference_update(targets)
         prune[address] = reason
     no_result = decision.no_result
-    if state.round == state.rounds_total and not any(state.ranked(group) for group in groups):
+    if state.round == state.rounds_total and not any(_selectable(state, group) for group in groups):
         no_result = "no passing candidate"
     return Decision(prune=prune, no_result=no_result, policy=decision.policy)

@@ -133,6 +133,26 @@ async def test_all_judge_errors_writes_no_result(env: EngineEnv) -> None:
     assert json.loads(env.store.read("goals/g/solution.json").data)["status"] == "no_result"
 
 
+async def test_allow_partial_selects_a_scored_partial_when_no_complete_candidate(
+    env: EngineEnv,
+) -> None:
+    from _fakes.tools import WRITE, PyTool
+
+    code = WRITE.format("{'data': {'y': 3.0}}") + "; import time; time.sleep(600)"
+    plan = _tool_plan(
+        _plan(teams=1, rounds=1), Ref.of(PyTool({"code": code, "timeout_s": 0.5, "grace_s": 0.1}))
+    )
+    plan = plan.model_copy(
+        update={"converge": plan.converge.model_copy(update={"allow_partial": True})}
+    )
+    out = await GoalRunner(env.deps, goal_id="g", plan=plan, replanner=None).run()
+    assert (out.status, out.reason) == ("finished", None)
+    [finalist] = out.finalists
+    assert (finalist.output.partial, finalist.output.data) == (True, {"y": 3.0})
+    assert env.events("decision")[-1].payload["decision"]["no_result"] is None
+    assert env.events("final_order")[-1].payload["candidate_ids"] == [finalist.id]
+
+
 @pytest.mark.parametrize("flag", ["stop", "run_budget"])
 async def test_stop_without_passing_candidate_records_selection_reason(
     env: EngineEnv, flag: str

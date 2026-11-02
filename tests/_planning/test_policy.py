@@ -1,6 +1,6 @@
 import pytest
 
-from swarm_arena import AgentSpec, Goal, PartSpec, Plan, Ref, Score, TeamSpec
+from swarm_arena import AgentSpec, ConvergeSpec, Goal, PartSpec, Plan, Ref, Score, TeamSpec
 from swarm_arena._planning.policy import Policy, guard
 from swarm_arena.board import Candidate
 from swarm_arena.manager import AgentStatus
@@ -8,6 +8,7 @@ from swarm_arena.planning import Decision, RoundState
 from swarm_arena.tool import ToolOutput, ToolRequest
 
 IDENTITY = ("quality", "rubric", "")
+NO_PASS = "no passing candidate"
 
 
 def _state(
@@ -125,6 +126,34 @@ def test_guard_no_result_uses_all_groups_and_only_final_round() -> None:
     assert guard(Decision(), st).no_result is None
     assert guard(Decision(), _state({"t": {"a": None}})).no_result is None
     assert guard(Decision(no_result="existing"), st).no_result == "existing"
+
+
+def _partial(state: RoundState, *, allow_partial: bool) -> RoundState:
+    output = ToolOutput(status="timeout", partial=True, data={"v": 3.0})
+    return state.model_copy(
+        update={
+            "plan": state.plan.model_copy(
+                update={
+                    "converge": ConvergeSpec(mode="select", allow_partial=allow_partial),
+                }
+            ),
+            "candidates": [c.model_copy(update={"output": output}) for c in state.candidates],
+        }
+    )
+
+
+@pytest.mark.parametrize(("allow_partial", "expected"), [(True, None), (False, NO_PASS)])
+def test_guard_final_round_counts_scored_partials_only_when_converge_allows_them(
+    allow_partial: bool, expected: str | None
+) -> None:
+    st = _partial(_state({"t": {"a": 3}}, round=3, rounds_total=3), allow_partial=allow_partial)
+    assert guard(Decision(), st).no_result == expected
+    assert st.ranked(None) == []
+
+
+def test_guard_final_round_ignores_partial_part_candidates_converge_cannot_join() -> None:
+    st = _state({}, parts={"p": {"u": {"b": 1}}}, round=3, rounds_total=3)
+    assert guard(Decision(), _partial(st, allow_partial=True)).no_result == NO_PASS
 
 
 def test_policy_is_abstract() -> None:
