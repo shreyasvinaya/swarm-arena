@@ -18,7 +18,7 @@ from _fakes.planning_llm import planner_config, planner_output
 from _fakes.run import all_events
 from _fakes.secrecy import assert_secret_absent
 
-from swarm_arena import Goal, Limits, PartSpec, Plan, Ref, RoundSpec
+from swarm_arena import ConvergeSpec, Goal, Limits, PartSpec, Plan, Ref, RoundSpec
 from swarm_arena._budget.llm_scope import LLMScope, llm_scope
 from swarm_arena._budget.tranche import Tranche, TrancheOutcome
 from swarm_arena._model.planning_types import History
@@ -578,6 +578,43 @@ def test_replan_without_output_rounds_keeps_the_schedule(tmp_path: Path) -> None
     output = planner_output()
     output["rounds"] = []
     assert _convert(tmp_path, output, current, 1).rounds == current.rounds
+
+
+def _human_converge(**update: Any) -> ConvergeSpec:
+    return ConvergeSpec(
+        top_n=1,
+        distinct=False,
+        allow_partial=True,
+        min_improvement=0.5,
+        round=RoundSpec(tool_overrides={"epochs": 3}, tool_timeout_s=30.0, fidelity="full"),
+        parents_per_part=2,
+        max_join_attempts=3,
+    ).model_copy(update=update)
+
+
+@pytest.mark.parametrize("top_n", [1, 3])
+def test_replan_restating_converge_keeps_human_only_settings(tmp_path: Path, top_n: int) -> None:
+    current = _convert(tmp_path, planner_output()).model_copy(
+        update={"converge": _human_converge()}
+    )
+    output = planner_output()
+    output["converge"] = {"mode": "select", "top_n": top_n}
+    assert _convert(tmp_path, output, current, 1).converge == _human_converge(top_n=top_n)
+    assert _convert(tmp_path, output).converge == ConvergeSpec(top_n=top_n)
+
+
+def test_replan_converge_team_keeps_human_only_settings(tmp_path: Path) -> None:
+    current = _convert(tmp_path, planner_output()).model_copy(
+        update={"converge": _human_converge()}
+    )
+    output = planner_output()
+    team = output["teams"][0] | {"name": "join"}
+    output["converge"] = {"mode": "team", "top_n": 2, "team": team}
+    result = _convert(tmp_path, output, current, 1)
+    assert result.converge.team is not None
+    assert result.converge.team.name == "join"
+    expected = _human_converge(mode="team", top_n=2, team=result.converge.team)
+    assert result.converge == expected
 
 
 @pytest.mark.parametrize(

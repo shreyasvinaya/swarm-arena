@@ -145,7 +145,8 @@ def plan_from_output(
     catalog : PlannerCatalog
         Human-approved component entries.
     current : Plan or None
-        Current revision, whose explicitly kept components retain identity.
+        Current revision, whose explicitly kept components retain identity. A
+        replan keeps its converge settings other than mode, top_n and team.
     rounds_done : int
         Completed ordinary rounds, including implicit schedules.
     limits : Limits
@@ -231,15 +232,18 @@ def plan_from_output(
             for row in data.get("rounds", [])
         ]
         converge_data = data.get("converge")
-        converge = (
-            (current.converge if current else ConvergeSpec())
-            if converge_data is None
-            else ConvergeSpec(
+        converge = current.converge if current else ConvergeSpec()
+        if converge_data is not None:
+            settable = ConvergeSpec(
                 mode=converge_data.get("mode", "select"),
                 top_n=converge_data.get("top_n", 2),
                 team=team(converge_data["team"]) if converge_data.get("team") is not None else None,
             )
-        )
+            # The schema exposes only mode, top_n and team; a replan keeps every other
+            # human converge setting of the current revision.
+            converge = converge.model_copy(
+                update={"mode": settable.mode, "top_n": settable.top_n, "team": settable.team}
+            )
         if current is not None:
             checks = [*current.checks, *checks]
             judges, ranking, policy = current.judges, current.ranking, current.policy
