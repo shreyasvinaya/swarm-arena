@@ -240,7 +240,7 @@ def test_driver_import_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     root = tmp_path / "mods"
     _write_module(root / "modx_d.py")
     monkeypatch.syspath_prepend(str(root))
-    assert driver_import_roots(_function_job("modx_d:f")) == (str(root.resolve()),)
+    assert driver_import_roots(_function_job("modx_d:f")) == (str(root),)
     assert driver_import_roots(_job()) == ()
     assert driver_import_roots(make_job()) == ()
 

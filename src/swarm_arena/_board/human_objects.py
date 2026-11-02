@@ -200,6 +200,13 @@ def _check_folder_payload(folder: _Folder, objects: Iterable[HumanObject]) -> No
         raise _core_error(ValueError, "human object kind does not match folder")
 
 
+def _check_learning_namespace(name: str, objects: Iterable[HumanObject]) -> None:
+    """Keep each added learning in the namespace of the object that carries it."""
+    namespace = name.split("/", 1)[0]
+    if any(obj.learning is not None and obj.learning.namespace != namespace for obj in objects):
+        raise _core_error(ValueError, "human learning namespace does not match object")
+
+
 def write_human_objects(
     arena: Store,
     namespace: str,
@@ -303,6 +310,12 @@ def read_human_object(arena: Store, name: str) -> list[HumanObject]:
     list[HumanObject]
         Validated operations in file order. Empty files contain no operations.
 
+    Raises
+    ------
+    ValueError
+        If the location is not reserved, a line is invalid, an operation does
+        not match the folder, or an added learning names another namespace.
+
     Examples
     --------
     >>> objects = read_human_object(arena, key)  # doctest: +SKIP
@@ -310,4 +323,5 @@ def read_human_object(arena: Store, name: str) -> list[HumanObject]:
     folder = _validate_human_key(name)
     objects = [HumanObject.model_validate_json(line) for line in arena.read(name).data.splitlines()]
     _check_folder_payload(folder, objects)
+    _check_learning_namespace(name, objects)
     return objects

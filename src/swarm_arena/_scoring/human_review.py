@@ -10,7 +10,6 @@ from contextlib import suppress
 from datetime import datetime
 from functools import partial
 from pathlib import Path
-from tempfile import gettempdir
 from typing import Any, Final, TypeVar
 from urllib.parse import quote, urlsplit
 
@@ -580,6 +579,7 @@ class HumanReview:
         from swarm_arena._engine.resume import _take_over
         from swarm_arena._engine.run import (
             _close_stop_watcher,
+            _local_journal_path,
             _supervise_initialization,
             _supervise_writer,
         )
@@ -621,12 +621,7 @@ class HumanReview:
         try:
             head = lease.doc.head
             assert head is not None
-            path = (
-                Path(gettempdir())
-                / f"swarm-arena-{os.getuid()}"
-                / "journals"
-                / f"{run_id}-e{lease.doc.epoch}.jsonl"
-            )
+            path = _local_journal_path(run_id, lease.doc.epoch)
             completed = False
             async with (
                 _supervise_initialization(store, lease.doc.epoch, stops, None, config),

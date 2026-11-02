@@ -266,14 +266,17 @@ def track_inflight(registry: Inflight) -> Generator[None]:
 class _CommandJournal(Executor):
     """Forward command jobs and record successful returns in their journal."""
 
-    def __init__(self, journal: JournalWriter, executor: Executor) -> None:
+    def __init__(
+        self, journal: JournalWriter, executor: Executor, *, generation: int | None
+    ) -> None:
         super().__init__()
         self._journal = journal
         self._executor = executor
+        self._generation = generation
 
     async def submit(self, job: Job) -> ToolOutput:
         output = await self._executor.submit(job)
-        output = await _prepare_sync(_prepare_command_output, output)
+        output = await _prepare_sync(_prepare_command_output, output, generation=self._generation)
         self._journal.append(
             EventDraft(
                 type=EventType.COMMAND_END,
@@ -310,7 +313,9 @@ def command_journal(
     Returns
     -------
     tuple[Executor, Callable[[Job.Started], Awaitable[None]]]
-        Executor wrapper and the callback to place on command jobs.
+        Executor wrapper and the callback to place on command jobs. A command
+        that is running when the round stops gracefully still records its start
+        and completion; after an immediate stop both raise ``LimitReached``.
 
     Examples
     --------
@@ -337,7 +342,7 @@ def command_journal(
             )
         )
 
-    return _CommandJournal(journal, executor), on_started
+    return _CommandJournal(journal, executor, generation=generation), on_started
 
 
 def _draft(rt: AgentRuntime, type: EventType, **payload: Any) -> EventDraft:

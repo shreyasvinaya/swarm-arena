@@ -37,9 +37,9 @@ from agents import (
     RunConfig,
     RunHooks,
     Runner,
+    ToolsToFinalOutputResult,
     Usage,
 )
-from agents.agent import StopAtTools
 from agents.exceptions import AgentsException, UserError
 from agents.extensions.models.litellm_model import LitellmModel
 from agents.models._retry_runtime import provider_managed_retries_disabled
@@ -482,9 +482,11 @@ def test_runner_run_and_tool_context() -> None:
         inspect.signature(Runner.run).parameters
     )
     assert "tool_call_id" in {f.name for f in dataclasses.fields(ToolContext)}
-    assert StopAtTools(stop_at_tool_names=["finish_round"]) == {
-        "stop_at_tool_names": ["finish_round"]
-    }
+    assert [field.name for field in dataclasses.fields(ToolsToFinalOutputResult)] == [
+        "is_final_output",
+        "final_output",
+    ]
+    assert ToolsToFinalOutputResult(is_final_output=False).final_output is None
 
 
 def test_cache_constructor_parameters() -> None:

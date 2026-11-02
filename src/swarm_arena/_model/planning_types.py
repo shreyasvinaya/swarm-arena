@@ -43,7 +43,8 @@ class Decision(FrozenModel):
         Returns
         -------
         Decision
-            New decision retaining the first non-None no-result reason and joining
+            New decision listing this decision's prunes first, then the other's new
+            targets, retaining the first non-None no-result reason and joining
             nonempty policy names with ``+``. Neither input is modified.
 
         Examples
@@ -52,8 +53,11 @@ class Decision(FrozenModel):
         >>> Decision(policy="first").merge(Decision(policy="second")).policy
         'first+second'
         """
+        prune = dict(self.prune)
+        for name, reason in other.prune.items():
+            prune.setdefault(name, reason)
         return Decision(
-            prune={**other.prune, **self.prune},
+            prune=prune,
             no_result=self.no_result if self.no_result is not None else other.no_result,
             policy="+".join(name for name in (self.policy, other.policy) if name),
         )

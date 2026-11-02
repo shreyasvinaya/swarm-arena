@@ -71,6 +71,16 @@ def test_chain_merges_in_order() -> None:
     assert d.prune["t3"].startswith("KeepTopTeams:")
 
 
+def test_chain_guard_keeps_earlier_member_prunes() -> None:
+    st = _state_by_round({"leader": [10, 10], "newcomer": [1, 2]})
+    assert Chain(KeepTopTeams(1), Patience(rounds=1)).after_round(st).prune == {
+        "newcomer": "KeepTopTeams: rank 2 of 2 (best 2.0)"
+    }
+    assert Chain(Patience(rounds=1), KeepTopTeams(1)).after_round(st).prune == {
+        "leader": "Patience: no improvement for 1 rounds (best 10.0)"
+    }
+
+
 def test_spec_and_ref_forms_build() -> None:
     built = Ref(path="swarm_arena:SuccessiveHalving", config={"keep": 0.5}).build(Policy)
     assert isinstance(built, SuccessiveHalving)

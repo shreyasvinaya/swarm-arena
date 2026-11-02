@@ -555,6 +555,14 @@ Judge-private files are withheld from tool staging, not protected against
 arbitrary same-user code. Use trusted programs; containers are future work.
 See the [isolation boundary](own-files.md#isolation-boundary).
 
+Whatever the executor, the driver mirrors each run's journal locally in
+`tempfile.gettempdir()/swarm-arena-<uid>/journals`. It creates both directories
+as 0700. Like the default workspace root, they and every parent must be owned by
+you or root, and not writable by group or others unless sticky (like `/tmp`).
+Otherwise `run`, `resume`, `reconcile` and `review import` refuse with
+`local journal directory is not safe` before writing any event. Each mirror file
+is created as 0600 and is never written through a symlink, a hard link or a FIFO.
+
 For cluster execution, see the Ray guide's
 [initialization warning](running-on-ray.md#initialization-warning),
 [workspace cleanup limit](running-on-ray.md#workspace-cleanup), and

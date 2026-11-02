@@ -279,7 +279,7 @@ and newest fidelity. The four built-ins are:
 | `KeepTopTeams(k)` | Keep the best `k` live teams in each group by team-best score. Unscored teams rank last; tied teams follow plan order. Prune teams below that cutoff. |
 | `SuccessiveHalving(keep=0.5, min_per_team=1)` | Rank live, non-starved agents in each group by best result; keep `ceil(keep × agent_count)`, then additionally keep each team's best `min_per_team` agents with ranked results. Unscored agents follow scored agents in plan order. Prune other agents, or the whole team when all its live agents would be removed. |
 | `Patience(rounds=2)` | After more than `rounds` history entries, compare the latest cumulative team best with the best `rounds` rounds earlier. Prune when there is no latest score, or when that earlier score exists and the latest key has not improved. Both use the current identity and fidelity. |
-| `Chain(...)` | Apply member policies to the same state in order and merge prunes, keeping the first reason for each target. Guard the merged decision again. |
+| `Chain(...)` | Apply member policies to the same state in order and merge prunes, keeping the first reason for each target. Guard the merged decision again, in member order: when a group's last live team must be kept, earlier members' prunes win. |
 
 Every decision is guarded: already pruned, stopped, and watchdog-stopped agents
 are excluded; a prune targeting a starved agent is dropped; the last live team
