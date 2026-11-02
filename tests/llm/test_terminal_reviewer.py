@@ -388,7 +388,8 @@ async def test_descriptor_input_and_eof(tmp_path: Path, source: str) -> None:
 
 def _editor(tmp_path: Path, body: str) -> str:
     script = tmp_path / "editor"
-    script.write_text("#!/usr/bin/env python3\n" + body)
+    # Use this interpreter: the child gets its sys.path as PYTHONPATH.
+    script.write_text(f"#!{sys.executable}\n" + body)
     script.chmod(0o700)
     return str(script)
 
