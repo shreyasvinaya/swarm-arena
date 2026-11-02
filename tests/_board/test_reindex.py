@@ -195,6 +195,44 @@ def test_reindex_diagnostics_rebuild_once_and_close(
     _unlocked(directory / "toy.sqlite")
 
 
+@pytest.mark.parametrize("namespaces", [["toy", "hello"], []])
+def test_reindex_counts_only_each_namespace_runs(
+    run_config: RunConfig, tmp_path: Path, namespaces: list[str]
+) -> None:
+    directory = tmp_path / "cache"
+    directory.mkdir()
+    for namespace, run_id in (("toy", "toy-1"), ("toy", "toy-2"), ("hello", "hello-1")):
+        _seed(run_config, namespace, run_id)
+    for namespace in ("toy", "hello", "empty"):
+        (directory / f"{namespace}.sqlite").write_bytes(b"stale database")
+    expected = {"hello": 1, "toy": 2} if namespaces else {"empty": 0, "hello": 1, "toy": 2}
+    result = _reindex_with_diagnostics(run_config, namespaces, cache_dir=directory)
+    assert {m.run_id for m in result.frontier.marks} == {"toy-1", "toy-2", "hello-1"}
+    assert result.run_counts == expected
+    assert list(result.run_counts) == sorted(expected)
+
+
+def test_reindex_counts_only_selected_namespaces(run_config: RunConfig, tmp_path: Path) -> None:
+    from swarm_arena import Goal, PartSpec
+
+    run = FakeRun(run_config.run_root, "split")
+    draft = run.plan(parts=["a"])
+    part = PartSpec(name="a", goal=Goal(id="part", namespace="other"))
+    plan = Plan.model_validate(draft.payload["plan"]).model_copy(update={"parts": [part]})
+    run.commit(
+        draft.model_copy(
+            update={"payload": {**draft.payload, "plan": plan.model_dump(mode="json")}}
+        )
+    )
+    for namespace in ("toy", "other"):
+        add_pointer(run_config.arena_root, run, namespace)
+    run._lease.release()
+    _seed(run_config, "other", "other-only")
+    directory = tmp_path / "cache"
+    result = _reindex_with_diagnostics(run_config, ["toy"], cache_dir=directory)
+    assert result.run_counts == {"toy": 1}
+
+
 @pytest.mark.parametrize("stage", ["open", "frontier", "unlink"])
 def test_reindex_failure_releases_resources(
     run_config: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
