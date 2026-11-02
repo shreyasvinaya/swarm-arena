@@ -27,6 +27,7 @@ from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.reader import read_committed
 from swarm_arena._journal.replay import RunState
 from swarm_arena._model.plan import Plan
+from swarm_arena._model.results import Learning
 from swarm_arena._model.run_config import RunConfig
 from swarm_arena._scoring.human_review import HumanReview
 from swarm_arena._store.base import open_store
@@ -341,18 +342,22 @@ def _search(board: ArenaBoard, args: argparse.Namespace, namespaces: list[str]) 
             ),
         )
         for item, superseded in found:
-            markers = [
-                name
-                for name, enabled in (
-                    ("verified", item.verified),
-                    ("human", item.from_human),
-                    ("pinned", item.pinned),
-                    ("hidden", item.hidden),
-                    ("superseded", superseded),
-                )
-                if enabled
-            ]
+            markers = [*_markers(item), *(["superseded"] if superseded else [])]
             print(f"{item.id}\t{item.title}\t{item.author}\t{','.join(markers)}")
+
+
+def _markers(item: Learning) -> list[str]:
+    """Name the frontier-local curation and evidence flags a human curator sees."""
+    return [
+        name
+        for name, enabled in (
+            ("verified", item.verified),
+            ("human", item.from_human),
+            ("pinned", item.pinned),
+            ("hidden", item.hidden),
+        )
+        if enabled
+    ]
 
 
 def _show(board: ArenaBoard, identifier: str) -> None:
@@ -369,8 +374,14 @@ def _show(board: ArenaBoard, identifier: str) -> None:
         )
         print(f"files: {','.join(paths) or '-'}")
     else:
-        item = board.get_learning(identifier)
-        print(f"{item.id}: {item.title}\n{item.text}\nevidence:")
+        # Curation reads include hidden targets, as the viewer's learning page does.
+        with board._read_namespace() as reader:
+            try:
+                item = reader.learning(reader.namespaces(), identifier)
+            except KeyError:
+                raise _core_error(ValueError, f"unknown learning {identifier}") from None
+        print(f"{item.id}: {item.title}\n{item.text}")
+        print(f"markers: {','.join(_markers(item)) or '-'}\nevidence:")
         for candidate_id in item.evidence:
             try:
                 scores = board.scores(candidate_id)
