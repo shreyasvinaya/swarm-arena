@@ -121,7 +121,10 @@ def import_root(module_name: str) -> str:
     Returns
     -------
     str
-        Resolved directory containing the loaded module's real top-level package.
+        Absolute directory containing the loaded module's real top-level package.
+        Symlinks are not followed, so the directory is the ``sys.path`` entry the
+        module was imported from, even when the module file or a package
+        directory is a link to a differently named target.
         A package is known by its spec's submodule search locations, so an
         ``__init__`` that is a sourceless ``.pyc`` or a compiled extension works.
         FunctionTool rejects aliases of that module during preflight.
@@ -146,7 +149,10 @@ def import_root(module_name: str) -> str:
         # A package has submodule search locations, whatever its __init__ file is
         # (.py, a sourceless .pyc, or a compiled extension).
         levels = len(spec.name.split(".")) + (spec.submodule_search_locations is not None)
-        return str(Path(file).resolve().parents[levels - 1])
+        # __file__ is the sys.path entry joined with the module's relative path.
+        # Resolving symlinks could leave that entry, where the module would no
+        # longer be importable under its name.
+        return str(Path(file).absolute().parents[levels - 1])
     except KeyboardInterrupt:
         raise
     except BaseException as error:
