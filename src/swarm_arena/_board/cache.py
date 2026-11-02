@@ -21,6 +21,7 @@ from pydantic import JsonValue
 from swarm_arena._board.human_objects import (
     HumanObject,
     _check_folder_payload,
+    _check_learning_namespace,
     _validate_human_key,
     human_object_order,
 )
@@ -436,8 +437,7 @@ class ArenaCache:
         for name, obj in zip(names, objects, strict=True):
             folder = _validate_human_key(name)
             _check_folder_payload(folder, [obj])
-            if obj.learning is not None and obj.learning.namespace != name.split("/", 1)[0]:
-                raise _core_error(ValueError, "human learning namespace does not match object")
+            _check_learning_namespace(name, [obj])
             grouped.setdefault(name, []).append(obj)
         with self._lock:
             pending: list[str] = []

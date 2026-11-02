@@ -1114,7 +1114,7 @@ def test_cross_namespace_groups_keep_candidates_scores_and_siblings(tmp_path: Pa
         board.close()
 
 
-@pytest.mark.parametrize("kind", ["foreign", "corrupt", "future", "unreadable"])
+@pytest.mark.parametrize("kind", ["foreign", "corrupt", "future", "unreadable", "namespace"])
 def test_frontier_omits_unreadable_human_objects(
     tmp_path: Path,
     board: ArenaBoard,
@@ -1125,7 +1125,7 @@ def test_frontier_omits_unreadable_human_objects(
     import swarm_arena._board.arena as arena_module
 
     run = _seed(tmp_path)
-    _learning(run)
+    hint = _learning(run)
     good = _curate(tmp_path, "pin", "L-1")
     arena = open_store(str(tmp_path / "arena"))
     name = "toy/curation/20261018T130000.000Z-deadbeef.jsonl"
@@ -1135,6 +1135,11 @@ def test_frontier_omits_unreadable_human_objects(
         data = b""
     elif kind == "future":
         data = b'{"schema_version":2,"kind":"pin","learning_id":"L-1","author":"human:a"}'
+    elif kind == "namespace":
+        # Well-formed, but its learning belongs to another namespace's folder.
+        learning = hint.model_copy(update={"id": "L-2", "namespace": "other"})
+        add = HumanObject(kind="add", learning=learning, author="human:a")
+        data = add.model_dump_json().encode() + b"\n"
     else:
         data = secret.encode()
     arena.create(name, data)
