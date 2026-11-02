@@ -51,9 +51,9 @@ example later on this page:
 uv add "swarm-arena[llm]"
 ```
 
-The `llm` and `cache` extras currently require `litellm>=1.107.0rc2,<1.108`.
-LiteLLM 1.107.0 final was not on PyPI when 0.1.0 was prepared; publication awaits
-an owner decision to use the release candidate or wait for the final version.
+The `llm` and `cache` extras require `litellm>=1.107.0rc2,<1.108`. LiteLLM 1.107.0
+final was not on PyPI when 0.1.0 was released, so these extras install that release
+candidate. The core package does not use LiteLLM.
 
 ## Run hello-world
 
