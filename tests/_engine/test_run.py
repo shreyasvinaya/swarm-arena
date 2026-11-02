@@ -296,6 +296,59 @@ async def test_setup_failure_unbinds_and_releases_services(
     assert not events(run_config, "round_started")
 
 
+async def test_local_journal_is_private_and_resume_refuses_an_open_directory(
+    run_config: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+    import stat
+    import tempfile
+
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
+    old = os.umask(0o022)
+    try:
+        await Swarm(run_config).run(plan(rounds=1), run_id="mirror")
+    finally:
+        os.umask(old)
+    journals = temp / f"swarm-arena-{os.getuid()}" / "journals"
+    assert stat.S_IMODE(journals.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(journals.stat().st_mode) == 0o700
+    assert stat.S_IMODE((journals / "mirror-e1.jsonl").stat().st_mode) == 0o600
+    # Someone who can change the directory plants the next epoch's mirror as a link.
+    victim = tmp_path / "victim"
+    victim.write_text("export SAFE=1\n")
+    journals.chmod(0o777)
+    (journals / "mirror-e2.jsonl").symlink_to(victim)
+    with pytest.raises(RuntimeError, match=r"^local journal directory is not safe: "):
+        await Swarm(run_config).resume("mirror")
+    assert victim.read_text() == "export SAFE=1\n"
+    owner = read_owner(LocalStore(Path(run_config.run_root) / "mirror"))
+    assert owner is not None
+    assert owner[0].epoch == 2
+    assert owner[0].expires_at <= utc_now()
+
+
+@pytest.mark.parametrize("open_dir", ["root", "journals"])
+async def test_run_refuses_a_shared_local_journal_directory(
+    run_config: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, open_dir: str
+) -> None:
+    import os
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    root = tmp_path / f"swarm-arena-{os.getuid()}"
+    shared = root if open_dir == "root" else root / "journals"
+    shared.mkdir(parents=True)
+    shared.chmod(0o777)
+    with pytest.raises(RuntimeError, match=r"^local journal directory is not safe: "):
+        await Swarm(run_config).run(plan(rounds=1), run_id="shared")
+    assert list(root.rglob("*.jsonl")) == []
+    owner = read_owner(LocalStore(Path(run_config.run_root) / "shared"))
+    assert owner is not None
+    assert owner[0].expires_at <= utc_now()
+
+
 async def test_completed_resume_bootstrap_does_not_construct_manager(
     run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:

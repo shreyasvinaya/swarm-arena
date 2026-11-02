@@ -529,6 +529,42 @@ async def test_events_also_appended_to_local_file(store: LocalStore, tmp_path: P
     assert len((tmp_path / "journal.local.jsonl").read_text().splitlines()) == 1
 
 
+async def test_local_file_is_private(store: LocalStore, tmp_path: Path) -> None:
+    import os
+    import stat
+
+    old = os.umask(0o022)
+    try:
+        async with _writer(store, tmp_path) as w:
+            w.append(EventDraft(type=EventType.LEARNING))
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE((tmp_path / "journal.local.jsonl").stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("planted", ["symlink", "hardlink", "fifo"])
+async def test_local_file_never_writes_through_a_planted_entry(
+    store: LocalStore, tmp_path: Path, planted: str
+) -> None:
+    import os
+
+    victim = tmp_path / "victim"
+    victim.write_text("export SAFE=1\n")
+    local = tmp_path / "journal.local.jsonl"
+    if planted == "symlink":
+        local.symlink_to(victim)
+    elif planted == "hardlink":
+        os.link(victim, local)
+    else:
+        os.mkfifo(local)
+    async with _writer(store, tmp_path) as w:
+        # A FIFO without a reader would block this synchronous append forever.
+        with pytest.raises(Fenced, match="OSError"):
+            w.append(EventDraft(type=EventType.LEARNING))
+    assert victim.read_text() == "export SAFE=1\n"
+    assert store.list("journal/") == []
+
+
 async def test_unknown_create_not_found_retries(tmp_path: Path) -> None:
     flaky = FlakyStore(LocalStore(tmp_path / "run"), unknown_before_create=1)
     async with _writer(flaky, tmp_path, group_window_s=0) as w:

@@ -1,11 +1,14 @@
 """Serialize journal publication and lease maintenance in one asynchronous task."""
 
+import errno
+import os
+import stat
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from functools import partial
 from hashlib import sha256
 from pathlib import Path
-from typing import Literal, TypeVar
+from typing import Final, Literal, TypeVar
 
 import anyio
 from anyio.abc import TaskGroup
@@ -30,6 +33,9 @@ from swarm_arena._store.base import Store
 from swarm_arena._store.io import _create, _storage_io, _validated_io
 
 _T = TypeVar("_T")
+_MIRROR_FLAGS: Final = (
+    os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+)
 
 
 class JournalWriter:
@@ -327,9 +333,20 @@ class JournalWriter:
         return self._head
 
     def _mirror(self, line: bytes) -> None:
-        """Flush the synchronous local mirror before exposing an admitted event."""
-        self._local_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._local_path.open("ab") as stream:
+        """
+        Flush the synchronous local mirror before exposing an admitted event.
+
+        The file is created as 0600 and opened without following a symlink or
+        blocking on a FIFO. Anything but a regular file of this user with one
+        link is refused, so a planted entry cannot redirect the append.
+        """
+        self._local_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(self._local_path, _MIRROR_FLAGS, 0o600)
+        with os.fdopen(fd, "ab") as stream:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid():
+                raise OSError(errno.EINVAL, "local journal is not a private regular file")
+            os.set_blocking(fd, True)
             stream.write(line)
             stream.flush()
 
