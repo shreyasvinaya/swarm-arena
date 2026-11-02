@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-10-27
+## [0.1.0] - 2026-11-03
 
 ### Added
 
@@ -57,9 +57,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   managers, rubric judges, catalog-authorized planners and curators, bounded human
   approval, model pricing, response and prompt-cache accounting, and opt-in trace
   links. Provider failures retain survivor identities and replayable completion
-  receipts. The supported LiteLLM floor remains `>=1.107.0rc2,<1.108` because
-  1.107.0 final is unavailable; the owner must choose whether to ship with that
-  release candidate or wait before publishing 0.1.0.
+  receipts. The `llm` and `cache` extras require `litellm>=1.107.0rc2,<1.108`;
+  the floor is a LiteLLM release candidate because 1.107.0 final was not on PyPI
+  at release.
 - `RayExecutor`, the `ray` extra and `swarm-arena submit` support resource-aware
   cluster execution and Ray Jobs, checked file transfer, bounded recovery and
   two-step cancellation with data-only partial results. Per-tool LLM gateway keys,

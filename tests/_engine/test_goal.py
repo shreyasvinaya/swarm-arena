@@ -139,8 +139,10 @@ async def test_allow_partial_selects_a_scored_partial_when_no_complete_candidate
     from _fakes.tools import WRITE, PyTool
 
     code = WRITE.format("{'data': {'y': 3.0}}") + "; import time; time.sleep(600)"
+    # The limit must leave a busy runner time to start Python and write the result
+    # first; with no result written, the timeout leaves nothing to select.
     plan = _tool_plan(
-        _plan(teams=1, rounds=1), Ref.of(PyTool({"code": code, "timeout_s": 0.5, "grace_s": 0.1}))
+        _plan(teams=1, rounds=1), Ref.of(PyTool({"code": code, "timeout_s": 5.0, "grace_s": 0.1}))
     )
     plan = plan.model_copy(
         update={"converge": plan.converge.model_copy(update={"allow_partial": True})}
