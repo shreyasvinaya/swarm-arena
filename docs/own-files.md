@@ -29,10 +29,13 @@ Names that both appear in a directory listing are separate entries, even as
 hard links to one file, and two such names that collide after canonical caseless
 folding are refused with both paths named. Each directory is listed once per
 snapshot; the manifest must also have a portable file/directory layout. Every
-glob must match at least one regular file. Symlinks below the plan directory and reserved
-top-level paths (`swarm`, `parents`, `candidate`) are rejected, including case
+glob must match at least one regular file. A selected path with a symlink component and
+reserved top-level paths (`swarm`, `parents`, `candidate`) are rejected, including case
 variants such as `SWARM` and `Parents`. Those names are
 allowed as basenames below an ordinary directory, such as `problem/candidate`.
+A `**` segment never follows a symlink and skips one that the glob does not select,
+so `**/*.physk` ignores the `.venv/bin/python` link of a project virtual environment,
+while `problem/**` still refuses a `problem/data` link.
 
 Once a file set has a manifest, snapshotting reuses it without reading the source
 files again. Source edits or deletion therefore cannot change an existing

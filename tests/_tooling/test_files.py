@@ -72,6 +72,61 @@ def test_symlinks_rejected(tmp_path: Path, artifacts: ArtifactStore, kind: str) 
         snapshot_fileset(FileSet(globs=[glob]), base, artifacts)
 
 
+def _symlink(base: Path, tmp_path: Path, rel: str, kind: str) -> None:
+    """Link ``base/rel`` to a file, directory, or missing file outside ``base``."""
+    target = _write(tmp_path, "outside/file.txt", b"secret-file-contents")
+    if kind == "directory":
+        (base / rel).symlink_to(target.parent, target_is_directory=True)
+    else:
+        if kind == "dangling":
+            target.unlink()
+        (base / rel).symlink_to(target)
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "dangling"])
+@pytest.mark.parametrize(
+    ("glob", "expected"),
+    [
+        ("problem/**/*.txt", ["problem/a.txt", "problem/sub/b.txt"]),
+        ("**/*.txt", ["problem/a.txt", "problem/sub/b.txt"]),
+        ("**/sub/*.txt", ["problem/sub/b.txt"]),
+    ],
+)
+def test_recursive_glob_ignores_unselected_symlinks(
+    tmp_path: Path, artifacts: ArtifactStore, kind: str, glob: str, expected: list[str]
+) -> None:
+    base = tmp_path / "source"
+    for rel in ["problem/a.txt", "problem/sub/b.txt", ".venv/bin/python3.11"]:
+        _write(base, rel)
+    # A project virtual environment links its interpreter and, on Linux, lib64.
+    (base / ".venv/bin/python").symlink_to("python3.11")
+    (base / ".venv/lib").mkdir()
+    (base / ".venv/lib64").symlink_to("lib", target_is_directory=True)
+    _symlink(base, tmp_path, "problem/sub/link", kind)
+    fs = snapshot_fileset(FileSet(globs=[glob]), base, artifacts)
+    assert list(fs.manifest) == expected
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "dangling"])
+@pytest.mark.parametrize(
+    ("glob", "link"),
+    [
+        ("problem/**/*.txt", "problem/sub/link.txt"),
+        ("problem/**", "problem/sub/link"),
+        ("problem/**/**", "problem/sub/link"),
+        ("problem/**/link/*", "problem/sub/link"),
+    ],
+)
+def test_recursive_glob_rejects_selected_symlinks(
+    tmp_path: Path, artifacts: ArtifactStore, kind: str, glob: str, link: str
+) -> None:
+    base = tmp_path / "source"
+    _write(base, "problem/sub/b.txt")
+    _symlink(base, tmp_path, link, kind)
+    with pytest.raises(ValueError, match=f"symlink not allowed: {link}$"):
+        snapshot_fileset(FileSet(globs=[glob]), base, artifacts)
+
+
 @pytest.mark.parametrize("reserved", ["swarm", "parents", "candidate"])
 def test_reserved_names_rejected(tmp_path: Path, artifacts: ArtifactStore, reserved: str) -> None:
     _write(tmp_path, f"{reserved}/x.txt")

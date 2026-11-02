@@ -102,7 +102,13 @@ def _identity(path: Path) -> tuple[int, int]:
 def _glob_files(
     base: Path, pattern: str, listings: dict[Path, dict[str, list[str]]]
 ) -> Iterator[str]:
-    """Expand glob segments using the shared descriptor inspection/listing helpers."""
+    """Expand glob segments using the shared descriptor inspection/listing helpers.
+
+    A symlink is refused when the pattern selects it or passes through it. A
+    non-final ``**`` lists every entry only to find directories to descend
+    into, so it skips a symlink there without following it: the next segment
+    still examines that entry and refuses it if it matches.
+    """
     parts = PurePosixPath(pattern).parts
     if not parts:
         return
@@ -135,6 +141,8 @@ def _glob_files(
         for name in sorted(children):
             relative = f"{parent}/{name}" if parent else name
             link, info = _inspect_path(base, relative)
+            if link == relative and recursive and index + 1 < len(parts):
+                continue  # not selected here; the next segment examines it
             if link is not None:
                 raise ValueError(f"symlink not allowed: {link}")
             if info is None:
@@ -156,7 +164,9 @@ def snapshot_fileset(fs: FileSet, base_dir: Path, artifacts: ArtifactStore) -> F
 
     Already snapshotted sets and sets with no globs are returned unchanged,
     without accessing source files. Each glob must match at least one regular
-    file. Symlinks below the base directory and reserved top-level paths fail.
+    file. A selected path with a symlink component and reserved top-level
+    paths fail. A ``**`` segment never follows a symlink and skips one that
+    the glob does not select, such as ``.venv/bin/python`` under ``**/*.txt``.
     A glob spelling that only a case-insensitive lookup resolves, such as
     ``problem/RUN.py`` for a listed ``run.py``, is recorded once with the
     listed spelling. Names that both appear in a directory listing are two
