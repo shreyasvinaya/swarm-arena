@@ -12,7 +12,7 @@ import pytest
 from _fakes.cleanup import observe_task, settle_tasks
 from _fakes.engine import RtEnv
 from _fakes.gateway import FakeGateway
-from _fakes.tools import WRITE, CommandRaisesTool, PyTool, write_then_sleep
+from _fakes.tools import WRITE, CommandRaisesTool, PyTool, make_job, write_then_sleep
 
 from swarm_arena import FunctionTool, RoundSpec, ScriptCheck
 from swarm_arena._agent.runtime import AgentRuntime
@@ -376,6 +376,57 @@ async def test_check_commands_journal_command_start_and_end(rt_env: RtEnv) -> No
     assert (start.payload["candidate_id"], start.payload["component"]) == (cand.id, "sc")
     assert end.payload["job_id"] == start.payload["job_id"]
     assert start.seq < end.seq
+
+
+async def test_graceful_stop_lets_running_check_command_finish(
+    rt_env: RtEnv, tmp_path: Path
+) -> None:
+    from swarm_arena._model.results import Candidate
+
+    release = tmp_path / "release"
+    code = (
+        f"from pathlib import Path; Path({str(rt_env.marker)!r}).touch(); import time\n"
+        f"while not Path({str(release)!r}).exists(): time.sleep(0.01)\n"
+        + WRITE.format("{'passed': True}")
+    )
+    rt = rt_env.rt_with_checks([("sc", ScriptCheck(command=["python", "-c", code]))])
+    candidates: list[Candidate] = []
+
+    async def run() -> None:
+        candidates.append(
+            await execute_tool_run(rt, {"x": 1.0}, parents=(), replicate=None, edits=None)
+        )
+
+    with anyio.fail_after(60):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run)
+            await rt_env.wait_for(rt_env.marker)  # the check command is running
+            rt_env.inflight.close()  # graceful stop: refuse new work, let this finish
+            await anyio.to_thread.run_sync(release.touch)
+    [cand] = candidates
+    assert [(result.passed, result.reasons) for result in cand.checks] == [(True, [])]
+    start, end = rt_env.events("command_start")[-1], rt_env.events("command_end")[-1]
+    assert end.payload == {"job_id": start.payload["job_id"], "status": "ok"}
+
+
+async def test_immediate_stop_refuses_running_check_command_completion(rt_env: RtEnv) -> None:
+    from swarm_arena._agent.tool_run import command_journal
+
+    class StopNowThenReturn(_QueuedExecutor):
+        async def submit(self, job: Job) -> ToolOutput:
+            rt_env.inflight.close()
+            rt_env.inflight.cancel_all()  # stop --now while the command runs
+            return ToolOutput(status=RunStatus.OK)
+
+    wrapped, _ = command_journal(
+        rt_env.rt.journal,
+        StopNowThenReturn(rt_env.rt.executor),
+        candidate_id="c1",
+        component="check",
+    )
+    with pytest.raises(LimitReached):
+        await wrapped.submit(make_job(id="cmd1"))
+    assert not rt_env.events("command_end")
 
 
 async def test_providers_without_usage_settle_estimated(rt_env: RtEnv) -> None:
