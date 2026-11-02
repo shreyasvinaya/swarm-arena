@@ -19,7 +19,7 @@ from swarm_arena._agent.repeats import COUNTED, RepeatIndex
 from swarm_arena._agent.runtime import AgentCounters, AgentRuntime
 from swarm_arena._agent.tool_run import Inflight, track_inflight
 from swarm_arena._agent.watchdog import Watchdog
-from swarm_arena._board.arena import ArenaView, past_run_repeat_entries
+from swarm_arena._board.arena import ArenaView, candidate_group, past_run_repeat_entries
 from swarm_arena._board.base import Board, BoardView
 from swarm_arena._board.digest import _digest_group_views, build_digest
 from swarm_arena._board.leaderboard import group_judges
@@ -29,7 +29,7 @@ from swarm_arena._budget.llm_scope import LLMScope, llm_scope
 from swarm_arena._budget.tranche import Tranche
 from swarm_arena._engine import stops as provider_module
 from swarm_arena._engine.admission import RunAdmission
-from swarm_arena._engine.parts import part_scoring, team_goal
+from swarm_arena._engine.parts import group_goals, part_scoring, team_goal
 from swarm_arena._engine.stops import (
     ProviderStops,
     RunClock,
@@ -309,6 +309,10 @@ class _SeedView(BoardView):
     def get_candidate(self, id: str) -> Candidate:
         """Read an assigned parent or an ordinary own-group candidate."""
         return self._parents.get(id, self._view).get_candidate(id)
+
+    def _candidate_group(self, id: str) -> str | None:
+        """Report the group an assigned parent's own fixed snapshot selected it into."""
+        return candidate_group(self._parents.get(id, self._view), id)
 
     def scores(self, candidate_id: str) -> list[Score]:
         """Read scores through the same fixed parent snapshot."""
@@ -607,6 +611,7 @@ class RoundRunner:
             private_paths=private_paths,
             rankings=rankings,
             sibling_views=siblings,
+            group_goals=group_goals(self.plan),
             seed_parents=self.seed_parents,
             started_runs=self.started_runs.get(key, 0),
             gateway=deps.gateway,

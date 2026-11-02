@@ -12,7 +12,7 @@ from _fakes.engine import CtxEnv
 from _fakes.secrecy import assert_secret_absent
 from _fakes.tools import AlwaysFailCheck
 
-from swarm_arena import FunctionTool, Limits, Score
+from swarm_arena import FunctionTool, Limits, Score, ScriptTool
 from swarm_arena._agent.context import AgentContext
 from swarm_arena._agent.repeats import RepeatIndex
 from swarm_arena._board.base import BoardView
@@ -851,6 +851,37 @@ async def test_script_candidate_files_authorized_and_fetched_in_worker(
     assert (rt.counters.turns, rt.counters.board_reads) == (1, 1)
     assert len(ctx_env.events("agent_counters")) == 1
     assert (await ctx.run_tool({})).read_ids == [c.id]
+
+
+async def test_script_files_of_a_part_candidate_use_its_part_goal(ctx_env: CtxEnv) -> None:
+    part_ctx = await ctx_env.script_ctx()
+    part_goal = part_ctx.goal
+    main = ctx_env.env.rt
+    overlay = ctx_env.artifacts.put_bytes(b"a = 2\n")
+    c = _candidate(round=1).model_copy(
+        update={"part": "script", "overlay": {"problem/a.phyk": overlay}}
+    )
+    view = await _snapshot(ctx_env, candidates=(c,))
+    ctx = ctx_env.ctx(
+        tool=ScriptTool(command=["python", "main.py"]),
+        view=view,
+        group_goals={"": main.goal, "script": part_goal},
+    )
+    assert ctx.goal.files.manifest == {}
+    assert await ctx.call_action("list_files", {"candidate": c.id}) == {
+        "files": ["problem/a.phyk", "problem/run.py"]
+    }
+    assert await ctx.call_action("read_file", {"path": "problem/run.py", "candidate": c.id}) == {
+        "path": "problem/run.py",
+        "content": "print(1)\n",
+    }
+    assert await ctx.call_action("read_file", {"path": "problem/a.phyk", "candidate": c.id}) == {
+        "path": "problem/a.phyk",
+        "content": "a = 2\n",
+    }
+    run_digest = part_goal.files.manifest["problem/run.py"]
+    assert await anyio.to_thread.run_sync(ctx._read_artifact, run_digest) == b"print(1)\n"
+    assert await ctx.call_action("list_files", {}) == {"files": []}
 
 
 async def test_edit_byte_limit_uses_editable_script(ctx_env: CtxEnv) -> None:

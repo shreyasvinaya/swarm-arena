@@ -56,6 +56,10 @@ class FileViewContext(Protocol):
         """Return a candidate in the agent's view."""
         ...
 
+    def _candidate_goal(self, candidate: Candidate) -> Goal:
+        """Return the main or part goal whose files the candidate ran on."""
+        ...
+
     def _read_artifact(self, sha256: str) -> bytes:
         """Read artifact bytes within the agent's permitted view."""
         ...
@@ -132,12 +136,15 @@ class ReadFileArgs(_ConfigInputModel):
 
 
 def _files(ctx: FileViewContext, candidate: str | None) -> dict[str, str]:
-    """Resolve only files visible through the supplied agent context."""
-    return (
-        ctx.goal.files.manifest
-        if candidate is None
-        else effective_files(ctx.goal, ctx.get_candidate(candidate))
-    )
+    """Resolve only files visible through the supplied agent context.
+
+    A candidate's view starts from its own group's goal, which differs from the
+    agent's goal for a part candidate seen by a main-goal or converge agent.
+    """
+    if candidate is None:
+        return ctx.goal.files.manifest
+    found = ctx.get_candidate(candidate)
+    return effective_files(ctx._candidate_goal(found), found)
 
 
 def _list_files_sync(ctx: FileViewContext, args: ListFilesArgs) -> JsonValue:

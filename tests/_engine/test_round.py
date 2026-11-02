@@ -896,6 +896,168 @@ async def test_converge_inherits_assigned_part_parents(env: EngineEnv) -> None:
     assert out.candidates[0].read_ids == [parent.id]
 
 
+async def test_converge_reads_part_parent_files_from_the_part_goal(env: EngineEnv) -> None:
+    from swarm_arena import ScriptTool
+    from swarm_arena._errors import SoftError
+    from swarm_arena.tool import FileSet
+
+    put = env.deps.artifacts.put_bytes
+    main = Goal(id="g", namespace="n", files=FileSet(manifest={"main/join.py": put(b"join\n")}))
+    part_files = {"part/notes.txt": put(b"notes\n"), "part/run.py": put(b"run\n")}
+    part_goal = Goal(id="sub", namespace="n", files=FileSet(manifest=part_files))
+    part = PartSpec(name="p", goal=part_goal)
+    plan = PLAN.model_copy(update={"goal": main, "parts": [part]})
+    env.deps.journal.append(r0_revision_draft(plan, plan.base_dir))
+    slot = _runner("a")
+    slot.team = slot.team.model_copy(update={"part": "p"})
+    slot.part, slot.goal, slot.goal_key = "p", part.goal, part.goal.key()
+    first = await _prepared_round(
+        env.deps, goal_id="g", plan=plan, agents=[slot], round_spec=RoundSpec(), rounds_left=1
+    ).run(1)
+    parent = first.candidates[0]
+    assert parent.part == "p"
+    seen: dict[str, Any] = {}
+
+    class JoinManager(Manager):
+        async def run_round(self, ctx: AgentContext) -> RoundReport:
+            async def call(key: str, name: str, args: dict[str, Any]) -> None:
+                try:
+                    seen[key] = await ctx.call_action(name, args)
+                except SoftError as error:
+                    seen[key] = str(error)
+
+            await call("main", "list_files", {})
+            await call("parent", "list_files", {"candidate": parent.id})
+            await call("notes", "read_file", {"path": "part/notes.txt", "candidate": parent.id})
+            await call("join", "read_file", {"path": "main/join.py", "candidate": parent.id})
+            return RoundReport(summary="read parts")
+
+    join = _with_manager("join", JoinManager())
+    join.tool_ref = Ref.of(ScriptTool(command=["python", "main/join.py"]))
+    join.spec = join.spec.model_copy(update={"tool": join.tool_ref})
+    join.goal, join.goal_key = main, main.key()
+    out = await _prepared_round(
+        env.deps,
+        goal_id="g",
+        plan=plan,
+        agents=[join],
+        round_spec=RoundSpec(),
+        rounds_left=1,
+        converge=True,
+        seed_parents=[parent.id],
+    ).run(2)
+    assert out.reasons["t/join"] == ""
+    assert seen == {
+        "main": {"files": ["main/join.py"]},
+        "parent": {"files": ["part/notes.txt", "part/run.py"]},
+        "notes": {"path": "part/notes.txt", "content": "notes\n"},
+        "join": "no such file: main/join.py",
+    }
+
+
+async def test_renamed_part_candidate_files_follow_the_view_group(env: EngineEnv) -> None:
+    from swarm_arena import ScriptTool
+    from swarm_arena._errors import SoftError
+    from swarm_arena.tool import FileSet
+
+    put = env.deps.artifacts.put_bytes
+    main = Goal(id="g", namespace="n", files=FileSet(manifest={"main/join.py": put(b"join\n")}))
+    goal_a = Goal(
+        id="sub-a",
+        namespace="n",
+        files=FileSet(manifest={"part_a/notes.txt": put(b"a\n"), "part_a/run.py": put(b"ra\n")}),
+    )
+    goal_b = Goal(
+        id="sub-b",
+        namespace="n",
+        files=FileSet(manifest={"part_b/notes.txt": put(b"b\n"), "part_b/run.py": put(b"rb\n")}),
+    )
+    # Revision 0 names goal_a "x"; revision 1 renames it "a" and gives "x" to goal_b.
+    plan = PLAN.model_copy(update={"goal": main, "parts": [PartSpec(name="x", goal=goal_a)]})
+    env.deps.journal.append(r0_revision_draft(plan, plan.base_dir))
+    producer = _runner("p")
+    producer.team = producer.team.model_copy(update={"part": "x"})
+    producer.part, producer.goal, producer.goal_key = "x", goal_a, goal_a.key()
+    first = await _prepared_round(
+        env.deps, goal_id="g", plan=plan, agents=[producer], round_spec=RoundSpec(), rounds_left=1
+    ).run(1)
+    old = first.candidates[0]
+    assert old.part == "x"
+    revised = plan.model_copy(
+        update={
+            "revision": 1,
+            "parts": [PartSpec(name="a", goal=goal_a), PartSpec(name="x", goal=goal_b)],
+        }
+    )
+    for draft in (
+        EventDraft(type="round_closed", goal_id="g", round=1, payload={"round": 1}),
+        EventDraft(
+            type="plan_revision",
+            goal_id="g",
+            payload={"plan": revised.model_dump(mode="json"), "origin": "human", "first_round": 2},
+        ),
+    ):
+        env.deps.journal.append(draft)
+    seen: dict[str, dict[str, Any]] = {}
+
+    class Reader(Manager):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+
+        async def run_round(self, ctx: AgentContext) -> RoundReport:
+            async def call(name: str, args: dict[str, Any]) -> Any:
+                try:
+                    return await ctx.call_action(name, args)
+                except SoftError as error:
+                    return str(error)
+
+            seen[self.name] = {
+                "list": await call("list_files", {"candidate": old.id}),
+                "own": await call("read_file", {"path": "part_a/notes.txt", "candidate": old.id}),
+                "other": await call("read_file", {"path": "part_b/notes.txt", "candidate": old.id}),
+            }
+            return RoundReport(summary="read the renamed part")
+
+    def reader(name: str, goal: Goal, part: str | None) -> AgentSlot:
+        slot = _with_manager(name, Reader(name))
+        slot.tool_ref = Ref.of(ScriptTool(command=["python", "run.py"]))
+        slot.spec = slot.spec.model_copy(update={"tool": slot.tool_ref})
+        slot.team = slot.team.model_copy(update={"part": part})
+        slot.part, slot.goal, slot.goal_key = part, goal, goal.key()
+        return slot
+
+    second = await _prepared_round(
+        env.deps,
+        goal_id="g",
+        plan=revised,
+        agents=[reader("main", main, None), reader("pa", goal_a, "a")],
+        round_spec=RoundSpec(),
+        rounds_left=2,
+    ).run(2)
+    assert second.reasons == {"t/main": "", "t/pa": ""}
+    env.deps.journal.append(
+        EventDraft(type="round_closed", goal_id="g", round=2, payload={"round": 2})
+    )
+    third = await _prepared_round(
+        env.deps,
+        goal_id="g",
+        plan=revised,
+        agents=[reader("join", main, None)],
+        round_spec=RoundSpec(),
+        rounds_left=1,
+        converge=True,
+        seed_parents=[old.id],
+    ).run(3)
+    assert third.reasons["t/join"] == ""
+    expected = {
+        "list": {"files": ["part_a/notes.txt", "part_a/run.py"]},
+        "own": {"path": "part_a/notes.txt", "content": "a\n"},
+        "other": "no such file: part_b/notes.txt",
+    }
+    assert seen == {"main": expected, "pa": expected, "join": expected}
+
+
 async def test_part_unnamed_ranking_and_digest_round(env: EngineEnv) -> None:
     from swarm_arena import PartSpec
     from swarm_arena._model.results import Score
