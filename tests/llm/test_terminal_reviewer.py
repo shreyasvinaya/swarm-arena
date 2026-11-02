@@ -4,6 +4,7 @@ import json
 import os
 import pty
 import select
+import shlex
 import signal
 import subprocess
 import sys
@@ -387,10 +388,30 @@ async def test_descriptor_input_and_eof(tmp_path: Path, source: str) -> None:
 
 
 def _editor(tmp_path: Path, body: str) -> str:
+    # Run the body with this interpreter: the child gets its sys.path as PYTHONPATH.
+    # The quoted path stays out of the shebang (spaces, length); exec keeps the PID.
+    program = tmp_path / "editor.py"
+    program.write_text(body)
     script = tmp_path / "editor"
-    script.write_text("#!/usr/bin/env python3\n" + body)
+    script.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(program))} "$@"\n'
+    )
     script.chmod(0o700)
     return str(script)
+
+
+def test_editor_runs_with_an_interpreter_path_that_has_a_space(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interpreter = tmp_path / "a venv" / "python"
+    interpreter.parent.mkdir()
+    interpreter.symlink_to(sys.executable)
+    monkeypatch.setattr(sys, "executable", str(interpreter))
+    editor = _editor(tmp_path, "import os, sys\nprint(os.getpid(), sys.argv[1:])\n")
+    with subprocess.Popen([editor, "a plan.toml"], stdout=subprocess.PIPE, text=True) as process:
+        stdout, _ = process.communicate(timeout=60)
+    assert process.returncode == 0
+    assert stdout == f"{process.pid} ['a plan.toml']\n"
 
 
 async def test_edit_runs_the_editor(tmp_path: Path) -> None:
