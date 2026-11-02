@@ -350,10 +350,11 @@ uv run swarm-arena resume .swarm-arena/runs/<run-id>
 uv run swarm-arena reconcile .swarm-arena/runs/<run-id>
 ```
 
-Resume uses the run's saved `run.toml`. To supply a replacement configuration,
-use `resume RUN_DIR --config RUN_TOML`; `--force` permits an explicit ownership
-takeover. See [Limits and safety](limits-and-safety.md) before changing limits or
-forcing takeover.
+Resume uses the run's saved `run.toml` with the journal's committed limits, so
+limits raised by an earlier resume stay in effect. To supply a replacement
+configuration, use `resume RUN_DIR --config RUN_TOML`; `--force` permits an
+explicit ownership takeover. See [Limits and safety](limits-and-safety.md)
+before changing limits or forcing takeover.
 
 Reconcile uses the same saved-configuration addressing and accepts
 `reconcile RUN_DIR --config RUN_TOML`. Run directories and run roots must be

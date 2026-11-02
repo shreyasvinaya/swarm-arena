@@ -12,6 +12,7 @@ from swarm_arena._journal.lease import Lease, read_owner
 from swarm_arena._journal.reader import read_chain
 from swarm_arena._journal.replay import RunState
 from swarm_arena._model.base import FrozenModel
+from swarm_arena._model.limits import Limits
 from swarm_arena._model.plan import Plan
 from swarm_arena._model.results import Candidate
 from swarm_arena._scoring.ranking import ranked
@@ -263,6 +264,22 @@ def _read_status(run_root: str, run_id: str) -> StatusReport:
         spent=_spent(state),
         lost=len(state.lost),
     )
+
+
+def _read_limits(run_root: str, run_id: str) -> Limits | None:
+    """Replay the committed effective limits, including every ``limits_changed``.
+
+    Returns None when the run has no authority or no committed run configuration,
+    leaving that refusal to the caller's own resume validation.
+    """
+    store = open_store(run_root).child(run_id)
+    owner = read_owner(store)
+    if owner is None or owner[0].head is None:
+        return None
+    events = [event for _, batch in read_chain(store, owner[0].head) for event in batch]
+    if not any(event.type == EventType.RUN_CONFIG for event in events):
+        return None
+    return RunState.from_events(events).config.limits
 
 
 async def read_status(run_root: str, run_id: str) -> StatusReport:

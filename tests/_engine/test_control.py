@@ -12,6 +12,7 @@ from swarm_arena._engine.control import (
     GoalStatus,
     SpendTotal,
     StatusReport,
+    _read_limits,
     format_status,
     read_status,
     request_stop,
@@ -20,7 +21,9 @@ from swarm_arena._engine.control import (
 from swarm_arena._journal.event import Event, EventType
 from swarm_arena._journal.lease import Head, Lease, OwnerDoc, read_owner
 from swarm_arena._journal.segment import encode_segment
+from swarm_arena._model.limits import Limits
 from swarm_arena._model.results import Score
+from swarm_arena._model.run_config import RunConfig
 from swarm_arena._store.base import Store, open_store
 
 
@@ -179,6 +182,31 @@ async def test_status_no_owner_and_empty_expired_owner(run_root: Path) -> None:
     assert not rep.owner_live
     assert rep.goals == {}
     assert "owner expired" in format_status(rep)
+
+
+def test_read_limits_replays_committed_limit_changes(run_root: Path) -> None:
+    assert _read_limits(str(run_root), "missing") is None
+    _released_run(run_root, "empty")
+    assert _read_limits(str(run_root), "empty") is None
+    store = _live_run(run_root, "r1")
+    _commit(store, _events())
+    assert _read_limits(str(run_root), "r1") is None
+    store = _live_run(run_root, "r2")
+    start, raised = Limits(max_usd=10), Limits(max_usd=20, run_timeout_s=90000)
+    config = RunConfig(limits=start).model_dump(mode="json")
+    _commit(
+        store,
+        [
+            _event(1, "run_config", {"config": config}, run_id="r2"),
+            _event(
+                2,
+                "limits_changed",
+                {"old": start.model_dump(mode="json"), "new": raised.model_dump(mode="json")},
+                run_id="r2",
+            ),
+        ],
+    )
+    assert _read_limits(str(run_root), "r2") == raised
 
 
 async def test_status_preserves_one_identity_fidelity_and_tuple_value(run_root: Path) -> None:

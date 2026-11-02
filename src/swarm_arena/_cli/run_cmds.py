@@ -3,9 +3,10 @@
 For example, ``swarm-arena run --yes run.toml plans/`` loads sorted TOML
 plans. Without ``--yes``, approval requires a terminal and accepts only y/yes.
 Declining approval leaves the run and artifact roots unwritten. Resume uses
-``RUN_DIR/run.toml`` unless ``--config`` supplies an override, and always
-selects the run root from RUN_DIR's resolved parent. Ctrl-C exits 130 after
-cancellation cleanup and prints ``interrupted`` without a traceback.
+``RUN_DIR/run.toml`` with the journal's committed limits, so limits raised by
+an earlier resume carry over, unless ``--config`` supplies an override. It
+always selects the run root from RUN_DIR's resolved parent. Ctrl-C exits 130
+after cancellation cleanup and prints ``interrupted`` without a traceback.
 """
 
 import argparse
@@ -25,7 +26,7 @@ from typing import TextIO
 import anyio
 from anyio import wait_readable
 
-from swarm_arena._engine.control import format_status, read_status, request_stop
+from swarm_arena._engine.control import _read_limits, format_status, read_status, request_stop
 from swarm_arena._engine.solution import SolutionDocument
 from swarm_arena._engine.swarm import Swarm
 from swarm_arena._model.canonical import utc_now
@@ -275,11 +276,19 @@ def _stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _saved_config(run_dir: Path) -> RunConfig:
+    """Load the start-time run.toml with the committed limits replayed over it."""
+    config = RunConfig.load(run_dir / "run.toml")
+    limits = _read_limits(str(run_dir.parent), run_dir.name)
+    return config if limits is None else config.model_copy(update={"limits": limits})
+
+
 async def _resume_async(args: argparse.Namespace) -> None:
     """Load saved or override settings and resume the run at the given location."""
-    config = await anyio.to_thread.run_sync(
-        RunConfig.load, args.config if args.config is not None else args.run_dir / "run.toml"
-    )
+    if args.config is not None:
+        config = await anyio.to_thread.run_sync(RunConfig.load, args.config)
+    else:
+        config = await anyio.to_thread.run_sync(_saved_config, args.run_dir)
     config = config.model_copy(update={"run_root": str(args.run_dir.parent)})
     results = await Swarm(config).resume(args.run_dir.name, force=args.force)
     await _print_results(config.run_root, args.run_dir.name, list(results))

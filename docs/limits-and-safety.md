@@ -534,7 +534,9 @@ restarting managers. Missing result views can be rebuilt from the journal.
 A goal stopped by `stop` or `stop --now` with rounds left continues even when
 limits are unchanged. A goal stopped by a limit continues only when the resume
 changes limits. Budget caps may increase or become unlimited, but cannot decrease;
-changes are journaled as `limits_changed`.
+changes are journaled as `limits_changed`. A later resume without `--config`
+keeps the committed limits, including raised ones, rather than the start-time
+limits in the saved `run.toml`.
 
 A resumed stopped goal gets only its share of the remaining unallocated work
 budget, which can be 0 when other goals were still running and already got its
