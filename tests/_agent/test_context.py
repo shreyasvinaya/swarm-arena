@@ -296,6 +296,22 @@ async def test_read_ids_recorded(ctx_env: CtxEnv) -> None:
     assert ctx_env.rt.board.get_candidate(c.id).read_ids == ["L-1"]
 
 
+async def test_result_scores_charge_nothing(
+    ctx_env: CtxEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = ctx_env.ctx(limits=Limits(max_board_reads_per_round=0))
+    c = await ctx.run_tool({"x": 1.0})
+    assert ctx._result_scores(c.id) == []
+    stored = Score(id="s-1", candidate_id=c.id, judge="rank", key=(2.0,))
+    monkeypatch.setattr(ctx_env.rt.view, "scores", Mock(return_value=[stored]))
+    scores = ctx._result_scores(c.id)
+    assert scores == [stored]
+    assert scores[0] is not stored
+    assert (ctx_env.counters.turns, ctx_env.counters.board_reads) == (1, 0)
+    assert len(ctx_env.events("agent_counters")) == 2
+    assert ctx._read_ids == {}
+
+
 async def test_extra_action_counts_as_board_read(ctx_env: CtxEnv) -> None:
     ctx = await ctx_env.script_ctx()
     assert await ctx.call_action("list_files", {}) == {

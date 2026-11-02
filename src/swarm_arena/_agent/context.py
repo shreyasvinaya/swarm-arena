@@ -829,6 +829,23 @@ class AgentContext:
 
         return self._on_loop(read)
 
+    def _result_scores(self, candidate_id: str) -> list[Score]:
+        """Read snapshot scores of a result this context already returned.
+
+        A ``run_tool`` result or a ``my_candidates`` entry is this agent's own
+        action output, not a board read: the lookup charges no turn or board
+        read and adds no read provenance. Results outside the view have none.
+        """
+
+        def read() -> list[Score]:
+            try:
+                scores = self._rt.view.scores(candidate_id)
+            except (KeyError, ValueError):
+                scores = []
+            return [s.model_copy(deep=True) for s in scores]
+
+        return self._on_loop(read)
+
     def search_learnings(
         self,
         query: str,
