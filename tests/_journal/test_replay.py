@@ -9,7 +9,12 @@ from _fakes.secrecy import assert_secret_absent
 from swarm_arena import Goal, Limits, Plan, RunConfig, Score
 from swarm_arena._errors import ChainError
 from swarm_arena._journal.event import Event, EventType
-from swarm_arena._journal.replay import GoalState, ReservationState, RunState
+from swarm_arena._journal.replay import (
+    GoalState,
+    ReservationState,
+    RunState,
+    continues_on_resume,
+)
 from swarm_arena._model.base import FrozenModel
 from swarm_arena._model.board_types import Frontier
 from swarm_arena._model.planning_types import Decision
@@ -770,6 +775,40 @@ def test_no_result_reason_is_distinct_from_terminal_reason_and_resets() -> None:
     assert (goal.no_result_reason, goal.end_reason) == ("no passing candidate", "stop")
     continued = RunState.from_events([*events, _ev(5, "goal_started", {}, goal_id="g")])
     assert continued.goals["g"].no_result_reason is None
+
+
+@pytest.mark.parametrize(
+    ("end_reason", "no_result_reason", "same_limits", "raised_limits"),
+    [
+        ("stop", "no passing candidate", True, True),
+        ("stop --now", "provider_failed", True, True),
+        ("run_timeout_s", "no passing candidate", False, True),
+        ("run budget", "no passing candidate", False, True),
+        ("run budget", "run budget", False, False),
+        ("stopped", "stopped", False, False),
+        ("policy terminal", "policy terminal", False, False),
+    ],
+)
+def test_stop_that_left_no_passing_candidate_continues_on_resume(
+    end_reason: str, no_result_reason: str, same_limits: bool, raised_limits: bool
+) -> None:
+    limits = Limits(max_usd=100)
+
+    def state(rounds_closed: int) -> RunState:
+        goal = GoalState(
+            status="no_result",
+            finished=True,
+            rounds_closed=rounds_closed,
+            end_reason=end_reason,
+            no_result_reason=no_result_reason,
+        )
+        return RunState(
+            config=RunConfig(limits=limits), goals={"g": goal}, plans={"g": [(_plan(), "human")]}
+        )
+
+    assert continues_on_resume(state(1), "g", limits) is same_limits
+    assert continues_on_resume(state(1), "g", Limits(max_usd=200)) is raised_limits
+    assert not continues_on_resume(state(3), "g", Limits(max_usd=200))
 
 
 def test_repeat_keys_folded() -> None:

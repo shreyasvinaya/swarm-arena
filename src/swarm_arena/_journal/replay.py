@@ -758,7 +758,11 @@ def continues_on_resume(state: RunState, goal_id: str, limits: Limits) -> bool:
     -------
     bool
         True for a stopped goal with rounds left after an explicit stop or a
-        limits change. Finished and no-result goals do not continue.
+        limits change. A no-result goal continues the same way only when a stop
+        or limit ended its lifecycle with no passing candidate (its
+        ``goal_finished`` reason is a stop reason distinct from its no-result
+        reason). Finished goals, queued goals that never started, and goals
+        whose policy or final judging recorded the no-result do not continue.
 
     Examples
     --------
@@ -770,7 +774,14 @@ def continues_on_resume(state: RunState, goal_id: str, limits: Limits) -> bool:
     return bool(
         goal is not None
         and revisions
-        and goal.status == "stopped"
+        and (
+            goal.status == "stopped"
+            or (
+                goal.status == "no_result"
+                and goal.end_reason in STOP_REASONS
+                and goal.end_reason != goal.no_result_reason
+            )
+        )
         and goal.rounds_closed < revisions[-1][0].rounds_total(limits)
         and (goal.end_reason in {"stop", "stop --now"} or limits != state.config.limits)
     )

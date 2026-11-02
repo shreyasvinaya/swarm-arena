@@ -800,6 +800,55 @@ async def test_limit_stopped_goal_continues_only_with_raised_limits(
         assert reopen.seq < _events(c, "limits_changed")[0].seq
 
 
+@pytest.mark.parametrize("reason", ["stop", "stop --now", "run_timeout_s", "run budget"])
+async def test_stop_before_first_passing_candidate_continues_like_any_stop(
+    tmp_path: Path,
+    run_config: RunConfig,
+    recorders: dict[str, _Recorder],
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+) -> None:
+    for agent in ("a", "b"):
+        recorders[agent] = _Recorder({1: [], 2: [2.0], 3: [3.0]})
+    c = await _crash(
+        tmp_path, run_config, recorders, plans=[_plan(rounds=3)], completed=(), lost=()
+    )
+    real_stop = GoalRunner._stop
+
+    def stop_after_first_round(self: GoalRunner) -> bool:
+        if self.rounds_closed >= 1:
+            flag = {
+                "stop": "stop",
+                "stop --now": "stop_now",
+                "run_timeout_s": "run_timeout",
+                "run budget": "run_budget",
+            }[reason]
+            setattr(self.deps.stops, flag, True)
+        return real_stop(self)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(GoalRunner, "_stop", stop_after_first_round)
+        assert await Swarm(c.config).resume(c.run_id, force=True) == {"g": []}
+    assert [e.payload["reason"] for e in _events(c, "no_result")] == ["no passing candidate"]
+    assert [e.payload["reason"] for e in _events(c, "goal_finished")] == [reason]
+    view = json.loads(c.store.read("goals/g/solution.json").data)
+    assert (view["status"], view["reason"]) == ("no_result", "no passing candidate")
+    before = len(_events(c, "round_started"))
+    await Swarm(c.config).resume(c.run_id)
+    explicit = reason in {"stop", "stop --now"}
+    assert [e.round for e in _events(c, "round_started")[before:]] == ([2, 3] if explicit else [])
+    if not explicit:
+        raised = (
+            with_limits(c.config, run_timeout_s=c.config.limits.run_timeout_s + 1)
+            if reason == "run_timeout_s"
+            else with_limits(c.config, max_usd=2000)
+        )
+        await Swarm(raised).resume(c.run_id)
+        assert [e.round for e in _events(c, "round_started")[before:]] == [2, 3]
+    assert _goal_status(c, "g") == "finished"
+    assert _final_order(c)
+
+
 async def test_queued_goal_starts_from_journaled_r0(
     tmp_path: Path, run_config: RunConfig, recorders: dict[str, _Recorder]
 ) -> None:
