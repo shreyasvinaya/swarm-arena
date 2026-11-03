@@ -112,7 +112,9 @@ class LocalExecutor(Executor):
             Directory that holds the job workspaces; None selects
             ``tempfile.gettempdir()/swarm-arena-<uid>``. It and every parent
             must be owned by this user or root and not writable by group or
-            others unless sticky (like ``/tmp``).
+            others unless sticky (like ``/tmp``). The default root must not be
+            a symbolic link, though ``tempfile.gettempdir()`` may be one; a
+            configured root may be a link, and its target is checked.
         keep_workspaces : bool, default=False
             Keep each workspace after its job instead of removing it.
         rlimits : bool, default=True
