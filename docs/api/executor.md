@@ -48,7 +48,10 @@ character of the job id outside `[A-Za-z0-9._-]` becomes `_`, and the id is cut
 to 64 characters. The default `workspace_root` is per user:
 `tempfile.gettempdir()/swarm-arena-<uid>`. The root and every parent directory
 must be owned by you or root, and not writable by group or others unless sticky
-(like `/tmp`). The command starts only after `Job.on_started` returns.
+(like `/tmp`). The default root must be a directory, not a symbolic link, so
+nobody can redirect it by planting one; `tempfile.gettempdir()` itself may be a
+link (like `/var` on macOS). A configured root may be a link: its target and the
+target's parents are checked. The command starts only after `Job.on_started` returns.
 
 The total declared output size is bounded by `LocalExecutor.Config.max_output_bytes`
 (default **256 MiB**). This same budget reaches built-in collection before hashing

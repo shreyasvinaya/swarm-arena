@@ -349,6 +349,56 @@ async def test_run_refuses_a_shared_local_journal_directory(
     assert owner[0].expires_at <= utc_now()
 
 
+@pytest.mark.parametrize("linked", ["root", "journals"])
+async def test_run_refuses_a_local_journal_directory_planted_as_a_link(
+    run_config: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linked: str
+) -> None:
+    import os
+    import tempfile
+
+    temp = tmp_path / "temp"
+    temp.mkdir(mode=0o700)
+    # A private directory of this user that someone else knows the path of.
+    victim = tmp_path / "victim"
+    victim.mkdir(mode=0o700)
+    root = temp / f"swarm-arena-{os.getuid()}"
+    if linked == "root":
+        root.symlink_to(victim)
+    else:
+        root.mkdir(mode=0o700)
+        (root / "journals").symlink_to(victim)
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
+    with pytest.raises(RuntimeError, match=r"^local journal directory is not safe: "):
+        await Swarm(run_config).run(plan(rounds=1), run_id="linked")
+    assert list(victim.iterdir()) == []
+    owner = read_owner(LocalStore(Path(run_config.run_root) / "linked"))
+    assert owner is not None
+    assert owner[0].expires_at <= utc_now()
+
+
+def test_local_journal_directory_may_be_under_a_linked_temporary_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+    import stat
+    import tempfile
+
+    from swarm_arena._engine.run import _local_journal_path
+
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    # The temporary directory itself may be a link, like /var -> /private/var on macOS.
+    (tmp_path / "temp").symlink_to(real)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "temp"))
+    path = _local_journal_path("r", 3)
+    journals = real.resolve() / f"swarm-arena-{os.getuid()}" / "journals"
+    assert path == journals / "r-e3.jsonl"
+    for directory in (journals.parent, journals):
+        info = os.lstat(directory)
+        assert stat.S_ISDIR(info.st_mode)
+        assert stat.S_IMODE(info.st_mode) == 0o700
+
+
 async def test_completed_resume_bootstrap_does_not_construct_manager(
     run_config: RunConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:

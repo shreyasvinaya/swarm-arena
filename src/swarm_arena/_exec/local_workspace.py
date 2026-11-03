@@ -28,11 +28,7 @@ _UNSAFE: Final = (
     "{} is not safe: it and every parent directory must be owned by this user "
     "or root, and not writable by group or others unless sticky (like /tmp)"
 )
-
-
-def _default_root() -> Path:
-    """Return this user's default workspace root, so users of one host never share it."""
-    return Path(tempfile.gettempdir()) / f"swarm-arena-{os.getuid()}"
+_LINKED: Final = "{} is not safe: it must be a directory, not a symbolic link or another file"
 
 
 def _only_owner_can_change(info: os.stat_result) -> bool:
@@ -56,10 +52,37 @@ def _private_directory(path: Path, name: str) -> Path:
     return path
 
 
+def _default_directory(name: str, *parts: str) -> Path:
+    """
+    Create this user's default root, or a directory below it, without following a link.
+
+    Only ``tempfile.gettempdir()`` is resolved, because it may itself be a link
+    (``/var`` on macOS, or a configured ``TMPDIR``). Each directory below it is
+    this package's own: it is created as 0700, one level at a time, and refused
+    if it is a link, is not a directory, or another user could change it. In a
+    sticky temporary directory, nobody else can then rename or remove it.
+    """
+    path = _private_directory(Path(tempfile.gettempdir()), name)
+    for part in (f"swarm-arena-{os.getuid()}", *parts):
+        path /= part
+        try:
+            with contextlib.suppress(FileExistsError):
+                os.mkdir(path, 0o700)
+            info = os.lstat(path)
+        except OSError:
+            raise _core_error(RuntimeError, f"cannot create the {name}") from None
+        if not stat.S_ISDIR(info.st_mode):
+            raise _core_error(RuntimeError, _LINKED.format(name))
+        if not _only_owner_can_change(info):
+            raise _core_error(RuntimeError, _UNSAFE.format(name))
+    return path
+
+
 def _workspace_root(configured: str | None) -> Path:
     """Create the workspace root if needed; refuse one that another user could change."""
-    root = Path(configured).expanduser() if configured is not None else _default_root()
-    return _private_directory(root, "workspace root")
+    if configured is None:
+        return _default_directory("workspace root")
+    return _private_directory(Path(configured).expanduser(), "workspace root")
 
 
 def _open_workspace(configured: str | None, job: Job) -> tuple[Path, ArtifactStore]:

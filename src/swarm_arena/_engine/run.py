@@ -52,7 +52,7 @@ from swarm_arena._errors import (
     _stop_cleanup_error,
 )
 from swarm_arena._exec.executor import Executor, schedule_timeout_scope
-from swarm_arena._exec.local_workspace import _default_root, _private_directory
+from swarm_arena._exec.local_workspace import _default_directory
 from swarm_arena._exec.threads import run_sync_daemon
 from swarm_arena._journal.event import Event, EventDraft, EventType
 from swarm_arena._journal.lease import Head, Lease
@@ -483,13 +483,12 @@ def _local_journal_path(run_id: str, epoch: int) -> Path:
 
     The mirror lives in ``journals`` under this user's default root,
     ``tempfile.gettempdir()/swarm-arena-<uid>``. Both directories are created
-    as 0700, one level at a time, and refused like a workspace root if another
-    user could change them, so nobody else can read the mirror or plant a link
-    for it. Callers resolve this before entering the journal writer, so a
-    refusal still releases the lease.
+    as 0700, one level at a time, and refused like the default workspace root
+    if either is a link or another user could change it, so nobody else can
+    read the mirror, redirect it, or plant a link for it. Callers resolve this
+    before entering the journal writer, so a refusal still releases the lease.
     """
-    name = "local journal directory"
-    journals = _private_directory(_private_directory(_default_root(), name) / "journals", name)
+    journals = _default_directory("local journal directory", "journals")
     return journals / f"{run_id}-e{epoch}.jsonl"
 
 

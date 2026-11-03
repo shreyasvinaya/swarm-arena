@@ -561,6 +561,8 @@ Whatever the executor, the driver mirrors each run's journal locally in
 `tempfile.gettempdir()/swarm-arena-<uid>/journals`. It creates both directories
 as 0700. Like the default workspace root, they and every parent must be owned by
 you or root, and not writable by group or others unless sticky (like `/tmp`).
+Neither directory may be a symbolic link, so nobody can redirect the mirror by
+planting one; `tempfile.gettempdir()` itself may be a link (like `/var` on macOS).
 Otherwise `run`, `resume`, `reconcile` and `review import` refuse with
 `local journal directory is not safe` before writing any event. Each mirror file
 is created as 0600 and is never written through a symlink, a hard link or a FIFO.
